@@ -648,6 +648,28 @@ class TestApplyTuning:
         assert "min_severity" not in rule.threshold_config
         db.commit.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_raise_threshold_rejects_off_ladder_custom_severity_with_a_stored_floor(self) -> None:
+        actor = _auth_user()
+        rule = _StubRule(
+            tenant_id=actor.tenant_id,
+            severity="informational",
+            threshold_config={"min_severity": "high", "event_threshold": 3},
+        )
+        db = _setup_mutator_db(rule)
+
+        with pytest.raises(HTTPException) as caught:
+            await apply_tuning(
+                db,
+                rule_id=rule.id,
+                actor=actor,
+                body=ApplyTuningRequest(action="raise_threshold"),
+            )
+
+        assert caught.value.status_code == 422
+        assert rule.threshold_config == {"min_severity": "high", "event_threshold": 3}
+        db.commit.assert_not_awaited()
+
     def test_apply_request_rejects_a_nul(self) -> None:
         with pytest.raises(ValidationError):
             ApplyTuningRequest(action="add_suppression", suppression_reason="nightly\x00rename")
