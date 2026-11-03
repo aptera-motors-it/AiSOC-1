@@ -1,14 +1,3 @@
-"""An indicator the bloom filter has counted is in the console store.
-
-``ingest_iocs`` added the bloom key before any sink ran. A refresh
-while the stores were down still counted the indicator as seen, and
-the next refresh wrote nothing.
-
-Qdrant is the store the console reads, and the one a CORE install
-has. OpenSearch and Neo4j are not in that profile, so a failure there
-is not a missed indicator. A Qdrant failure is.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -41,9 +30,6 @@ def _embedding_stays_offline(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class _Recording:
-    """A sink that keeps the values it was given. The second refresh uses this
-    once the real clients are no longer pointed at a closed port."""
-
     def __init__(self) -> None:
         self.values: list[str] = []
 
@@ -64,8 +50,6 @@ class _Bus:
 
 
 class _Unreachable:
-    """The real store clients, aimed at a closed port, which is what an outage is."""
-
     def __init__(self) -> None:
         self.opensearch = AsyncOpenSearch(
             hosts=[{"host": "127.0.0.1", "port": 1}],
@@ -87,19 +71,15 @@ class _Unreachable:
         bloom: RedisBloomFilter,
         *,
         kafka_producer: Any | None = None,
-        **replacements: Any,
+        os_store: Any | None = None,
+        qdrant_store: Any | None = None,
+        neo4j_store: Any | None = None,
     ) -> ThreatIntelPipeline:
-        stores: dict[str, Any] = {
-            "os_store": OpenSearchStore(self.opensearch),
-            "qdrant_store": QdrantStore(self.qdrant),
-            "neo4j_store": Neo4jStore(self.neo4j),
-        }
-        stores.update(replacements)
         return ThreatIntelPipeline(
             bloom=bloom,
-            os_store=stores["os_store"],
-            qdrant_store=stores["qdrant_store"],
-            neo4j_store=stores["neo4j_store"],
+            os_store=OpenSearchStore(self.opensearch) if os_store is None else os_store,
+            qdrant_store=QdrantStore(self.qdrant) if qdrant_store is None else qdrant_store,
+            neo4j_store=Neo4jStore(self.neo4j) if neo4j_store is None else neo4j_store,
             kafka_producer=kafka_producer,
         )
 
@@ -133,8 +113,6 @@ def _bloom(client: aioredis.Redis) -> tuple[str, RedisBloomFilter]:
 
 
 async def test_an_outage_is_stored_on_the_next_refresh() -> None:
-    """Sinks down, then the same feed again with the sinks back: the second refresh stores it."""
-
     client = await _redis()
     key, bloom = _bloom(client)
     feed = _feed()
@@ -165,8 +143,6 @@ async def test_an_outage_is_stored_on_the_next_refresh() -> None:
 
 
 async def test_a_qdrant_outage_is_stored_when_qdrant_returns() -> None:
-    """The other two sinks accepting the batch does not make it seen. The console store does."""
-
     client = await _redis()
     key, bloom = _bloom(client)
     feed = _feed()
@@ -200,8 +176,6 @@ async def test_a_qdrant_outage_is_stored_when_qdrant_returns() -> None:
 
 
 async def test_a_qdrant_write_is_not_repeated() -> None:
-    """CORE shape: Qdrant stored the batch, OpenSearch and Neo4j are absent. The next refresh is a duplicate."""
-
     client = await _redis()
     key, bloom = _bloom(client)
     feed = _feed()

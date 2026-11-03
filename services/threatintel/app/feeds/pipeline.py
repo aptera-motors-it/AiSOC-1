@@ -141,8 +141,6 @@ class ThreatIntelPipeline:
             unavailable=unavailable or None,
         )
 
-        # Qdrant is the console store. OpenSearch and Neo4j are absent on
-        # CORE, so only Qdrant accepting the batch marks it seen.
         if sinks["qdrant"] is not None:
             for bloom_key in unseen:
                 await self._bloom.add(bloom_key)
