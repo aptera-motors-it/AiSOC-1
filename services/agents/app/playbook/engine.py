@@ -27,7 +27,6 @@ from typing import Any
 import httpx
 
 from app.playbook import pause as playbook_pause
-from app.security import peer_tokens
 
 from . import action_bridge, ask_model, idempotency, references, timeout_outcome, verification
 from .bounds import (
@@ -809,7 +808,7 @@ async def _emit(run_id: str, event_type: str, payload: dict, http: httpx.AsyncCl
 # ---------------------------------------------------------------------------
 
 
-async def _suspend_for_approval(pr: PlaybookRun, step: PlaybookStep, step_idx: int, http: Any) -> Any:
+async def _suspend_for_approval(pr: PlaybookRun, step: PlaybookStep, step_idx: int) -> Any:
     """Create the approval and persist where to resume.
 
     Order matters. The approval row is created **first**, so the pause can
@@ -835,12 +834,11 @@ async def _suspend_for_approval(pr: PlaybookRun, step: PlaybookStep, step_idx: i
         logger.error("Approval step %s declares an unusable timeout outcome: %s", step.name, exc)
         return None
 
-    approval_id = await _create_approval(pr, step, tenant_id, http)
+    approval_id = await _create_approval(pr, step, tenant_id)
     if not approval_id:
-        # The docstring above has always claimed this and the code did not do
-        # it: a pause written with `approval_id=None` is a run halted forever
-        # with nothing for any human to decide against, and no amount of
-        # waiting produces one. Failing the step closed at least surfaces.
+        # A pause written with no approval is a run halted forever with
+        # nothing for any human to decide against. Failing the step closed
+        # at least surfaces.
         logger.error(
             "Approval step %s could not open an approval; not suspending run %s",
             step.name,
@@ -936,49 +934,21 @@ def _approval_ttl(step: PlaybookStep) -> float | None:
         return None
 
 
-async def _create_approval(pr: PlaybookRun, step: PlaybookStep, tenant_id: str, http: Any) -> str | None:
-    """Ask the API to open an approval. None when it could not be created.
+async def _create_approval(pr: PlaybookRun, step: PlaybookStep, tenant_id: str) -> str | None:
+    """Write the approval row here. None when it could not be created.
 
-    Posted to the API rather than written here for the same reason
-    `action_bridge` posts there: that service owns the vault and the
-    tenant session, and a second writer to `agent_approvals` would be a
-    second place the responder app's decision has to be kept in step with.
+    The API's create route is the console path. A playbook step used to
+    post there and the service principal was refused, so the pause was
+    written with nothing a human could decide. The row is written by the
+    same service that writes the pause.
     """
-    try:
-        # Token and tenant header together: both were wrong here, one at a
-        # time. This presented `AISOC_AGENTS_SERVICE_TOKEN` — the token the
-        # *agents* service accepts — to an API that validates
-        # `AISOC_API_SERVICE_TOKEN` (401), on `X-Tenant-ID`, which the API's
-        # service auth never reads, so a service caller named no tenant and
-        # resolved to an empty scope (403).
-        headers = peer_tokens.api_bearer_headers(tenant_id)
-    except RuntimeError as exc:
-        logger.warning("Approval step %s cannot open an approval: %s", step.name, exc)
-        return None
-    api_url = os.getenv("AISOC_API_URL", "http://api:8000")
-    try:
-        response = await http.post(
-            f"{api_url}/api/v1/approvals",
-            headers=headers,
-            json={
-                "title": step.name or f"Approval for {pr.playbook_name}",
-                "description": str(step.params.get("prompt") or step.params.get("reason") or ""),
-                "requested_by": f"playbook:{pr.playbook_id}",
-                "context": {"run_id": pr.run_id, "step_id": step.id},
-            },
-            timeout=10.0,
-        )
-        if response.status_code >= 400:
-            logger.warning(
-                "Approval creation refused: HTTP %s %s",
-                response.status_code,
-                response.text[:200],
-            )
-            return None
-        return str(response.json().get("id") or "") or None
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Approval creation failed: %s", exc)
-        return None
+    return await playbook_pause.open_approval(
+        tenant_id=tenant_id,
+        title=step.name or f"Approval for {pr.playbook_name}",
+        summary=str(step.params.get("prompt") or step.params.get("reason") or ""),
+        requested_by=f"playbook:{pr.playbook_id}",
+        action={"run_id": pr.run_id, "step_id": step.id},
+    )
 
 
 async def resume_after_approval(
@@ -2156,7 +2126,7 @@ class PlaybookEngine:
                 # the requirement and an in-memory pause is lost by the
                 # thing most likely to interrupt a long approval.
                 if step.type == StepType.APPROVAL and not dry_run:
-                    pause = await _suspend_for_approval(pr, step, current_idx, http)
+                    pause = await _suspend_for_approval(pr, step, current_idx)
                     if pause is not None:
                         pr.status = RunStatus.PAUSED
                         pr.step_results.append(

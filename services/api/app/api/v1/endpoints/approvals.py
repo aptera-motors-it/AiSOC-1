@@ -29,6 +29,7 @@ Endpoints
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
@@ -38,7 +39,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, func, select
 
-from app.api.v1.deps import AuthUser, require_permission
+from app.api.v1.deps import SERVICE_TENANT_HEADER, AuthUser, require_permission
 from app.core.config import settings
 from app.db.rls import TenantDBSession
 from app.models.responder import AgentApproval
@@ -443,6 +444,7 @@ async def decide_approval(
     unresolved = _dispatch_state(row) in _UNRESOLVED_DISPATCH
 
     if row.status == new_status and not unresolved:
+        await _resume_playbook_run(row)
         return ApprovalResponse.model_validate(row)
     if row.status not in {"pending", "expired"} and row.status != new_status:
         raise HTTPException(
@@ -497,9 +499,8 @@ async def decide_approval(
     await db.commit()
     await db.refresh(row)
 
-    # Notify the agents service (and any other listener) so the run can
-    # resume — fire-and-forget pattern matches the rest of the surface.
     await _notify_realtime(row, event="approval_decided")
+    await _resume_playbook_run(row)
 
     if dispatch.get("state") == _DISPATCH_FAILED:
         # The decision is durable and the operator is told the truth: their
@@ -644,6 +645,22 @@ async def _dispatch_decision(
         "action_status": result.get("status"),
         "blast_radius": result.get("blast_radius"),
     }
+
+
+async def _resume_playbook_run(row: AgentApproval) -> None:
+    if not (row.requested_by or "").startswith("playbook:"):
+        return
+    base = (os.getenv("AGENTS_SERVICE_URL") or os.getenv("AGENTS_API_URL") or "http://agents:8084").rstrip("/")
+    token = (os.getenv("AISOC_AGENTS_SERVICE_TOKEN") or os.getenv("AISOC_SERVICE_TOKEN") or "").strip()
+    headers = {"Authorization": f"Bearer {token}", SERVICE_TENANT_HEADER: str(row.tenant_id)}
+    try:
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+            response = await client.post(f"{base}/api/v1/playbooks/approvals/{row.id}/resume", headers=headers)
+    except httpx.HTTPError as exc:
+        logger.warning("Approval %s: decision not delivered to the agents service: %s", row.id, exc)
+        return
+    if response.status_code >= 400:
+        logger.warning("Approval %s: the agents service refused the decision: HTTP %s", row.id, response.status_code)
 
 
 async def _notify_realtime(row: AgentApproval, *, event: str) -> None:

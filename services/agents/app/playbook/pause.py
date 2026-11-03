@@ -224,6 +224,57 @@ async def suspend(
     )
 
 
+async def open_approval(*, tenant_id: str, title: str, summary: str, requested_by: str, action: dict[str, Any]) -> str | None:
+    pool = await _pool()
+    if pool is None:
+        return None
+    approval_id = str(uuid.uuid4())
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO agent_approvals (id, tenant_id, requested_by, title, summary, action)
+                VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6::jsonb)
+                """,
+                approval_id,
+                tenant_id,
+                requested_by[:120],
+                title[:200],
+                summary,
+                json.dumps(action, default=str),
+            )
+    except Exception as exc:
+        logger.warning("playbook_pause: approval write failed for tenant %s: %s", tenant_id, exc)
+        return None
+    return approval_id
+
+
+async def approval_decision(*, approval_id: str, tenant_id: str) -> dict[str, Any] | None:
+    pool = await _pool()
+    if pool is None:
+        return None
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT status, decided_by_id, decision_comment,
+                       (SELECT run_id FROM aisoc_playbook_pauses
+                         WHERE aisoc_playbook_pauses.approval_id = agent_approvals.id
+                           AND aisoc_playbook_pauses.tenant_id = agent_approvals.tenant_id) AS run_id
+                  FROM agent_approvals
+                 WHERE id = $1::uuid
+                   AND tenant_id = $2::uuid
+                   AND status IN ('approved', 'denied')
+                """,
+                approval_id,
+                tenant_id,
+            )
+    except Exception as exc:
+        logger.warning("playbook_pause: decision lookup failed for approval %s: %s", approval_id, exc)
+        return None
+    return dict(row) if row is not None else None
+
+
 async def find_waiting(*, approval_id: str, tenant_id: str) -> Pause | None:
     """The run waiting on this approval, if any.
 
@@ -575,6 +626,14 @@ async def expire_due(*, now: datetime | None = None) -> list[str]:
     return [str(row["run_id"]) for row in await expire_due_returning(now=now)]
 
 
+_DECIDED_APPROVAL = (
+    "SELECT 1 FROM agent_approvals"
+    " WHERE agent_approvals.id = aisoc_playbook_pauses.approval_id"
+    " AND agent_approvals.tenant_id = aisoc_playbook_pauses.tenant_id"
+    " AND agent_approvals.status IN ('approved', 'denied')"
+)
+
+
 async def expire_due_returning(*, now: datetime | None = None) -> list[dict[str, Any]]:
     """Expire every due pause and hand back what each one declared.
 
@@ -598,7 +657,9 @@ async def expire_due_returning(*, now: datetime | None = None) -> list[dict[str,
 
     Every due pause is still expired, including the ones declaring
     `rollback` or `contain`: the outcome decides what the platform *does*
-    about the deadline, not whether the deadline is recorded.
+    about the deadline, not whether the deadline is recorded. The one
+    exception is a pause whose approval a human already decided: it stays
+    `waiting`.
     """
     pool = await _pool()
     if pool is None:
@@ -606,12 +667,13 @@ async def expire_due_returning(*, now: datetime | None = None) -> list[dict[str,
     try:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
-                """
+                f"""
                 UPDATE aisoc_playbook_pauses
                    SET status = 'expired',
                        resolved_at = NOW(),
                        resolution = 'no decision before the approval deadline'
                  WHERE status = 'waiting' AND expires_at <= $1
+                   AND NOT EXISTS ({_DECIDED_APPROVAL})
              RETURNING id, tenant_id, run_id, playbook_id, step_id,
                        timeout_outcome, timeout_capability, timeout_params
                 """,

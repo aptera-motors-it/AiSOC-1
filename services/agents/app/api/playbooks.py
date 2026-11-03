@@ -16,7 +16,9 @@ from __future__ import annotations
 import html
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Annotated, Any
+from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from fastapi.responses import HTMLResponse
@@ -27,6 +29,7 @@ from app.playbook import (
     PlaybookEngine,
     PlaybookRun,
     PlaybookStore,
+    RunStatus,
     draft_from_nl,
     verification,
 )
@@ -369,10 +372,40 @@ async def _execute_and_update(
 ) -> None:
     """Background task: overwrite placeholder with real run."""
     engine = PlaybookEngine()
-    pr = await engine.run(playbook, context, dry_run=dry_run)
-    # Preserve the pre-allocated run_id
-    pr.run_id = run_id
+    pr = await engine.run(playbook, context, dry_run=dry_run, resume_run_id=run_id)
     _remember(tenant_id, pr)
+
+
+@router.post("/approvals/{approval_id}/resume", summary="Deliver a recorded approval decision", status_code=202)
+async def resume_approval(approval_id: UUID, background_tasks: BackgroundTasks, principal: ScopedPrincipal) -> dict[str, Any]:
+    if not principal.delegated:
+        raise HTTPException(status_code=403, detail="approval decisions are delivered by the API service")
+    tenant_id = str(scoped_tenant_or_403(principal))
+    decision = await playbook_pause.approval_decision(approval_id=str(approval_id), tenant_id=tenant_id)
+    if decision is None:
+        raise HTTPException(status_code=404, detail="no decided approval with this id")
+
+    background_tasks.add_task(_resume_approval_in_background, str(approval_id), tenant_id, decision)
+    return {"status": "resuming"}
+
+
+async def _resume_approval_in_background(approval_id: str, tenant_id: str, decision: dict[str, Any]) -> None:
+    approved = decision["status"] == "approved"
+    run = await engine_module.resume_after_approval(
+        approval_id=approval_id,
+        tenant_id=tenant_id,
+        approved=approved,
+        decided_by=str(decision["decided_by_id"] or ""),
+        comment=decision["decision_comment"] or "",
+    )
+    if run is not None:
+        _remember(tenant_id, run)
+        return
+    owned = _runs.get(str(decision["run_id"] or ""))
+    if not approved and owned is not None and owned.tenant_id == tenant_id and owned.run.status == RunStatus.PAUSED:
+        owned.run.status = RunStatus.CANCELLED
+        owned.run.error = "approval denied"
+        owned.run.finished_at = datetime.now(UTC).isoformat()
 
 
 # ---------------------------------------------------------------------------
