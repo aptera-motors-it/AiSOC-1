@@ -180,8 +180,10 @@ class ConnectorScheduler:
         # release() matches this string. Two schedulers in one process share
         # a hostname, and one stop must not expire the other's row.
         self._holder = unique_holder_identity()
+        self._stopping = False
         self._poll_claims: dict[str, datetime] = {}
         self._connector_leases: dict[str, LeaderLease] = {}
+        self._fetches_in_flight: set[str] = set()
         # Cache of {connector_id_str: last_seen_config_signature} so reloads
         # can detect when an instance's poll interval / config changed and
         # need its job rescheduled, vs leaving an unchanged job alone.
@@ -318,6 +320,12 @@ class ConnectorScheduler:
         chooses who schedules; the lease chooses who fetches. A backfill
         from the replica that already holds the window may fetch again.
         """
+        if self._stopping:
+            logger.info(
+                "connector.scheduler.poll_skipped id=%s reason=scheduler_stopping",
+                connector_id,
+            )
+            return False
         key = str(connector_id)
         now = datetime.now(UTC)
         held_until = self._poll_claims.get(key)
@@ -366,6 +374,7 @@ class ConnectorScheduler:
 
     async def stop(self) -> None:
         """Stop the scheduler and release resources."""
+        self._stopping = True
         if self._scheduler is not None:
             # ``wait=False`` so we don't block shutdown waiting for an
             # in-flight poll to finish; the next start picks up where we
@@ -380,9 +389,13 @@ class ConnectorScheduler:
         logger.info("connector.scheduler.stopped")
 
     async def _release_connector_leases(self) -> None:
-        leases = list(self._connector_leases.values())
-        self._connector_leases.clear()
-        self._poll_claims.clear()
+        releasable = [key for key in self._connector_leases if key not in self._fetches_in_flight]
+        leases: list[LeaderLease] = []
+        for key in releasable:
+            lease = self._connector_leases.pop(key, None)
+            self._poll_claims.pop(key, None)
+            if lease is not None:
+                leases.append(lease)
         for lease in leases:
             await lease.release()
 
@@ -675,20 +688,27 @@ class ConnectorScheduler:
             backfill=backfill_seconds is not None,
         ):
             return
+        inflight_key = str(connector_id)
+        self._fetches_in_flight.add(inflight_key)
         try:
-            raw_events = await connector.fetch_alerts(since_seconds=since_seconds)
-        except Exception:
-            logger.exception(
-                "connector.scheduler.fetch_failed id=%s type=%s",
-                connector_id,
-                target.connector_type,
-            )
-            # A fetch that raised part-way may already have staged handles for
-            # the batches it did read. None of it reached ingest, so none of
-            # it may be acknowledged.
-            self._discard_acknowledgements(connector, connector_id, reason="fetch_failed", staged=0)
-            await self._record_failure(target.id)
-            return
+            try:
+                raw_events = await connector.fetch_alerts(since_seconds=since_seconds)
+            except Exception:
+                logger.exception(
+                    "connector.scheduler.fetch_failed id=%s type=%s",
+                    connector_id,
+                    target.connector_type,
+                )
+                # A fetch that raised part-way may already have staged handles for
+                # the batches it did read. None of it reached ingest, so none of
+                # it may be acknowledged.
+                self._discard_acknowledgements(connector, connector_id, reason="fetch_failed", staged=0)
+                await self._record_failure(target.id)
+                return
+        finally:
+            self._fetches_in_flight.discard(inflight_key)
+            if self._stopping:
+                await self._release_connector_leases()
 
         # A scanner's findings are asset state, not events. The alert path
         # above carries neither the asset nor the CVE a vulnerability row

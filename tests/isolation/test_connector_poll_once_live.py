@@ -169,3 +169,211 @@ def test_two_schedulers_fetch_the_stub_vendor_once_per_window() -> None:
     assert in_window == 1, in_window
     assert after_expiry == 1, after_expiry
     assert after_stop == 1, after_stop
+
+
+def _gated_vendor():
+    from app.connectors.base import BaseConnector, ConnectorSchema
+
+    class GatedVendor(BaseConnector):
+        connector_id = "stub_vendor"
+        connector_name = "Stub vendor"
+        connector_category = "siem"
+        fetches: list[str] = []
+        in_flight = 0
+        max_in_flight = 0
+        hold: asyncio.Event | None = None
+        entered: asyncio.Event | None = None
+
+        @classmethod
+        def schema(cls) -> ConnectorSchema:
+            return ConnectorSchema(
+                connector_id=cls.connector_id,
+                connector_name=cls.connector_name,
+                category=cls.connector_category,
+                description="Local stub vendor.",
+                fields=[],
+            )
+
+        async def test_connection(self) -> dict[str, bool]:
+            return {"ok": True}
+
+        async def fetch_alerts(self, since_seconds: int = 300) -> list[dict[str, str]]:
+            del since_seconds
+            vendor = type(self)
+            vendor.fetches.append("fetch")
+            vendor.in_flight += 1
+            vendor.max_in_flight = max(vendor.max_in_flight, vendor.in_flight)
+            try:
+                if vendor.entered is not None:
+                    vendor.entered.set()
+                if vendor.hold is not None:
+                    await vendor.hold.wait()
+            finally:
+                vendor.in_flight -= 1
+            return [{"id": "evt-1", "message": "one"}]
+
+    return GatedVendor
+
+
+def _connector_id() -> uuid.UUID:
+    # First fire is ``id.int % 60`` seconds out. Zero would poll during the test.
+    while True:
+        connector_id = uuid.uuid4()
+        if connector_id.int % 60 >= 30:
+            return connector_id
+
+
+async def _stop_during_fetch() -> tuple[int, bool, int]:
+    from app.connectors import CONNECTOR_REGISTRY
+    from app.ingest_client import IngestClient
+    from app.scheduler import ConnectorScheduler
+    from app.security.credential_vault import get_vault
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    vendor = _gated_vendor()
+    vendor.fetches = []
+    vendor.in_flight = 0
+    vendor.max_in_flight = 0
+    vendor.hold = asyncio.Event()
+    vendor.entered = asyncio.Event()
+    CONNECTOR_REGISTRY["stub_vendor"] = vendor
+    os.environ["AISOC_SCHEDULER_LEADER_ELECTION"] = "false"
+
+    server, url = _ingest_url()
+    engine = create_async_engine(_dsn())
+    connector_id = _connector_id()
+    first = ConnectorScheduler(engine=engine, ingest_client=IngestClient(url), vault=get_vault())
+    second = ConnectorScheduler(engine=engine, ingest_client=IngestClient(url), vault=get_vault())
+    try:
+        await _seed(engine, connector_id)
+        await first.start()
+        await second.start()
+        first_poll = asyncio.create_task(first._poll_one(connector_id=connector_id))
+        await asyncio.wait_for(vendor.entered.wait(), 10)
+        await first.stop()
+        still_in_fetch = not first_poll.done()
+        vendor.entered.clear()
+        second_poll = asyncio.create_task(second._poll_one(connector_id=connector_id))
+        try:
+            await asyncio.wait_for(vendor.entered.wait(), 2)
+            second_entered = True
+        except TimeoutError:
+            second_entered = False
+        vendor.hold.set()
+        await asyncio.gather(first_poll, second_poll)
+        before = len(vendor.fetches)
+        await second._poll_one(connector_id=connector_id)
+        return vendor.max_in_flight if still_in_fetch else -1, second_entered, len(vendor.fetches) - before
+    finally:
+        if vendor.hold is not None:
+            vendor.hold.set()
+        await first.stop()
+        await second.stop()
+        await _drop(engine, connector_id)
+        await engine.dispose()
+        server.shutdown()
+        CONNECTOR_REGISTRY.pop("stub_vendor", None)
+
+
+def test_a_stop_during_fetch_does_not_overlap_the_other_replica() -> None:
+    """The other replica stays out of a fetch that is still running.
+
+    After that fetch returns, the same replica must fetch once. A stop
+    that kept the row for the whole window would pass the overlap check
+    by blocking the survivor.
+    """
+    max_in_flight, second_entered, after_release = asyncio.run(_stop_during_fetch())
+    assert max_in_flight == 1, max_in_flight
+    assert second_entered is False, second_entered
+    assert after_release == 1, after_release
+
+
+async def _lease_is_live(engine: Any, connector_id: uuid.UUID) -> bool:
+    from sqlalchemy import text
+
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text("SELECT expires_at > now() FROM scheduler_leases WHERE scope = :s"),
+                {"s": f"connector-poll:{connector_id}"},
+            )
+        ).first()
+    return bool(row is not None and row[0])
+
+
+async def _blocked_before_claim() -> tuple[int, int, bool, int]:
+    from app.connectors import CONNECTOR_REGISTRY
+    from app.ingest_client import IngestClient
+    from app.scheduler import ConnectorScheduler
+    from app.security.credential_vault import get_vault
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    vendor = _gated_vendor()
+    vendor.fetches = []
+    vendor.hold = None
+    vendor.entered = None
+    CONNECTOR_REGISTRY["stub_vendor"] = vendor
+    os.environ["AISOC_SCHEDULER_LEADER_ELECTION"] = "false"
+
+    server, url = _ingest_url()
+    engine = create_async_engine(_dsn())
+    locker = create_async_engine(_dsn())
+    connector_id = _connector_id()
+    running = ConnectorScheduler(engine=engine, ingest_client=IngestClient(url), vault=get_vault())
+    stopped = ConnectorScheduler(engine=engine, ingest_client=IngestClient(url), vault=get_vault())
+    survivor = ConnectorScheduler(engine=engine, ingest_client=IngestClient(url), vault=get_vault())
+    try:
+        await _seed(engine, connector_id)
+        await running.start()
+        lock_conn = await locker.connect()
+        lock_tx = await lock_conn.begin()
+        await lock_conn.execute(text("LOCK TABLE connectors IN ACCESS EXCLUSIVE MODE"))
+        control_poll = asyncio.create_task(running._poll_one(connector_id=connector_id))
+        await asyncio.sleep(1.0)
+        control_blocked = not control_poll.done() and len(vendor.fetches) == 0
+        await lock_tx.rollback()
+        await lock_conn.close()
+        await asyncio.wait_for(control_poll, 10)
+        control_fetches = len(vendor.fetches) if control_blocked else -1
+        await running.stop()
+
+        await stopped.start()
+        await survivor.start()
+        lock_conn = await locker.connect()
+        lock_tx = await lock_conn.begin()
+        await lock_conn.execute(text("LOCK TABLE connectors IN ACCESS EXCLUSIVE MODE"))
+        stopped_poll = asyncio.create_task(stopped._poll_one(connector_id=connector_id))
+        await asyncio.sleep(1.0)
+        await stopped.stop()
+        await lock_tx.rollback()
+        await lock_conn.close()
+        await asyncio.wait_for(stopped_poll, 10)
+        stopped_fetches = len(vendor.fetches) - control_fetches
+        lease_live = await _lease_is_live(engine, connector_id)
+        before = len(vendor.fetches)
+        await survivor._poll_one(connector_id=connector_id)
+        return control_fetches, stopped_fetches, lease_live, len(vendor.fetches) - before
+    finally:
+        await running.stop()
+        await stopped.stop()
+        await survivor.stop()
+        await _drop(engine, connector_id)
+        await engine.dispose()
+        await locker.dispose()
+        server.shutdown()
+        CONNECTOR_REGISTRY.pop("stub_vendor", None)
+
+
+def test_a_poll_blocked_before_the_claim_does_not_fetch_after_stop() -> None:
+    """A poll that has not claimed yet must not claim after stop.
+
+    The same poll fetches once the table lock clears while its scheduler
+    is still running. A claim that refused every poll would pass the
+    stopped case for the wrong reason.
+    """
+    control_fetches, stopped_fetches, lease_live, survivor_fetches = asyncio.run(_blocked_before_claim())
+    assert control_fetches == 1, control_fetches
+    assert stopped_fetches == 0, stopped_fetches
+    assert lease_live is False, lease_live
+    assert survivor_fetches == 1, survivor_fetches
