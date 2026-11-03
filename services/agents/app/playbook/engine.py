@@ -100,8 +100,8 @@ class StepResult(dict):  # thin dict subclass for JSON serialisation
 class PlaybookRun:
     """Mutable run state threaded through the engine."""
 
-    def __init__(self, playbook: Playbook, trigger_context: dict[str, Any]) -> None:
-        self.run_id: str = str(uuid.uuid4())
+    def __init__(self, playbook: Playbook, trigger_context: dict[str, Any], *, run_id: str | None = None) -> None:
+        self.run_id: str = run_id or str(uuid.uuid4())
         self.playbook_id: str = playbook.id
         self.playbook_name: str = playbook.name
         #: The top-level step list, so a `wait` can find the index it must
@@ -2088,12 +2088,10 @@ class PlaybookEngine:
         resume_run_id: str | None = None,
         resume_results: list[dict[str, Any]] | None = None,
     ) -> PlaybookRun:
-        pr = PlaybookRun(playbook, trigger_context)
-        if resume_run_id:
-            # Keep the original run id, so a resumed run stays one run in
-            # the realtime stream and the ledger rather than appearing as
-            # a second, unrelated one that starts halfway through.
-            pr.run_id = resume_run_id
+        # Keep the original run id, so a resumed run stays one run in
+        # the realtime stream and the ledger rather than appearing as
+        # a second, unrelated one that starts halfway through.
+        pr = PlaybookRun(playbook, trigger_context, run_id=resume_run_id)
         if resume_results:
             pr.step_results = list(resume_results)
         pr.started_at = datetime.now(UTC).isoformat()

@@ -259,6 +259,36 @@ async def find_waiting(*, approval_id: str, tenant_id: str) -> Pause | None:
     return _row_to_pause(row)
 
 
+async def run_status(*, run_id: str, tenant_id: str) -> str | None:
+    """The status of this run's latest pause, or None if it never paused.
+
+    Every status counts: a run that paused once has already executed the
+    steps before that pause. ``None`` also when the lookup fails, so a
+    database error starts the run rather than dropping a response.
+    """
+    pool = await _pool()
+    if pool is None:
+        return None
+    try:
+        async with pool.acquire() as conn:
+            status = await conn.fetchval(
+                """
+                SELECT status
+                  FROM aisoc_playbook_pauses
+                 WHERE run_id = $1
+                   AND tenant_id = $2::uuid
+                 ORDER BY created_at DESC
+                 LIMIT 1
+                """,
+                run_id,
+                tenant_id,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("playbook_pause: run lookup failed for run %s: %s", run_id, exc)
+        return None
+    return str(status) if status is not None else None
+
+
 def _row_to_pause(row: Any) -> Pause:
     def _json(value: Any, default: Any) -> Any:
         if value is None:

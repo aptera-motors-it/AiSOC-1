@@ -28,6 +28,7 @@ has to remember to use first.
 from __future__ import annotations
 
 import os
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -53,6 +54,10 @@ LIVE_PLAYBOOKS_ENV = "AISOC_ALERT_PLAYBOOKS_LIVE"
 #: it was handed. A test now asserts this constant against what the
 #: corpus declares, so the two cannot drift apart again.
 TRIGGER_EVENT = "alert"
+
+#: The fused-alert consumer delivers at least once, so a live run's id is
+#: derived, not random: a redelivered alert has to find the run it started.
+_RUN_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "tryaisoc.com/agents/alert-playbook-run")
 
 
 def deployment_enabled() -> bool:
@@ -141,7 +146,11 @@ async def run_for_alert(state: Any) -> TriggerOutcome:
         outcome.skipped_reason = "the alert carries no tenant, so no playbook can be scoped to it"
         return outcome
 
+    raw = getattr(state, "raw_alert", None)
+    alert_row_id = str(raw.get("id") or "") if isinstance(raw, dict) else ""
+
     try:
+        from app.playbook import pause as playbook_pause
         from app.playbook.engine import PlaybookEngine
         from app.playbook.store import PlaybookStore
 
@@ -161,8 +170,25 @@ async def run_for_alert(state: Any) -> TriggerOutcome:
     for playbook in matches:
         outcome.matched.append(playbook.id)
         live = is_live(tenant_id=tenant_id, playbook_id=playbook.id)
+        run_id = str(uuid.uuid5(_RUN_NAMESPACE, f"{tenant_id}:{alert_row_id}:{playbook.id}")) if live and alert_row_id else None
+        pause_status = await playbook_pause.run_status(run_id=run_id, tenant_id=tenant_id) if run_id else None
+        if pause_status is not None:
+            outcome.executed.append(
+                {
+                    "playbook_id": playbook.id,
+                    "playbook_name": playbook.name,
+                    "run_id": run_id,
+                    "status": "already_started",
+                    "pause_status": pause_status,
+                }
+            )
+            logger.info("alert_playbooks.already_started", playbook_id=playbook.id, run_id=run_id, pause_status=pause_status)
+            continue
         try:
-            run = await engine.run(playbook, context, dry_run=not live)
+            if run_id:
+                run = await engine.run(playbook, context, dry_run=False, resume_run_id=run_id)
+            else:
+                run = await engine.run(playbook, context, dry_run=not live)
         except Exception as exc:  # noqa: BLE001
             logger.warning("alert_playbooks.run_failed", playbook_id=playbook.id, error=str(exc))
             outcome.previewed.append({"playbook_id": playbook.id, "error": str(exc)})
