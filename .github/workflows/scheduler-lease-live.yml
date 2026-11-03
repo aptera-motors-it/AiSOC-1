@@ -295,7 +295,7 @@ jobs:
           import pathlib, sys
           p = pathlib.Path("app/scheduler.py")
           s = p.read_text()
-          needle = "        await self._fetches_idle.wait()\n"
+          needle = "        await self._wait_for_inflight_release()\n"
           if s.count(needle) != 1:
               print("negative control could not find the in-flight wait; "
                     "stop has been reshaped and this control no longer proves anything")
@@ -314,3 +314,154 @@ jobs:
             exit 1
           fi
           echo "OK: without the wait the in-flight release is swallowed and the suite goes red, as it must."
+
+      # A stop that lands while acquire is blocked on the lease row used to
+      # return immediately. Dropping the check after the claim lets that
+      # stopped scheduler fetch once the lock clears.
+      - name: The gate fails when a stopped scheduler fetches after the claim
+        working-directory: services/connectors
+        env:
+          ISOLATION_LEASE_DSN: ${{ env.LEASE_DSN }}
+          ISOLATION_CONNECTOR_DSN: ${{ env.LEASE_DSN }}
+          PYTHONPATH: .
+        run: |
+          set -euo pipefail
+          cp app/scheduler.py /tmp/scheduler-claim.bak
+          python - <<'PY'
+          import pathlib, sys
+          p = pathlib.Path("app/scheduler.py")
+          s = p.read_text()
+          needle = (
+              "        if self._stopping:\n"
+              "            logger.info(\n"
+              "                \"connector.scheduler.poll_skipped id=%s reason=stopped_during_claim\",\n"
+              "                connector_id,\n"
+              "            )\n"
+              "            return False\n"
+          )
+          if s.count(needle) != 1:
+              print("negative control could not find the stopped-during-claim check; "
+                    "the claim has been reshaped and this control no longer proves anything")
+              sys.exit(1)
+          p.write_text(s.replace(needle, "", 1))
+          PY
+          set +e
+          python -m pytest \
+            ../../tests/isolation/test_connector_poll_once_live.py::test_a_stop_during_the_lease_claim_does_not_fetch \
+            -q >/dev/null 2>&1
+          rc=$?
+          set -e
+          cp /tmp/scheduler-claim.bak app/scheduler.py
+          if [ "$rc" -eq 0 ]; then
+            echo "FAIL: a scheduler that stopped during the claim still fetched."
+            exit 1
+          fi
+          echo "OK: without the stopped-during-claim check the scheduler fetches and the suite goes red, as it must."
+
+      # The idle event is cleared only once the poll is in flight. Marking
+      # that after the claim returns lets stop() finish while the claim is
+      # still blocked on the lease row.
+      - name: The gate fails when the poll is marked in flight after the claim
+        working-directory: services/connectors
+        env:
+          ISOLATION_LEASE_DSN: ${{ env.LEASE_DSN }}
+          ISOLATION_CONNECTOR_DSN: ${{ env.LEASE_DSN }}
+          PYTHONPATH: .
+        run: |
+          set -euo pipefail
+          cp app/scheduler.py /tmp/scheduler-inflight.bak
+          python - <<'PY'
+          import pathlib, sys
+          p = pathlib.Path("app/scheduler.py")
+          s = p.read_text()
+          needle = "        self._fetches_in_flight.add(inflight_key)\n        self._fetches_idle.clear()\n"
+          if s.count(needle) != 1:
+              print("negative control could not find the in-flight mark; "
+                    "the poll has been reshaped and this control no longer proves anything")
+              sys.exit(1)
+          p.write_text(s.replace(needle, "", 1))
+          PY
+          set +e
+          python -m pytest \
+            ../../tests/isolation/test_connector_poll_once_live.py::test_a_stop_during_the_lease_claim_does_not_fetch \
+            -q >/dev/null 2>&1
+          rc=$?
+          set -e
+          cp /tmp/scheduler-inflight.bak app/scheduler.py
+          if [ "$rc" -eq 0 ]; then
+            echo "FAIL: stop() returned during the claim and the suite stayed green."
+            exit 1
+          fi
+          echo "OK: without the in-flight mark stop returns during the claim and the suite goes red, as it must."
+
+      # The idle event has to wait until every release this stop started has
+      # finished. Clearing that condition lets one task wake stop() while
+      # another task is still inside release().
+      - name: The gate fails when idle is set before every release finishes
+        working-directory: services/connectors
+        env:
+          ISOLATION_LEASE_DSN: ${{ env.LEASE_DSN }}
+          ISOLATION_CONNECTOR_DSN: ${{ env.LEASE_DSN }}
+          PYTHONPATH: .
+        run: |
+          set -euo pipefail
+          cp app/scheduler.py /tmp/scheduler-releases.bak
+          python - <<'PY'
+          import pathlib, sys
+          p = pathlib.Path("app/scheduler.py")
+          s = p.read_text()
+          needle = " and self._stop_releases == 0"
+          if s.count(needle) != 1:
+              print("negative control could not find the release counter; "
+                    "stop has been reshaped and this control no longer proves anything")
+              sys.exit(1)
+          p.write_text(s.replace(needle, "", 1))
+          PY
+          set +e
+          python -m pytest \
+            ../../tests/isolation/test_connector_poll_once_live.py::test_a_stop_returns_only_after_every_in_flight_release \
+            -q >/dev/null 2>&1
+          rc=$?
+          set -e
+          cp /tmp/scheduler-releases.bak app/scheduler.py
+          if [ "$rc" -eq 0 ]; then
+            echo "FAIL: stop() returned while a release was still in flight."
+            exit 1
+          fi
+          echo "OK: setting idle before every release finishes leaves a lease and the suite goes red, as it must."
+
+      # An unbounded wait pins shutdown for as long as fetch_alerts sits
+      # there. The test's own deadline is a few seconds past the bound, so
+      # this step fails instead of holding the job.
+      - name: The gate fails when stop waits with no timeout
+        working-directory: services/connectors
+        env:
+          ISOLATION_LEASE_DSN: ${{ env.LEASE_DSN }}
+          ISOLATION_CONNECTOR_DSN: ${{ env.LEASE_DSN }}
+          PYTHONPATH: .
+        run: |
+          set -euo pipefail
+          cp app/scheduler.py /tmp/scheduler-timeout.bak
+          python - <<'PY'
+          import pathlib, sys
+          p = pathlib.Path("app/scheduler.py")
+          s = p.read_text()
+          needle = "            await asyncio.wait_for(self._fetches_idle.wait(), _STOP_IN_FLIGHT_WAIT_S)\n"
+          if s.count(needle) != 1:
+              print("negative control could not find the bounded in-flight wait; "
+                    "stop has been reshaped and this control no longer proves anything")
+              sys.exit(1)
+          p.write_text(s.replace(needle, "            await self._fetches_idle.wait()\n", 1))
+          PY
+          set +e
+          python -m pytest \
+            ../../tests/isolation/test_connector_poll_once_live.py::test_a_hung_fetch_does_not_hold_shutdown \
+            -q >/dev/null 2>&1
+          rc=$?
+          set -e
+          cp /tmp/scheduler-timeout.bak app/scheduler.py
+          if [ "$rc" -eq 0 ]; then
+            echo "FAIL: an unbounded stop wait still returned while the fetch was hung."
+            exit 1
+          fi
+          echo "OK: without the timeout stop waits out a hung fetch and the suite goes red, as it must."

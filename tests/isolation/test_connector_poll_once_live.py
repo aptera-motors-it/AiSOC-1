@@ -5,8 +5,10 @@ import base64
 import json
 import os
 import threading
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -640,3 +642,416 @@ def test_an_in_flight_lease_is_released_before_the_engine_closes() -> None:
     assert max_in_flight == 1, max_in_flight
     assert fetches_before_survivor == 1, fetches_before_survivor
     assert after_stop == 1, after_stop
+
+
+def _termination_grace_seconds() -> float:
+    chart = Path(__file__).resolve().parents[2] / "infra/helm/aisoc/templates/deployment.yaml"
+    for line in chart.read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("terminationGracePeriodSeconds:"):
+            return float(stripped.split(":", 1)[1].split("#", 1)[0].strip())
+    raise AssertionError("terminationGracePeriodSeconds is missing from the chart")
+
+
+async def _scheduler_leases_lock_waiting(engine: Any) -> bool:
+    from sqlalchemy import text
+
+    async with engine.connect() as conn:
+        waiting = (
+            await conn.execute(text("SELECT COUNT(*) FROM pg_locks WHERE relation = 'scheduler_leases'::regclass AND NOT granted"))
+        ).scalar_one()
+        # A row lock blocks the release UPDATE on the holder's transaction id.
+        # That wait does not show up as an ungranted relation lock.
+        updating = (
+            await conn.execute(
+                text("SELECT COUNT(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%UPDATE scheduler_leases%'")
+            )
+        ).scalar_one()
+    return int(waiting) > 0 or int(updating) > 0
+
+
+async def _seed_another(engine: Any, existing: uuid.UUID, connector_id: uuid.UUID, name: str) -> None:
+    from sqlalchemy import text
+
+    async with engine.begin() as conn:
+        tenant_id = (await conn.execute(text("SELECT tenant_id FROM connectors WHERE id = :i"), {"i": existing})).scalar_one()
+        await conn.execute(
+            text(
+                "INSERT INTO connectors "
+                "(id, tenant_id, connector_type, name, is_enabled, auth_config, connector_config) "
+                "VALUES (:i, :t, 'stub_vendor', :n, true, '{}'::jsonb, CAST(:c AS jsonb))"
+            ),
+            {
+                "i": connector_id,
+                "t": tenant_id,
+                "n": name,
+                "c": json.dumps({"poll_interval_seconds": 300}),
+            },
+        )
+
+
+def _queued_vendor():
+    from app.connectors.base import BaseConnector, ConnectorSchema
+
+    class QueuedVendor(BaseConnector):
+        connector_id = "stub_vendor"
+        connector_name = "Stub vendor"
+        connector_category = "siem"
+        fetches: list[str] = []
+        in_flight = 0
+        max_in_flight = 0
+        gates: list[tuple[asyncio.Event, asyncio.Event]] = []
+
+        @classmethod
+        def schema(cls) -> ConnectorSchema:
+            return ConnectorSchema(
+                connector_id=cls.connector_id,
+                connector_name=cls.connector_name,
+                category=cls.connector_category,
+                description="Local stub vendor.",
+                fields=[],
+            )
+
+        async def test_connection(self) -> dict[str, bool]:
+            return {"ok": True}
+
+        async def fetch_alerts(self, since_seconds: int = 300) -> list[dict[str, str]]:
+            del since_seconds
+            entered = asyncio.Event()
+            hold = asyncio.Event()
+            vendor = type(self)
+            vendor.gates.append((entered, hold))
+            vendor.fetches.append("fetch")
+            vendor.in_flight += 1
+            vendor.max_in_flight = max(vendor.max_in_flight, vendor.in_flight)
+            try:
+                entered.set()
+                await hold.wait()
+            finally:
+                vendor.in_flight -= 1
+            return [{"id": "evt-1", "message": "one"}]
+
+    return QueuedVendor
+
+
+async def _stop_during_lease_claim() -> tuple[int, bool, bool, int, int, int]:
+    from app.connectors import CONNECTOR_REGISTRY
+    from app.ingest_client import IngestClient
+    from app.scheduler import ConnectorScheduler
+    from app.security.credential_vault import get_vault
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    vendor = _gated_vendor()
+    vendor.fetches = []
+    vendor.in_flight = 0
+    vendor.max_in_flight = 0
+    vendor.hold = None
+    vendor.entered = None
+    CONNECTOR_REGISTRY["stub_vendor"] = vendor
+    os.environ["AISOC_SCHEDULER_LEADER_ELECTION"] = "false"
+
+    server, url = _ingest_url()
+    engine = create_async_engine(_dsn())
+    locker = create_async_engine(_dsn())
+    connector_id = _connector_id()
+    running = ConnectorScheduler(engine=engine, ingest_client=IngestClient(url), vault=get_vault())
+    stopped = ConnectorScheduler(engine=engine, ingest_client=IngestClient(url), vault=get_vault())
+    survivor = ConnectorScheduler(engine=engine, ingest_client=IngestClient(url), vault=get_vault())
+    stopped_poll: asyncio.Task[None] | None = None
+    stop_task: asyncio.Task[None] | None = None
+    lock_conn = None
+    try:
+        await _seed(engine, connector_id)
+        await running.start()
+        lock_conn = await locker.connect()
+        lock_tx = await lock_conn.begin()
+        await lock_conn.execute(text("LOCK TABLE scheduler_leases IN ACCESS EXCLUSIVE MODE"))
+        control_poll = asyncio.create_task(running._poll_one(connector_id=connector_id))
+        control_blocked = False
+        for _ in range(30):
+            if control_poll.done():
+                break
+            if await _scheduler_leases_lock_waiting(engine):
+                control_blocked = True
+                break
+            await asyncio.sleep(0.1)
+        await lock_tx.rollback()
+        await lock_conn.close()
+        lock_conn = None
+        await asyncio.wait_for(control_poll, 10)
+        control_fetches = len(vendor.fetches) if control_blocked else -1
+        await running.stop()
+
+        await stopped.start()
+        await survivor.start()
+        lock_conn = await locker.connect()
+        lock_tx = await lock_conn.begin()
+        await lock_conn.execute(text("LOCK TABLE scheduler_leases IN ACCESS EXCLUSIVE MODE"))
+        stopped_poll = asyncio.create_task(stopped._poll_one(connector_id=connector_id))
+        claim_blocked = False
+        for _ in range(30):
+            if stopped_poll.done():
+                break
+            if await _scheduler_leases_lock_waiting(engine):
+                claim_blocked = True
+                break
+            await asyncio.sleep(0.1)
+        stop_task = asyncio.create_task(stopped.stop())
+        await asyncio.sleep(0.5)
+        # On a scheduler that clears the idle event only after the claim
+        # returns, stop() is already done while this lock is still held.
+        stop_waited = not stop_task.done()
+        await lock_tx.rollback()
+        await lock_conn.close()
+        lock_conn = None
+        await asyncio.wait_for(stopped_poll, 10)
+        if not stop_task.done():
+            await asyncio.wait_for(stop_task, 10)
+        stopped_fetches = len(vendor.fetches) - control_fetches
+        before = len(vendor.fetches)
+        await survivor._poll_one(connector_id=connector_id)
+        return (
+            control_fetches,
+            claim_blocked,
+            stop_waited,
+            stopped_fetches,
+            len(vendor.fetches) - before,
+            vendor.max_in_flight,
+        )
+    finally:
+        if lock_conn is not None:
+            await lock_conn.close()
+        for task in (stopped_poll, stop_task):
+            if task is not None and not task.done():
+                task.cancel()
+        await running.stop()
+        await stopped.stop()
+        await survivor.stop()
+        await _drop(engine, connector_id)
+        await engine.dispose()
+        await locker.dispose()
+        server.shutdown()
+        CONNECTOR_REGISTRY.pop("stub_vendor", None)
+
+
+def test_a_stop_during_the_lease_claim_does_not_fetch() -> None:
+    """A stop that lands while the claim is blocked on the lease row must not fetch.
+
+    The same claim fetches once when the lock clears and the scheduler is
+    still running. After stop, the survivor fetches once and the two do
+    not overlap.
+    """
+    control_fetches, claim_blocked, stop_waited, stopped_fetches, survivor_fetches, max_in_flight = asyncio.run(_stop_during_lease_claim())
+    assert control_fetches == 1, control_fetches
+    assert claim_blocked is True, claim_blocked
+    assert (stop_waited, stopped_fetches) == (True, 0), (stop_waited, stopped_fetches)
+    assert survivor_fetches == 1, survivor_fetches
+    assert max_in_flight == 1, max_in_flight
+
+
+async def _hung_fetch_does_not_hold_shutdown() -> tuple[float, float, float, bool, int, int, float]:
+    import app.scheduler as scheduler_mod
+    from app.connectors import CONNECTOR_REGISTRY
+    from app.ingest_client import IngestClient
+    from app.scheduler import ConnectorScheduler
+    from app.security.credential_vault import get_vault
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    grace = _termination_grace_seconds()
+    configured = getattr(scheduler_mod, "_STOP_IN_FLIGHT_WAIT_S", None)
+    if not isinstance(configured, (int, float)) or not (0 < float(configured) < grace):
+        raise AssertionError(f"stop() waits for in-flight fetches with no bound below the {grace:g}s termination grace")
+    real_bound = float(configured)
+    # The chart bound is what shutdown uses. Turn it down for the wait
+    # itself so this suite does not sit for the whole production value.
+    # stop() has to read the constant: a fixed sleep would not notice.
+    exercised = min(real_bound, 2.0)
+
+    vendor = _gated_vendor()
+    vendor.fetches = []
+    vendor.in_flight = 0
+    vendor.max_in_flight = 0
+    vendor.hold = asyncio.Event()
+    vendor.entered = asyncio.Event()
+    CONNECTOR_REGISTRY["stub_vendor"] = vendor
+    os.environ["AISOC_SCHEDULER_LEADER_ELECTION"] = "false"
+
+    server, url = _ingest_url()
+    engine = create_async_engine(_dsn())
+    connector_id = _connector_id()
+    holder = ConnectorScheduler(engine=engine, ingest_client=IngestClient(url), vault=get_vault())
+    survivor = ConnectorScheduler(engine=engine, ingest_client=IngestClient(url), vault=get_vault())
+    poll: asyncio.Task[None] | None = None
+    stop_task: asyncio.Task[None] | None = None
+    scheduler_mod._STOP_IN_FLIGHT_WAIT_S = exercised
+    try:
+        await _seed(engine, connector_id)
+        await holder.start()
+        await survivor.start()
+        poll = asyncio.create_task(holder._poll_one(connector_id=connector_id))
+        await asyncio.wait_for(vendor.entered.wait(), 10)
+        started = time.monotonic()
+        stop_task = asyncio.create_task(holder.stop())
+        try:
+            await asyncio.wait_for(stop_task, exercised + 5)
+        except TimeoutError:
+            elapsed = time.monotonic() - started
+            raise AssertionError(f"stop() still waiting after {elapsed:.1f}s; the bound is {exercised:g}s") from None
+        elapsed = time.monotonic() - started
+        lease_live = await _lease_is_live(engine, connector_id)
+        before = len(vendor.fetches)
+        await survivor._poll_one(connector_id=connector_id)
+        return (
+            elapsed,
+            real_bound,
+            grace,
+            lease_live,
+            len(vendor.fetches) - before,
+            vendor.max_in_flight,
+            exercised,
+        )
+    finally:
+        if vendor.hold is not None:
+            vendor.hold.set()
+        if poll is not None and not poll.done():
+            try:
+                await asyncio.wait_for(poll, 10)
+            except Exception:
+                poll.cancel()
+        if stop_task is not None and not stop_task.done():
+            stop_task.cancel()
+        await survivor.stop()
+        await holder.stop()
+        scheduler_mod._STOP_IN_FLIGHT_WAIT_S = real_bound
+        await _drop(engine, connector_id)
+        await engine.dispose()
+        server.shutdown()
+        CONNECTOR_REGISTRY.pop("stub_vendor", None)
+
+
+def test_a_hung_fetch_does_not_hold_shutdown() -> None:
+    """A fetch that never returns must not pin stop() until the pod is killed.
+
+    The wait is shorter than terminationGracePeriodSeconds. When it runs
+    out the lease stays in place, so the other replica does not fetch
+    while this one is still inside fetch_alerts.
+    """
+    elapsed, configured, grace, lease_live, survivor_fetches, max_in_flight, exercised = asyncio.run(_hung_fetch_does_not_hold_shutdown())
+    assert 5 <= configured < grace, (configured, grace)
+    assert exercised - 1 <= elapsed < exercised + 5, (elapsed, exercised)
+    assert lease_live is True, lease_live
+    assert survivor_fetches == 0, survivor_fetches
+    assert max_in_flight == 1, max_in_flight
+
+
+async def _stop_returns_only_after_every_release() -> tuple[bool, bool]:
+    from app.connectors import CONNECTOR_REGISTRY
+    from app.ingest_client import IngestClient
+    from app.scheduler import ConnectorScheduler
+    from app.security.credential_vault import get_vault
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    vendor = _queued_vendor()
+    vendor.fetches = []
+    vendor.in_flight = 0
+    vendor.max_in_flight = 0
+    vendor.gates = []
+    CONNECTOR_REGISTRY["stub_vendor"] = vendor
+    os.environ["AISOC_SCHEDULER_LEADER_ELECTION"] = "false"
+
+    server, url = _ingest_url()
+    engine = create_async_engine(_dsn())
+    first_id = _connector_id()
+    second_id = _connector_id()
+    holder = ConnectorScheduler(engine=engine, ingest_client=IngestClient(url), vault=get_vault())
+    polls: list[asyncio.Task[None]] = []
+    stop_task: asyncio.Task[tuple[bool, bool]] | None = None
+    lock_conn = None
+    try:
+        await _seed(engine, first_id)
+        await _seed_another(engine, first_id, second_id, "stub-b")
+        await holder.start()
+        polls.append(asyncio.create_task(holder._poll_one(connector_id=first_id)))
+        for _ in range(100):
+            if vendor.gates:
+                break
+            await asyncio.sleep(0.05)
+        else:
+            raise AssertionError("the first fetch did not start")
+        await asyncio.wait_for(vendor.gates[0][0].wait(), 10)
+        polls.append(asyncio.create_task(holder._poll_one(connector_id=second_id)))
+        for _ in range(100):
+            if len(vendor.gates) > 1:
+                break
+            await asyncio.sleep(0.05)
+        else:
+            raise AssertionError("the second fetch did not start")
+        await asyncio.wait_for(vendor.gates[1][0].wait(), 10)
+
+        async def _stop_and_read() -> tuple[bool, bool]:
+            await holder.stop()
+            return await _lease_is_live(engine, first_id), await _lease_is_live(engine, second_id)
+
+        stop_task = asyncio.create_task(_stop_and_read())
+        await asyncio.sleep(0.3)
+        if stop_task.done():
+            raise AssertionError("stop() returned while both fetches were still inside fetch_alerts")
+
+        lock_conn = await engine.connect()
+        lock_tx = await lock_conn.begin()
+        await lock_conn.execute(
+            text("SELECT expires_at FROM scheduler_leases WHERE scope = :s FOR UPDATE"),
+            {"s": f"connector-poll:{first_id}"},
+        )
+        vendor.gates[0][1].set()
+        release_blocked = False
+        for _ in range(100):
+            if await _scheduler_leases_lock_waiting(engine):
+                release_blocked = True
+                break
+            await asyncio.sleep(0.05)
+        if not release_blocked:
+            raise AssertionError("the first release did not block on its lease row")
+        vendor.gates[1][1].set()
+        for _ in range(100):
+            if stop_task.done() or not await _lease_is_live(engine, second_id):
+                break
+            await asyncio.sleep(0.05)
+        for _ in range(40):
+            if stop_task.done():
+                break
+            await asyncio.sleep(0.05)
+        if not stop_task.done():
+            await lock_tx.commit()
+            await lock_conn.close()
+            lock_conn = None
+        return await asyncio.wait_for(stop_task, 15)
+    finally:
+        for gate in vendor.gates:
+            gate[1].set()
+        if lock_conn is not None:
+            await lock_conn.close()
+        for task in polls:
+            if not task.done():
+                task.cancel()
+        if stop_task is not None and not stop_task.done():
+            stop_task.cancel()
+        await holder.stop()
+        await _drop(engine, first_id)
+        await _drop(engine, second_id)
+        await engine.dispose()
+        server.shutdown()
+        CONNECTOR_REGISTRY.pop("stub_vendor", None)
+
+
+def test_a_stop_returns_only_after_every_in_flight_release() -> None:
+    """Two fetches finishing during stop() must both release before stop() returns.
+
+    One task can see an empty in-flight set and wake the waiter while the
+    other task is still inside its release. The lease row, not the idle
+    event, is what the next replica reads.
+    """
+    first_live, second_live = asyncio.run(_stop_returns_only_after_every_release())
+    assert (first_live, second_live) == (False, False), (first_live, second_live)

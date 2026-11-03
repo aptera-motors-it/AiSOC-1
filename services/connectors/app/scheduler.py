@@ -112,6 +112,12 @@ _DEFAULT_POLL_INTERVAL_S = 300
 _MIN_POLL_INTERVAL_S = 30
 _MAX_POLL_INTERVAL_S = 86400  # 24 hours
 
+# The chart's terminationGracePeriodSeconds is 60. A fetch that never
+# returns must not hold shutdown for the whole of that. The lease is left
+# to expire; releasing it here would let the other replica fetch while
+# this one is still inside fetch_alerts.
+_STOP_IN_FLIGHT_WAIT_S = 20.0
+
 # Workstream 5: backfill-on-outage tunables.
 #
 # When a connector recovers from an outage that lasted at least
@@ -187,6 +193,9 @@ class ConnectorScheduler:
         self._fetches_in_flight: set[str] = set()
         self._fetches_idle = asyncio.Event()
         self._fetches_idle.set()
+        # Releases started because stop() is in progress. The idle event
+        # stays clear until this is back to zero.
+        self._stop_releases = 0
         # Cache of {connector_id_str: last_seen_config_signature} so reloads
         # can detect when an instance's poll interval / config changed and
         # need its job rescheduled, vs leaving an unchanged job alone.
@@ -324,7 +333,8 @@ class ConnectorScheduler:
         from the replica that already holds the window may fetch again.
         The row lasts one poll interval from the claim, which is after the
         tick started, so the next tick is still inside it. The holder
-        renews that row. Another replica cannot.
+        renews that row. Another replica cannot. A stop that lands during
+        the claim does not fetch; the caller releases the row.
         """
         if self._stopping:
             logger.info(
@@ -344,7 +354,9 @@ class ConnectorScheduler:
                 holder=self._holder,
                 lease=window_seconds,
             )
-            if not await lease.acquire() and (key in self._fetches_in_flight or not await lease.renew()):
+            # The caller marks this poll in flight before the claim, so that
+            # set must not be what skips the holder's renew.
+            if not await lease.acquire() and not await lease.renew():
                 logger.info(
                     "connector.scheduler.poll_skipped id=%s reason=connector_lease_held",
                     connector_id,
@@ -355,6 +367,12 @@ class ConnectorScheduler:
             return False
         self._connector_leases[key] = lease
         self._poll_claims[key] = now + timedelta(seconds=window_seconds)
+        if self._stopping:
+            logger.info(
+                "connector.scheduler.poll_skipped id=%s reason=stopped_during_claim",
+                connector_id,
+            )
+            return False
         return True
 
     async def _maintain_lease(self) -> None:
@@ -385,10 +403,7 @@ class ConnectorScheduler:
             self._scheduler.shutdown(wait=False)
             self._scheduler = None
         await self._release_connector_leases()
-        # The lifespan disposes the engine when stop() returns. An in-flight
-        # fetch releases its own lease after fetch_alerts returns; that write
-        # has to finish first.
-        await self._fetches_idle.wait()
+        await self._wait_for_inflight_release()
         if self._ingest_client is not None:
             await self._ingest_client.aclose()
         self._known_signatures.clear()
@@ -404,6 +419,41 @@ class ConnectorScheduler:
                 leases.append(lease)
         for lease in leases:
             await lease.release()
+
+    async def _wait_for_inflight_release(self) -> None:
+        """Wait until in-flight fetches have released, but not past shutdown.
+
+        The lifespan disposes the engine when stop() returns. A fetch that
+        is still inside fetch_alerts releases after it returns, and that
+        write has to finish first. One that never returns must not hold
+        the process until the grace period kills it. Leaving that lease
+        to expire avoids a second fetch while the first is still running.
+        """
+        try:
+            await asyncio.wait_for(self._fetches_idle.wait(), _STOP_IN_FLIGHT_WAIT_S)
+        except TimeoutError:
+            logger.warning(
+                "connector.scheduler.stop_fetch_timeout wait_seconds=%s in_flight=%s",
+                _STOP_IN_FLIGHT_WAIT_S,
+                sorted(self._fetches_in_flight),
+            )
+
+    async def _finish_inflight(self, key: str) -> None:
+        """Drop one fetch from the in-flight set and, during stop, release.
+
+        The idle event wakes stop() only after every release this stop
+        started has finished. Setting it as soon as the set is empty lets
+        one task wake the waiter while another task is still inside release().
+        """
+        self._fetches_in_flight.discard(key)
+        if self._stopping:
+            self._stop_releases += 1
+            try:
+                await self._release_connector_leases()
+            finally:
+                self._stop_releases -= 1
+        if not self._fetches_in_flight and self._stop_releases == 0:
+            self._fetches_idle.set()
 
     # ------------------------------------------------------------------ reload
 
@@ -688,16 +738,25 @@ class ConnectorScheduler:
             )
         else:
             since_seconds = _coerce_poll_interval(target.connector_config)
-        if not await self._claim_connector_poll(
-            connector_id,
-            float(_coerce_poll_interval(target.connector_config)),
-            backfill=backfill_seconds is not None,
-        ):
-            return
+        # Count this poll before the claim. stop() waits on the idle event,
+        # and a claim blocked on the lease row has to keep that event clear
+        # or shutdown returns and this replica still fetches.
         inflight_key = str(connector_id)
+        if inflight_key in self._fetches_in_flight:
+            logger.info(
+                "connector.scheduler.poll_skipped id=%s reason=fetch_already_in_flight",
+                connector_id,
+            )
+            return
         self._fetches_in_flight.add(inflight_key)
         self._fetches_idle.clear()
         try:
+            if not await self._claim_connector_poll(
+                connector_id,
+                float(_coerce_poll_interval(target.connector_config)),
+                backfill=backfill_seconds is not None,
+            ):
+                return
             try:
                 raw_events = await connector.fetch_alerts(since_seconds=since_seconds)
             except Exception:
@@ -713,13 +772,7 @@ class ConnectorScheduler:
                 await self._record_failure(target.id)
                 return
         finally:
-            self._fetches_in_flight.discard(inflight_key)
-            try:
-                if self._stopping:
-                    await self._release_connector_leases()
-            finally:
-                if not self._fetches_in_flight:
-                    self._fetches_idle.set()
+            await self._finish_inflight(inflight_key)
 
         # A scanner's findings are asset state, not events. The alert path
         # above carries neither the asset nor the CVE a vulnerability row
