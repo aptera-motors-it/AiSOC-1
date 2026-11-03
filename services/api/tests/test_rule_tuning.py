@@ -606,6 +606,48 @@ class TestApplyTuning:
         assert rule.threshold_config["min_severity"] == "critical"
         assert rule.threshold_config["event_threshold"] == 2
 
+    @pytest.mark.asyncio
+    async def test_raise_threshold_uses_compiled_severity_when_the_row_is_off_ladder(self) -> None:
+        actor = _auth_user()
+        rule = _StubRule(
+            rule_id=uuid_for("det-application-001", actor.tenant_id),
+            tenant_id=actor.tenant_id,
+            severity="informational",
+            threshold_config={},
+        )
+        db = _setup_mutator_db(rule)
+
+        await apply_tuning(
+            db,
+            rule_id=rule.id,
+            actor=actor,
+            body=ApplyTuningRequest(action="raise_threshold"),
+        )
+
+        assert rule.threshold_config["min_severity"] == "critical"
+
+    @pytest.mark.asyncio
+    async def test_raise_threshold_rejects_an_off_ladder_custom_severity(self) -> None:
+        actor = _auth_user()
+        rule = _StubRule(
+            tenant_id=actor.tenant_id,
+            severity="informational",
+            threshold_config={},
+        )
+        db = _setup_mutator_db(rule)
+
+        with pytest.raises(HTTPException) as caught:
+            await apply_tuning(
+                db,
+                rule_id=rule.id,
+                actor=actor,
+                body=ApplyTuningRequest(action="raise_threshold"),
+            )
+
+        assert caught.value.status_code == 422
+        assert "min_severity" not in rule.threshold_config
+        db.commit.assert_not_awaited()
+
     def test_apply_request_rejects_a_nul(self) -> None:
         with pytest.raises(ValidationError):
             ApplyTuningRequest(action="add_suppression", suppression_reason="nightly\x00rename")

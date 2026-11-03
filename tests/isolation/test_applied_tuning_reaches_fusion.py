@@ -157,7 +157,53 @@ async def db() -> AsyncIterator[AsyncSession]:
     await engine.dispose()
 
 
-async def _tenant_and_rule(db: AsyncSession) -> tuple[uuid.UUID, uuid.UUID, str, dict[str, str]]:
+class _BothReadBeforeWrite:
+    """Hold the first apply after its read until the second has also read.
+
+    A row lock stops the second read. Seeing that wait lets the first apply
+    commit, which is the serialization the lock is there to provide. The
+    lost update is an assertion on the stored hosts, not a timed-out request.
+    """
+
+    def __init__(self) -> None:
+        self._arrived = 0
+        self._both_read = asyncio.Event()
+
+    async def after_read(self, session: AsyncSession) -> None:
+        self._arrived += 1
+        if self._arrived >= 2:
+            self._both_read.set()
+            return
+        deadline = asyncio.get_running_loop().time() + 5
+        while not self._both_read.is_set():
+            if await _peer_waits_on_rule_row(session):
+                return
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError("the other apply neither read the row nor waited on its lock")
+            await asyncio.sleep(0.02)
+
+
+async def _peer_waits_on_rule_row(session: AsyncSession) -> bool:
+    import sqlalchemy
+
+    found = await session.execute(
+        sqlalchemy.text(
+            "SELECT 1 FROM pg_stat_activity "
+            "WHERE datname = current_database() "
+            "AND pid <> pg_backend_pid() "
+            "AND wait_event_type = 'Lock' "
+            "AND query ILIKE '%detection_rules%' "
+            "LIMIT 1"
+        )
+    )
+    return found.first() is not None
+
+
+async def _tenant_and_rule(
+    db: AsyncSession,
+    *,
+    severity: str = _SEVERITY,
+) -> tuple[uuid.UUID, uuid.UUID, str, dict[str, str]]:
     import sqlalchemy
     from app.core.security import get_password_hash
 
@@ -189,7 +235,7 @@ async def _tenant_and_rule(db: AsyncSession) -> tuple[uuid.UUID, uuid.UUID, str,
             "(id, tenant_id, name, rule_language, rule_body, category, status, severity, provenance) "
             "VALUES (:i, :t, 'Mass file rename', 'sigma', 'title: mass rename', 'impact', 'active', :sev, CAST(:p AS jsonb))"
         ),
-        {"i": rule_id, "t": tenant_id, "sev": _SEVERITY, "p": json.dumps({"source_id": source})},
+        {"i": rule_id, "t": tenant_id, "sev": severity, "p": json.dumps({"source_id": source})},
     )
     await db.commit()
     return tenant_id, rule_id, source, {"email": email}
@@ -276,7 +322,22 @@ async def test_add_suppression_reaches_fusion(app_client: httpx.AsyncClient, db:
     assert decision["other_hits"] == 1, {"decision": decision, "stored": stored}
 
 
-async def test_concurrent_suppressions_both_reach_fusion(app_client: httpx.AsyncClient, db: AsyncSession) -> None:
+async def test_concurrent_suppressions_both_reach_fusion(
+    app_client: httpx.AsyncClient,
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.rule_tuning as rule_tuning
+
+    gate = _BothReadBeforeWrite()
+    original = rule_tuning._load_rule_for_tenant
+
+    async def load_then_hold(session: AsyncSession, *, rule_id: uuid.UUID, tenant_id: uuid.UUID):
+        rule = await original(session, rule_id=rule_id, tenant_id=tenant_id)
+        await gate.after_read(session)
+        return rule
+
+    monkeypatch.setattr(rule_tuning, "_load_rule_for_tenant", load_then_hold)
     tenant_id, rule_id, source, user = await _tenant_and_rule(db)
     headers = await _bearer(app_client, user["email"])
 
@@ -302,6 +363,23 @@ async def test_concurrent_suppressions_both_reach_fusion(app_client: httpx.Async
     assert decision["hits"] == 0, {"decision": decision, "stored": stored}
     assert decision["second_hits"] == 0, {"decision": decision, "stored": stored}
     assert decision["other_hits"] == 1, {"decision": decision, "stored": stored}
+
+
+async def test_off_ladder_custom_severity_is_rejected(app_client: httpx.AsyncClient, db: AsyncSession) -> None:
+    tenant_id, rule_id, source, user = await _tenant_and_rule(db, severity="informational")
+    before = _fusion(str(tenant_id), source)
+    headers = await _bearer(app_client, user["email"])
+    response = await app_client.post(
+        f"/api/v1/detection/tuning/{rule_id}/apply",
+        json={"action": "raise_threshold"},
+        headers=headers,
+    )
+    assert response.status_code == 422, response.text
+    stored = await _stored(db, rule_id)
+    after = _fusion(str(tenant_id), source)
+    assert "min_severity" not in stored["threshold"], stored
+    assert before["hits"] == 1, before
+    assert after["hits"] == 1, after
 
 
 async def test_nul_in_the_apply_body_is_rejected(app_client: httpx.AsyncClient, db: AsyncSession) -> None:

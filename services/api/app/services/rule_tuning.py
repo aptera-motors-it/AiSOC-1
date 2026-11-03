@@ -705,11 +705,18 @@ async def apply_tuning(
 
     if body.action == "raise_threshold":
         catalogue_rule = builtin_by_uuid(rule.id, actor.tenant_id)
+        corpus_severity = None if catalogue_rule is None else catalogue_rule.severity
+        current_threshold = _threshold_config(rule)
+        if _raised_min_severity(rule.severity, corpus_severity, current_threshold.get("min_severity")) is None:
+            raise HTTPException(
+                status_code=422,
+                detail="rule severity is outside info, low, medium, high, critical",
+            )
         next_threshold, old_value, new_value = _bumped_threshold(
-            _threshold_config(rule),
+            current_threshold,
             body.threshold,
             rule_severity=rule.severity,
-            corpus_severity=None if catalogue_rule is None else catalogue_rule.severity,
+            corpus_severity=corpus_severity,
         )
         rule.threshold_config = next_threshold
         changes_payload["threshold"] = {"before": old_value, "after": new_value}
