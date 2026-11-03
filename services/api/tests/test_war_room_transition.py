@@ -1,16 +1,6 @@
-"""A war-room resolve follows the same transition table as the console.
-
-The console refuses a status move that is not an edge in
-``case_status.TRANSITIONS``. ``POST /war-rooms/{id}/decision`` with
-``decision=resolve`` used to write ``status = 'resolved'`` for any current
-status, so a case that was still ``new`` became resolved from chat.
-
-Live PostgreSQL and the shipped ASGI app. The decision route is the path
-the bot calls, and the row it updates is the row the console reads.
-"""
-
 from __future__ import annotations
 
+import asyncio
 import os
 import socket
 import uuid
@@ -19,7 +9,10 @@ from urllib.parse import urlparse
 
 import pytest
 import pytest_asyncio
+from app.db.database import engine as app_engine
+from app.db.rls import set_rls_context
 from app.main import app
+from app.services.case_depth import merge_cases
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -53,9 +46,7 @@ live_only = pytest.mark.skipif(
 async def _release_the_app_pool():
     yield
     if _LIVE:
-        from app.db.database import engine
-
-        await engine.dispose()
+        await app_engine.dispose()
 
 
 async def _seed(status: str) -> tuple[Any, Any, uuid.UUID, uuid.UUID, uuid.UUID]:
@@ -93,6 +84,7 @@ async def _cleanup(maker: Any, tenant_id: uuid.UUID) -> None:
     async with maker() as db:
         await db.execute(text("SELECT set_config('app.audit_retention_purge', 'on', true)"))
         await db.execute(text("DELETE FROM audit_log WHERE tenant_id = :t"), {"t": tenant_id})
+        await db.execute(text("UPDATE aisoc_cases SET merged_into_id = NULL WHERE tenant_id = :t"), {"t": tenant_id})
         await db.execute(text("DELETE FROM aisoc_cases WHERE tenant_id = :t"), {"t": tenant_id})
         await db.execute(text("DELETE FROM tenants WHERE id = :t"), {"t": tenant_id})
         await db.commit()
@@ -150,7 +142,6 @@ async def _decide(room_id: uuid.UUID) -> tuple[int, dict[str, Any]]:
     ],
 )
 async def test_war_room_resolve_follows_the_transition_table(monkeypatch: pytest.MonkeyPatch, status: str, allowed: bool) -> None:
-    """Resolve is a transition to ``resolved``, not a write that skips the table."""
     monkeypatch.setenv("AISOC_AGENTS_SERVICE_TOKEN", _TOKEN)
     engine, maker, tenant_id, case_id, room_id = await _seed(status)
     try:
@@ -171,3 +162,99 @@ async def test_war_room_resolve_follows_the_transition_table(monkeypatch: pytest
     finally:
         await _cleanup(maker, tenant_id)
         await engine.dispose()
+
+
+async def _seed_pair() -> tuple[Any, Any, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID]:
+    engine = create_async_engine(_OWNER_DSN)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    tenant_id = uuid.uuid4()
+    primary_id = uuid.uuid4()
+    duplicate_id = uuid.uuid4()
+    room_id = uuid.uuid4()
+    suffix = tenant_id.hex[:8]
+    async with maker() as db:
+        await db.execute(
+            text("INSERT INTO tenants (id, name, slug) VALUES (:i, :n, :s)"),
+            {"i": tenant_id, "n": f"war-room-{suffix}", "s": f"war-room-{suffix}"},
+        )
+        for case_id, number in ((primary_id, f"P-{suffix}"), (duplicate_id, f"D-{suffix}")):
+            await db.execute(
+                text(
+                    "INSERT INTO aisoc_cases (id, tenant_id, case_number, title, severity, status) "
+                    "VALUES (:i, :t, :n, 'Suspected intrusion', 'high', 'investigating')"
+                ),
+                {"i": case_id, "t": tenant_id, "n": number},
+            )
+        await db.execute(
+            text(
+                "INSERT INTO aisoc_case_war_rooms "
+                "(id, tenant_id, case_id, provider, channel_id, channel_name, state, opened_by) "
+                "VALUES (:i, :t, :c, 'slack', :ch, 'incident', 'open', 'ada@example.com')"
+            ),
+            {"i": room_id, "t": tenant_id, "c": duplicate_id, "ch": f"C{suffix}"},
+        )
+        await db.commit()
+    return engine, maker, tenant_id, primary_id, duplicate_id, room_id
+
+
+async def _waiting_case_statement(maker: Any) -> str | None:
+    async with maker() as db:
+        rows = (
+            (
+                await db.execute(
+                    text(
+                        "SELECT query FROM pg_stat_activity "
+                        "WHERE wait_event_type = 'Lock' "
+                        "AND pid <> pg_backend_pid() "
+                        "AND query LIKE '%aisoc_cases%' "
+                        "AND (query LIKE '%FOR UPDATE%' OR query LIKE '%status = ''resolved''%')"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    return rows[0] if rows else None
+
+
+@live_only
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interleave", ["sequential", "concurrent"])
+async def test_war_room_resolve_does_not_overwrite_a_concurrent_close(monkeypatch: pytest.MonkeyPatch, interleave: str) -> None:
+    monkeypatch.setenv("AISOC_AGENTS_SERVICE_TOKEN", _TOKEN)
+    engine, maker, tenant_id, primary_id, duplicate_id, room_id = await _seed_pair()
+    merger = create_async_engine(_DSN)
+    merger_maker = async_sessionmaker(merger, expire_on_commit=False)
+    try:
+        async with merger_maker() as mdb:
+            await set_rls_context(mdb, tenant_id)
+            await merge_cases(
+                mdb,
+                tenant_id=tenant_id,
+                primary_id=primary_id,
+                duplicate_ids=[duplicate_id],
+                actor="bob@example.com",
+                reason="duplicate",
+            )
+            if interleave == "sequential":
+                await mdb.commit()
+                code, body = await _decide(room_id)
+            else:
+                task = asyncio.create_task(_decide(room_id))
+                waiting = None
+                for _ in range(200):
+                    waiting = await _waiting_case_statement(maker)
+                    if waiting:
+                        break
+                    await asyncio.sleep(0.02)
+                assert waiting, "resolve never blocked on the merge row lock"
+                await mdb.commit()
+                code, body = await task
+        row = await _case_row(maker, duplicate_id)
+        assert code == 422, body
+        assert row["status"] == "closed"
+        assert row["resolved_at"] is None
+    finally:
+        await _cleanup(maker, tenant_id)
+        await engine.dispose()
+        await merger.dispose()
