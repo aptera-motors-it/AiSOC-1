@@ -33,6 +33,8 @@ CONSOLE_SECRET = "approval-resume-console-secret-at-least-32-chars"
 ANSWER_SECRET = "approval-resume-answer-secret-not-a-real-secret"
 TENANT_HEADER = "X-AiSOC-Tenant-ID"
 DEADLINE_SECONDS = 4
+HOLD_SECONDS = 2
+AGENTS_APPLICATION = f"approval-resume-agents-{uuid.uuid4().hex[:12]}"
 
 _AGENTS = Path(__file__).resolve().parents[2] / "services" / "agents"
 
@@ -128,7 +130,7 @@ def agents(tmp_path_factory: pytest.TempPathFactory, realtime: _Realtime) -> Any
     port = _free_port()
     env = {
         **os.environ,
-        "DATABASE_URL": _dsn(),
+        "DATABASE_URL": f"{_dsn()}{'&' if '?' in _dsn() else '?'}application_name={AGENTS_APPLICATION}",
         "AISOC_SERVICE_TOKEN": SERVICE_TOKEN,
         "SECRET_KEY": CONSOLE_SECRET,
         "ENVIRONMENT": "production",
@@ -270,6 +272,25 @@ async def _paused_run(
     callback_first: bool = False,
     **gate: Any,
 ) -> dict[str, Any]:
+    playbook_id, run_id = await _started_run(
+        agents, db, tenant, gates=gates, held_by=held_by, held_at=held_at, after=after, callback_first=callback_first, **gate
+    )
+    pause = await _pause_at(db, tenant, playbook_id, gates[0])
+    return {**pause, "playbook_id": playbook_id, "started_run_id": run_id}
+
+
+async def _started_run(
+    agents: str,
+    db: Any,
+    tenant: str,
+    *,
+    gates: tuple[str, ...] = ("gate",),
+    held_by: _Realtime | None = None,
+    held_at: str = "gate",
+    after: dict[str, Any] | None = None,
+    callback_first: bool = False,
+    **gate: Any,
+) -> tuple[str, str]:
     import httpx
 
     playbook = {
@@ -298,9 +319,7 @@ async def _paused_run(
         if callback_first:
             resumed = await client.post(f"/api/v1/playbook-waits/{await _resume_token(db, tenant, playbook_id, 'callback')}/resume")
             assert resumed.status_code == 202, resumed.text
-
-    pause = await _pause_at(db, tenant, playbook_id, gates[0])
-    return {**pause, "playbook_id": playbook_id, "started_run_id": started.json()["run_id"]}
+    return playbook_id, str(started.json()["run_id"])
 
 
 async def _resume_token(db: Any, tenant: str, playbook_id: str, step_id: str) -> str:
@@ -663,6 +682,71 @@ class TestTheSweeperLeavesADecidedPause:
         await _past_the_deadline(pause)
 
         assert await _pause_status(db, pause) == "expired"
+
+
+async def _blocked_at_pause_write(db: Any) -> None:
+    async def _waiting() -> Any:
+        async with db.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1 "
+                "AND wait_event_type = 'Lock' AND query LIKE '%INSERT INTO aisoc_playbook_pauses%'",
+                AGENTS_APPLICATION,
+            )
+
+    assert await _poll(_waiting), "the run never reached its pause write"
+
+
+async def _decide_once_open(api: Any, db: Any, tenants: dict[str, str], run_id: str, decision: str) -> None:
+    async def _approval() -> Any:
+        async with db.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT id FROM agent_approvals WHERE tenant_id = $1::uuid AND action->>'run_id' = $2",
+                tenants["owner"],
+                run_id,
+            )
+
+    approval_id = await _poll(_approval)
+    assert approval_id is not None, "the run never opened its approval"
+    await _decide(api, tenants, {"approval_id": approval_id}, decision)
+
+
+class TestADecisionBeforeItsPauseIsWritten:
+    async def _decided_while_the_pause_write_waits(
+        self, api: Any, agents: str, db: Any, tenants: dict[str, str], decision: str
+    ) -> tuple[dict[str, Any] | None, str]:
+        owner = tenants["owner"]
+        async with db.acquire() as locker, locker.transaction():
+            # SHARE blocks the pause INSERT and no read, so the run stops at its
+            # pause write for as long as this transaction is open.
+            await locker.execute("LOCK TABLE aisoc_playbook_pauses IN SHARE MODE")
+            playbook_id, run_id = await _started_run(agents, db, owner, expires_in_hours=(HOLD_SECONDS + DEADLINE_SECONDS) / 3600)
+            await _blocked_at_pause_write(db)
+            deciding = asyncio.create_task(_decide_once_open(api, db, tenants, run_id, decision))
+            await asyncio.sleep(HOLD_SECONDS)
+        await deciding
+
+        await _finished_run(agents, owner, run_id)
+        run = await _run_record(agents, owner, run_id)
+        pause = await _pause_at(db, owner, playbook_id, "gate")
+        return run, str(pause["status"])
+
+    async def test_an_approval_decided_as_it_opens_continues_the_run(self, api: Any, agents: str, db: Any, tenants: dict[str, str]) -> None:
+        run, pause = await self._decided_while_the_pause_write_waits(api, agents, db, tenants, "approve")
+
+        assert run is not None and run["status"] == "completed", (
+            f"the approval was recorded and the run reads {run and run['status']}; its pause is {pause}"
+        )
+        assert [step["step_id"] for step in run["step_results"]][-1] == "after"
+        assert pause == "resumed"
+
+    async def test_a_denial_decided_as_it_opens_cancels_the_run(self, api: Any, agents: str, db: Any, tenants: dict[str, str]) -> None:
+        run, pause = await self._decided_while_the_pause_write_waits(api, agents, db, tenants, "deny")
+
+        assert run is not None and run["status"] == "cancelled", (
+            f"the denial was recorded and the run reads {run and run['status']}; its pause is {pause}"
+        )
+        assert "after" not in [step["step_id"] for step in run["step_results"]], "a denied run continued"
+        assert pause == "denied"
 
 
 class TestOnlyTheApiServiceDeliversADecision:
