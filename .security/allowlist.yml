@@ -361,7 +361,7 @@ ceilings:
     # v10 lesson). The same pass found and fixed litellm's missing config
     # volumeMount, which no static scan flags and which made the gateway
     # unable to boot at all.
-    failed: 270
+    failed: 131
     measured_with: "3.2.334"
   tfsec:
     total: 30
