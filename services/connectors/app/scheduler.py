@@ -337,6 +337,10 @@ class ConnectorScheduler:
                 lease=window_seconds,
             )
             if not await lease.acquire():
+                logger.info(
+                    "connector.scheduler.poll_skipped id=%s reason=connector_lease_held",
+                    connector_id,
+                )
                 return False
         except Exception:
             logger.exception("connector.scheduler.lease_failed id=%s", connector_id)
@@ -667,10 +671,6 @@ class ConnectorScheduler:
             float(_coerce_poll_interval(target.connector_config)),
             backfill=backfill_seconds is not None,
         ):
-            logger.info(
-                "connector.scheduler.poll_skipped id=%s reason=connector_lease_held",
-                connector_id,
-            )
             return
         try:
             raw_events = await connector.fetch_alerts(since_seconds=since_seconds)
