@@ -122,11 +122,12 @@ async def _drop(engine: Any, connector_id: uuid.UUID) -> None:
         )
 
 
-async def _run() -> tuple[list[bool], int]:
+async def _run() -> tuple[list[bool], int, int]:
     from app.connectors import CONNECTOR_REGISTRY
     from app.ingest_client import IngestClient
     from app.scheduler import ConnectorScheduler, _job_id
     from app.security.credential_vault import get_vault
+    from sqlalchemy import text
     from sqlalchemy.ext.asyncio import create_async_engine
 
     vendor = _stub_vendor()
@@ -152,7 +153,14 @@ async def _run() -> tuple[list[bool], int]:
             job = scheduler._scheduler.get_job(_job_id(connector_id)) if scheduler._scheduler is not None else None
             jobs.append(job is not None)
             await scheduler._poll_one(connector_id=connector_id)
-        return jobs, len(vendor.fetches)
+        in_window = len(vendor.fetches)
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("UPDATE scheduler_leases SET expires_at = now() - interval '1 second' WHERE scope = :s"),
+                {"s": f"connector-poll:{connector_id}"},
+            )
+        await schedulers[0]._poll_one(connector_id=connector_id)
+        return jobs, in_window, len(vendor.fetches) - in_window
     finally:
         for scheduler in schedulers:
             await scheduler.stop()
@@ -163,6 +171,7 @@ async def _run() -> tuple[list[bool], int]:
 
 
 def test_two_schedulers_fetch_the_stub_vendor_once_per_window() -> None:
-    jobs, fetches = asyncio.run(_run())
+    jobs, in_window, after_expiry = asyncio.run(_run())
     assert jobs == [True, True], jobs
-    assert fetches == 1, fetches
+    assert in_window == 1, in_window
+    assert after_expiry == 1, after_expiry
