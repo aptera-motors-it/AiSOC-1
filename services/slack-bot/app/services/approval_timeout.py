@@ -82,6 +82,7 @@ class ApprovalTimeoutScheduler:
         # behaviour); production injects a PostgresTimerStore.
         self._store: TimerStore = store or InMemoryTimerStore()
         self._timers: dict[str, asyncio.Task[None]] = {}
+        self._records: dict[str, TimerRecord] = {}
 
     @property
     def pending(self) -> int:
@@ -120,6 +121,7 @@ class ApprovalTimeoutScheduler:
             channel=channel,
             approver_id=approver_id,
         )
+        self._records[action_id] = record
         asyncio.create_task(self._store.put(record))  # noqa: RUF006 — fire-and-forget persist
 
         async def _fire() -> None:
@@ -127,6 +129,8 @@ class ApprovalTimeoutScheduler:
                 await asyncio.sleep(timeout_seconds)
             except asyncio.CancelledError:
                 return
+            if self._records.get(action_id) is record:
+                del self._records[action_id]
             # The timer fired — drop the durable row so recovery won't re-arm it.
             with contextlib.suppress(Exception):
                 await self._store.delete(action_id)
@@ -185,6 +189,7 @@ class ApprovalTimeoutScheduler:
         """
         # Human decided in time (or explicit cancel) — drop the durable row so a
         # restart won't resurrect a timer for an already-decided action.
+        self._records.pop(action_id, None)
         asyncio.create_task(self._store.delete(action_id))  # noqa: RUF006 — fire-and-forget
 
         existing = self._timers.pop(action_id, None)
@@ -192,6 +197,30 @@ class ApprovalTimeoutScheduler:
             return False
         existing.cancel()
         return True
+
+    def suspend(self, action_id: str) -> TimerRecord | None:
+        """Stop the timer and return its record so a failed click can resume it.
+
+        Returns ``None`` when nothing is still waiting, including when the
+        fallback has already started.
+        """
+        record = self._records.get(action_id)
+        if record is None or not self.cancel(action_id):
+            return None
+        return record
+
+    def resume(self, record: TimerRecord) -> asyncio.Task[None]:
+        """Arm whatever is left of a suspended deadline."""
+        remaining = max(0.0, record.fire_at_epoch - time.time())
+        safe_default: SafeDefault = "approved" if record.safe_default == "approved" else "rejected"
+        return self.schedule(
+            record.action_id,
+            timeout_seconds=remaining,
+            safe_default=safe_default,
+            case_id=record.case_id,
+            channel=record.channel,
+            approver_id=record.approver_id,
+        )
 
     async def recover(self) -> int:
         """Re-arm timers from the durable store after a restart.
@@ -240,3 +269,4 @@ class ApprovalTimeoutScheduler:
                 # reference.
                 _ = await task
         self._timers.clear()
+        self._records.clear()

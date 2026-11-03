@@ -57,7 +57,7 @@ class ApprovalCardRequest(BaseModel):
         ),
     )
     related_alerts: list[dict[str, Any]] | None = None
-    timeout_seconds: int | None = None
+    timeout_seconds: int | None = Field(default=None, ge=0, le=7 * 24 * 60 * 60)
 
 
 def _authorized(supplied: str | None) -> bool:

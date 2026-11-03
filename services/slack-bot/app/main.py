@@ -65,6 +65,7 @@ from app.notify import router as notify_router
 from app.services.aisoc_clients import AisocActionsClient, AisocApiClient
 from app.services.approval_audit import StructlogAuditSink
 from app.services.approval_timeout import ApprovalTimeoutScheduler
+from app.services.timer_store import TimerRecord
 from app.war_room import router as war_room_router
 
 # Configure structlog before anything else so module-level loggers
@@ -231,6 +232,10 @@ async def _route_action_decision(
         first = actions[0] or {}
         button_value = first.get("value") or ""
 
+    suspended: TimerRecord | None = None
+    if timeout_scheduler is not None and event_action_id in {APPROVE_ACTION_ID, DENY_ACTION_ID}:
+        suspended = timeout_scheduler.suspend(button_value.split("|", 1)[0].strip())
+
     try:
         payload = await handle_action_decision(
             action_id_event=event_action_id,
@@ -247,12 +252,8 @@ async def _route_action_decision(
             "response_type": "ephemeral",
             "text": f"⚠️ Internal error: {exc}",
         }
-    # A terminal decision replaces the card. Drop the timer first so the
-    # deadline cannot reject an action a person already decided.
-    if timeout_scheduler is not None and payload.get("replace_original"):
-        decided = button_value.split("|", 1)[0].strip()
-        if decided:
-            timeout_scheduler.cancel(decided)
+    if suspended is not None and timeout_scheduler is not None and not payload.get("replace_original"):
+        timeout_scheduler.resume(suspended)
     await respond(payload)
 
 
