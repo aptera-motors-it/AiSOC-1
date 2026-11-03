@@ -240,7 +240,10 @@ def tick(state: dict) -> None:
             nag.count += 1
             nag.last = now.isoformat()
             state["escalations"][case.id] = nag.__dict__
-            save_state(state)
+            try:
+                save_state(state)
+            except Exception as exc:
+                log(f"ERROR saving escalation state after {case.ref}: {type(exc).__name__}: {exc}")
 
         if should_send_digest(state.get("digest_last", ""), now):
             try:
