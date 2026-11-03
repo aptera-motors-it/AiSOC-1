@@ -177,11 +177,11 @@ class ConnectorScheduler:
         # None when leader election is off, which is the default and
         # means this replica always schedules.
         self._lease: LeaderLease | None = None
-        # Distinct from any other scheduler in this process. The hostname
-        # alone collides when two schedulers share a process, and a shared
-        # holder would treat the second as the replica that already won.
+        # release() matches this string. Two schedulers in one process share
+        # a hostname, and one stop must not expire the other's row.
         self._holder = f"{holder_identity()}:{uuid.uuid4().hex[:12]}"
         self._poll_claims: dict[str, datetime] = {}
+        self._connector_leases: dict[str, LeaderLease] = {}
         # Cache of {connector_id_str: last_seen_config_signature} so reloads
         # can detect when an instance's poll interval / config changed and
         # need its job rescheduled, vs leaving an unchanged job alone.
@@ -322,8 +322,6 @@ class ConnectorScheduler:
         chooses who schedules; the lease chooses who fetches. A backfill
         from the replica that already holds the window may fetch again.
         """
-        if self._engine is None:
-            return False
         key = str(connector_id)
         now = datetime.now(UTC)
         held_until = self._poll_claims.get(key)
@@ -345,6 +343,7 @@ class ConnectorScheduler:
         except Exception:
             logger.exception("connector.scheduler.lease_failed id=%s", connector_id)
             return False
+        self._connector_leases[key] = lease
         self._poll_claims[key] = now + timedelta(seconds=window_seconds)
         return True
 
@@ -378,10 +377,24 @@ class ConnectorScheduler:
             # successful polls before this point).
             self._scheduler.shutdown(wait=False)
             self._scheduler = None
+        await self._release_connector_leases()
         if self._ingest_client is not None:
             await self._ingest_client.aclose()
         self._known_signatures.clear()
         logger.info("connector.scheduler.stopped")
+
+    async def _release_connector_leases(self) -> None:
+        """Expire the connector leases this scheduler holds.
+
+        A stopped process does not poll. Leaving the row until the window
+        ends keeps the survivor from fetching, including the single replica
+        that just restarted.
+        """
+        leases = list(self._connector_leases.values())
+        self._connector_leases.clear()
+        self._poll_claims.clear()
+        for lease in leases:
+            await lease.release()
 
     # ------------------------------------------------------------------ reload
 
