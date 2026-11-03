@@ -194,6 +194,10 @@ class ApplyTuningRequest(BaseModel):
         max_length=255,
         description="Free-text reason recorded with the suppression placeholder.",
     )
+    suppress_when: dict[str, list[str]] | None = Field(
+        default=None,
+        description="Field values that suppress this rule, stored as suppression_config.suppress_when.",
+    )
 
 
 class DismissTuningRequest(BaseModel):
@@ -550,8 +554,60 @@ async def _load_rule_for_tenant(
     return rule
 
 
-def _bumped_threshold(current: dict[str, Any], override: int | None) -> tuple[dict[str, Any], int, int]:
-    """Return (new_config, old_threshold, new_threshold)."""
+_SEVERITY_LADDER = ("info", "low", "medium", "high", "critical")
+
+
+def _raised_min_severity(rule_severity: object, existing: object) -> str | None:
+    """One step above the higher of the rule severity and any stored floor.
+
+    Fusion holds a match only when the rule sits strictly below
+    ``min_severity``. ``critical`` has no higher step.
+    """
+    ranks: list[int] = []
+    for value in (rule_severity, existing):
+        if isinstance(value, str):
+            key = value.strip().lower()
+            if key in _SEVERITY_LADDER:
+                ranks.append(_SEVERITY_LADDER.index(key))
+    if not ranks:
+        return None
+    return _SEVERITY_LADDER[min(max(ranks) + 1, len(_SEVERITY_LADDER) - 1)]
+
+
+def _string_list(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    if value is None:
+        return []
+    return [str(value)]
+
+
+def _merged_suppress_when(current: dict[str, Any], incoming: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Keep values already stored and add the ones this apply named."""
+    merged: dict[str, list[str]] = {}
+    raw = current.get("suppress_when")
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            merged[str(key)] = _string_list(value)
+    for key, values in incoming.items():
+        bucket = merged.setdefault(str(key), [])
+        for item in _string_list(values):
+            if item not in bucket:
+                bucket.append(item)
+    return merged
+
+
+def _bumped_threshold(
+    current: dict[str, Any],
+    override: int | None,
+    *,
+    rule_severity: str | None,
+) -> tuple[dict[str, Any], int, int]:
+    """Return (new_config, old_threshold, new_threshold).
+
+    ``event_threshold`` stays the event count. ``min_severity`` is the floor
+    fusion compares with the rule's severity.
+    """
     next_config = dict(current)
     raw_existing = current.get("event_threshold") or current.get("threshold")
     try:
@@ -561,6 +617,9 @@ def _bumped_threshold(current: dict[str, Any], override: int | None) -> tuple[di
     new_value = override if override is not None else max(existing + 1, 2)
     next_config["event_threshold"] = new_value
     next_config["last_raised_at"] = datetime.now(UTC).isoformat()
+    floor = _raised_min_severity(rule_severity, current.get("min_severity"))
+    if floor is not None:
+        next_config["min_severity"] = floor
     return next_config, existing, new_value
 
 
@@ -569,10 +628,13 @@ def _appended_suppression(
     *,
     reason: str | None,
     actor_email: str | None,
+    suppress_when: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
-    """Append a placeholder suppression record. The real suppression engine
-    interprets ``suppression_config.rules`` — this just gives it a starting
-    point that analysts can refine."""
+    """Record a suppression the workbench added.
+
+    ``rules`` is the analyst's note. ``suppress_when`` is the field match
+    fusion reads when deciding whether the rule fires.
+    """
     next_config = dict(current)
     rules_list = list(next_config.get("rules") or [])
     rules_list.append(
@@ -585,6 +647,8 @@ def _appended_suppression(
     )
     next_config["rules"] = rules_list
     next_config["last_tuned_at"] = datetime.now(UTC).isoformat()
+    if suppress_when is not None:
+        next_config["suppress_when"] = _merged_suppress_when(current, suppress_when)
     return next_config
 
 
@@ -638,6 +702,7 @@ async def apply_tuning(
         next_threshold, old_value, new_value = _bumped_threshold(
             _threshold_config(rule),
             body.threshold,
+            rule_severity=rule.severity,
         )
         rule.threshold_config = next_threshold
         changes_payload["threshold"] = {"before": old_value, "after": new_value}
@@ -647,6 +712,7 @@ async def apply_tuning(
             _suppression_config(rule),
             reason=body.suppression_reason or body.note,
             actor_email=actor.email,
+            suppress_when=body.suppress_when,
         )
         changes_payload["suppression_reason"] = body.suppression_reason or body.note
 
