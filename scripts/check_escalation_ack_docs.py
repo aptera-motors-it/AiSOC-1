@@ -202,7 +202,6 @@ def _migration_case_ack_writers(root: Path) -> list[str]:
 def gate_escalation_ack_docs(root: Path) -> list[Finding]:
     findings: list[Finding] = []
     readme = _read(root, README)
-    bridge_path = root / BRIDGE
     bridge_doc = _bridge_module_doc(root)
 
     if not readme:
@@ -236,7 +235,7 @@ def gate_escalation_ack_docs(root: Path) -> list[Finding]:
                 findings.append(
                     Finding(
                         str(rel),
-                        'must say today only the war-room acknowledge decision (exclusive writer)',
+                        "must say today only the war-room acknowledge decision (exclusive writer)",
                     )
                 )
         else:
@@ -244,7 +243,7 @@ def gate_escalation_ack_docs(root: Path) -> list[Finding]:
                 findings.append(
                     Finding(
                         str(rel),
-                        'module docstring must say today only the war-room acknowledge decision writes it',
+                        "module docstring must say today only the war-room acknowledge decision writes it",
                     )
                 )
         if ALT_ACK_WRITER.search(lowered) or ALT_ACK_WRITER.search(plain):
@@ -303,7 +302,7 @@ WAR_ROOM_ACK_SNIPPET = (
     'if decision == "acknowledge":\n'
     '    "UPDATE aisoc_cases SET acknowledged_at = COALESCE(acknowledged_at, :now)"\n'
     'elif decision == "escalate":\n'
-    '    pass\n'
+    "    pass\n"
 )
 
 GOOD_README = """# escalations
@@ -482,9 +481,7 @@ def _self_test() -> int:
         rogue = noise / "services/api/app/noise.py"
         rogue.parent.mkdir(parents=True, exist_ok=True)
         rogue.write_text(
-            'def f(row):\n'
-            '    db.execute("UPDATE aisoc_cases SET status = %s", row["status"])\n'
-            '    return row["acknowledged_at"]\n',
+            'def f(row):\n    db.execute("UPDATE aisoc_cases SET status = %s", row["status"])\n    return row["acknowledged_at"]\n',
             encoding="utf-8",
         )
         passed_noise = len(gate_escalation_ack_docs(noise)) == 0
