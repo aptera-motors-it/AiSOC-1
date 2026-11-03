@@ -54,11 +54,19 @@ def test_clean_fixture_passes(tree: Path) -> None:
     assert gate.check_root_lockfile(tree) == []
 
 
-def test_flags_vulnerable_minimatch(tree: Path) -> None:
-    text = (tree / "pnpm-lock.yaml").read_text(encoding="utf-8").replace("11.0.4", "3.1.5")
+def test_flags_scoped_vulnerable_minimatch(tree: Path) -> None:
+    text = (tree / "pnpm-lock.yaml").read_text(encoding="utf-8").replace("11.0.4", "10.2.6")
     (tree / "pnpm-lock.yaml").write_text(text, encoding="utf-8")
     problems = gate.check_root_lockfile(tree)
-    assert any("minimatch@3.1.5" in p for p in problems), problems
+    assert any("minimatch@10.2.6" in p for p in problems), problems
+
+
+def test_allows_legacy_minimatch_three(tree: Path) -> None:
+    text = (tree / "pnpm-lock.yaml").read_text(encoding="utf-8").replace(
+        "/minimatch@11.0.4:", "  /minimatch@3.1.5:\n    resolution: {integrity: sha512-legacy}\n  /minimatch@11.0.4:"
+    )
+    (tree / "pnpm-lock.yaml").write_text(text, encoding="utf-8")
+    assert gate.check_root_lockfile(tree) == []
 
 
 def test_flags_vulnerable_deepmerge(tree: Path) -> None:
@@ -72,6 +80,15 @@ def test_missing_lockfile_is_not_clean(tree: Path) -> None:
     (tree / "pnpm-lock.yaml").unlink()
     problems = gate.check_root_lockfile(tree)
     assert problems and "missing" in problems[0]
+
+
+def test_flags_quoted_minimatch_key(tree: Path) -> None:
+    text = (tree / "pnpm-lock.yaml").read_text(encoding="utf-8").replace(
+        "/minimatch@11.0.4:", "'/minimatch@10.2.6':"
+    )
+    (tree / "pnpm-lock.yaml").write_text(text, encoding="utf-8")
+    problems = gate.check_root_lockfile(tree)
+    assert any("minimatch@10.2.6" in p for p in problems), problems
 
 
 def test_gate_cli_on_this_repository() -> None:

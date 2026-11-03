@@ -7,12 +7,17 @@ and only fails on high/critical findings, so moderate ``minimatch`` and low
 ``deepmerge`` advisories on the root lockfile can sit as warnings forever while
 Dependabot and ``pnpm audit`` still name them on every push.
 
-This gate is narrower and stricter: it reads the resolved versions in the root
-lockfile and refuses any copy outside the fixed ranges recorded for
-GHSA-g3hv-75wg-m249 (minimatch before 11.0.1) and GHSA-gcqx-w48m-w2h4
-(deepmerge 4.2.0 through 4.3.1). ``apps/mobile`` keeps its own lockfile and is
-out of scope here on purpose — the workspace file is what the console and docs
-builds use.
+This gate is narrower and stricter than ``security_audit.py`` for two packages it
+can actually move without breaking the tree:
+
+* **deepmerge** — refuse GHSA-gcqx-w48m-w2h4 (4.2.0 through 4.3.1); pin below 4.2.0.
+* **minimatch** — refuse GHSA-g3hv-75wg-m249 only on **major >= 9** copies below 11.0.1
+  (the same range the root ``minimatch@>=9.0.0`` override already fixes). Legacy
+  ``minimatch@3`` / ``5`` lines stay on their toolchain majors: forcing them to 11
+  breaks ``glob@7`` and ``nyc`` (see CHANGELOG / #1574).
+
+Package keys using registry tarballs or quoted paths are parsed the same as
+``/pkg@version:`` entries. ``apps/mobile`` is out of scope.
 """
 
 from __future__ import annotations
@@ -27,11 +32,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gate_toolkit import repo_root, self_test_main
 
 _PNPM_PKG = re.compile(
-    r"^ {2}/(?P<name>@[^/@\s]+/[^@\s]+|[^@/\s][^@\s]*)@(?P<version>\d[^(:\s]*)",
+    r"^ {2}(?:'/|/)(?P<name>@[^/@\s'\"]+/[^@\s'\"]+|[^@/\s'\"][^@\s'\"]*)@(?P<version>\d[\d.]*)(?:':|:)",
+    re.MULTILINE,
+)
+_PNPM_TARBALL = re.compile(
+    r"^ {2}['\"]?@[^'\"]+/(?P<name>[^/'\"]+)/-/[^/'\"]+-(?P<version>\d[\d.]*)\.tgz['\"]?:",
     re.MULTILINE,
 )
 
 _MINIMATCH_FLOOR = (11, 0, 1)
+_MINIMATCH_SCOPED_MAJOR = 9
 _DEEPMERGE_VULN_LOW = (4, 2, 0)
 _DEEPMERGE_VULN_HIGH = (4, 3, 1)
 
@@ -60,7 +70,22 @@ def parse_pnpm_lock_versions(text: str) -> dict[str, list[str]]:
     resolved: dict[str, list[str]] = {}
     for match in _PNPM_PKG.finditer(text):
         resolved.setdefault(match.group("name"), []).append(match.group("version"))
+    for match in _PNPM_TARBALL.finditer(text):
+        resolved.setdefault(match.group("name"), []).append(match.group("version"))
     return resolved
+
+
+def _minimatch_problems(versions: set[str]) -> list[str]:
+    problems: list[str] = []
+    for version in sorted(versions):
+        parsed = _parse_version(version)
+        if parsed[0] < _MINIMATCH_SCOPED_MAJOR:
+            continue
+        if _lt(parsed, _MINIMATCH_FLOOR):
+            problems.append(
+                f"minimatch@{version} is below 11.0.1 (GHSA-g3hv-75wg-m249); raise the minimatch@>=9.0.0 override and refresh the lockfile"
+            )
+    return problems
 
 
 def findings_for_lockfile(text: str) -> list[str]:
@@ -69,13 +94,8 @@ def findings_for_lockfile(text: str) -> list[str]:
     if not resolved:
         return ["pnpm-lock.yaml contains no resolved package entries — nothing was scanned"]
 
-    for version in sorted(set(resolved.get("minimatch", []))):
-        parsed = _parse_version(version)
-        if _lt(parsed, _MINIMATCH_FLOOR):
-            problems.append(
-                f"minimatch@{version} is below 11.0.1 (GHSA-g3hv-75wg-m249); "
-                "raise it with a pnpm override and refresh the lockfile"
-            )
+    for line in _minimatch_problems(set(resolved.get("minimatch", []))):
+        problems.append(line)
 
     for version in sorted(set(resolved.get("deepmerge", []))):
         parsed = _parse_version(version)
@@ -122,16 +142,34 @@ def _self_test_cases() -> list[tuple[str, bool]]:
         [
             "lockfileVersion: '9.0'",
             "packages:",
-            "  /minimatch@3.1.5:",
+            "  /minimatch@10.2.6:",
             "    resolution: {integrity: x}",
             "  /deepmerge@4.3.1:",
             "    resolution: {integrity: y}",
         ]
     )
-    good = bad.replace("3.1.5", "11.0.4").replace("4.3.1", "4.1.2")
+    good = bad.replace("10.2.6", "11.0.4").replace("4.3.1", "4.1.2")
+    quoted = bad.replace("/minimatch@10.2.6:", "'/minimatch@10.2.6':")
+    tarball = bad.replace(
+        "  /minimatch@10.2.6:",
+        "  '@registry.npmjs.org/minimatch/-/minimatch-10.2.6.tgz':",
+    )
+    legacy = "\n".join(
+        [
+            "lockfileVersion: '9.0'",
+            "packages:",
+            "  /minimatch@3.1.5:",
+            "    resolution: {integrity: x}",
+            "  /deepmerge@4.1.2:",
+            "    resolution: {integrity: y}",
+        ]
+    )
     return [
-        ("flags known-vulnerable minimatch and deepmerge", len(findings_for_lockfile(bad)) >= 2),
+        ("flags scoped minimatch and vulnerable deepmerge", len(findings_for_lockfile(bad)) >= 2),
         ("accepts fixed minimatch/deepmerge versions", not findings_for_lockfile(good)),
+        ("flags quoted pnpm package keys", bool(findings_for_lockfile(quoted))),
+        ("flags registry tarball package keys", bool(findings_for_lockfile(tarball))),
+        ("allows legacy minimatch 3.x with fixed deepmerge", not findings_for_lockfile(legacy)),
     ]
 
 
