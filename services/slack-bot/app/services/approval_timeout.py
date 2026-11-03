@@ -83,6 +83,8 @@ class ApprovalTimeoutScheduler:
         self._store: TimerStore = store or InMemoryTimerStore()
         self._timers: dict[str, asyncio.Task[None]] = {}
         self._records: dict[str, TimerRecord] = {}
+        self._epoch: dict[str, int] = {}
+        self._open_epoch: dict[str, int] = {}
 
     @property
     def pending(self) -> int:
@@ -110,6 +112,7 @@ class ApprovalTimeoutScheduler:
         existing = self._timers.get(action_id)
         if existing is not None and not existing.done():
             existing.cancel()
+        self._epoch[action_id] = self._epoch.get(action_id, 0) + 1
 
         # Phase B3 — persist the pending timer so a restart can recover it.
         # Best-effort: a store failure never blocks arming the in-memory timer.
@@ -189,6 +192,8 @@ class ApprovalTimeoutScheduler:
         """
         # Human decided in time (or explicit cancel) — drop the durable row so a
         # restart won't resurrect a timer for an already-decided action.
+        self._epoch[action_id] = self._epoch.get(action_id, 0) + 1
+        self._open_epoch.pop(action_id, None)
         self._records.pop(action_id, None)
         asyncio.create_task(self._store.delete(action_id))  # noqa: RUF006 — fire-and-forget
 
@@ -199,21 +204,21 @@ class ApprovalTimeoutScheduler:
         return True
 
     def suspend(self, action_id: str) -> TimerRecord | None:
-        """Stop the in-memory sleep and return its record.
-
-        The store row stays. ``cancel`` is what drops it, and that waits
-        until the decision has replaced the card.
-        """
+        """Stop the in-memory sleep and return its record. The store row stays."""
         record = self._records.get(action_id)
         task = self._timers.get(action_id)
         if record is None or task is None or task.done():
             return None
+        self._open_epoch[action_id] = self._epoch.get(action_id, 0)
         self._timers.pop(action_id, None)
         task.cancel()
         return record
 
-    def resume(self, record: TimerRecord) -> asyncio.Task[None]:
-        """Arm whatever is left of a suspended deadline."""
+    def resume(self, record: TimerRecord) -> asyncio.Task[None] | None:
+        """Arm the time left unless a decision already dropped this deadline."""
+        seen = self._open_epoch.pop(record.action_id, None)
+        if seen is None or seen != self._epoch.get(record.action_id):
+            return None
         remaining = max(0.0, record.fire_at_epoch - time.time())
         safe_default: SafeDefault = "approved" if record.safe_default == "approved" else "rejected"
         return self.schedule(

@@ -232,9 +232,10 @@ async def _route_action_decision(
         first = actions[0] or {}
         button_value = first.get("value") or ""
 
+    action_id = button_value.split("|", 1)[0].strip()
     suspended: TimerRecord | None = None
-    if timeout_scheduler is not None and event_action_id in {APPROVE_ACTION_ID, DENY_ACTION_ID}:
-        suspended = timeout_scheduler.suspend(button_value.split("|", 1)[0].strip())
+    if timeout_scheduler is not None and event_action_id in {APPROVE_ACTION_ID, DENY_ACTION_ID} and action_id:
+        suspended = timeout_scheduler.suspend(action_id)
 
     try:
         payload = await handle_action_decision(
@@ -252,11 +253,10 @@ async def _route_action_decision(
             "response_type": "ephemeral",
             "text": f"⚠️ Internal error: {exc}",
         }
-    if suspended is not None and timeout_scheduler is not None:
-        if payload.get("replace_original"):
-            timeout_scheduler.cancel(suspended.action_id)
-        else:
-            timeout_scheduler.resume(suspended)
+    if timeout_scheduler is not None and action_id and payload.get("replace_original"):
+        timeout_scheduler.cancel(action_id)
+    elif suspended is not None and timeout_scheduler is not None:
+        timeout_scheduler.resume(suspended)
     await respond(payload)
 
 
