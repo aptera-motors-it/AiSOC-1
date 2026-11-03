@@ -24928,11 +24928,15 @@ components:
             - new
             - triaging
             - triaged
-            - in_progress
             - investigating
+            - in_progress
+            - escalated
+            - snoozed
             - resolved
-            - false_positive
             - closed
+            - false_positive
+            - fp
+            - dismissed
           - type: 'null'
           title: Status
         priority:
