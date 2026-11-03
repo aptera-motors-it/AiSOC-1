@@ -68,7 +68,7 @@ def test_osv_scanner_reports_no_known_vulnerabilities(module_dir: str) -> None:
     osv = _require_tool("osv-scanner")
     go_mod = REPO_ROOT / module_dir / "go.mod"
     proc = subprocess.run(
-        [osv, "scan", "source", "-L", str(go_mod)],
+        [osv, "scan", "source", "-L", str(go_mod), "--all-vulns"],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
@@ -76,8 +76,11 @@ def test_osv_scanner_reports_no_known_vulnerabilities(module_dir: str) -> None:
     )
     combined = proc.stdout + proc.stderr
     assert proc.returncode == 0, f"osv-scanner failed for {module_dir}:\n{combined}"
-    assert "Total 0 packages affected" in combined or "No issues found" in combined, (
-        f"osv-scanner reported vulnerabilities for {module_dir}:\n{combined}"
+    assert "Uncalled vulnerabilities" not in combined, (
+        f"osv-scanner --all-vulns reported uncalled vulnerabilities for {module_dir}:\n{combined}"
+    )
+    assert "No issues found" in combined, (
+        f"osv-scanner --all-vulns must report a clean lockfile for {module_dir}:\n{combined}"
     )
 
 
