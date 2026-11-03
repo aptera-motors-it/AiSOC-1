@@ -189,10 +189,11 @@ async def test_two_workers_attempt_a_due_row_once(owner, monkeypatch: pytest.Mon
 
 
 class _ReplyServer(ThreadingHTTPServer):
-    def __init__(self, status_code: int, body: bytes) -> None:
+    def __init__(self, status_code: int, body: bytes, content_type: str = "text/plain") -> None:
         super().__init__(("127.0.0.1", 0), _Reply)
         self.status_code = status_code
         self.body = body
+        self.content_type = content_type
         self.count = 0
         self.lock = threading.Lock()
 
@@ -206,7 +207,7 @@ class _Reply(BaseHTTPRequestHandler):
             server.count += 1
         payload = server.body
         self.send_response(server.status_code)
-        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Type", server.content_type)
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -215,8 +216,8 @@ class _Reply(BaseHTTPRequestHandler):
         return
 
 
-def _serve(status_code: int, body: bytes) -> tuple[_ReplyServer, threading.Thread]:
-    server = _ReplyServer(status_code, body)
+def _serve(status_code: int, body: bytes, content_type: str = "text/plain") -> tuple[_ReplyServer, threading.Thread]:
+    server = _ReplyServer(status_code, body, content_type)
     thread = threading.Thread(target=server.serve_forever, name="webhook-reply", daemon=True)
     thread.start()
     return server, thread
@@ -306,5 +307,62 @@ async def test_a_nul_error_body_is_recorded_and_the_next_row_is_sent(owner, monk
         bad_thread.join(timeout=2)
         good_thread.join(timeout=2)
         await _delete_tenant(owner, poisoned_tenant)
+        await _delete_tenant(owner, healthy_tenant)
+        await app_engine.dispose()
+
+
+def _host(server: _ReplyServer) -> str:
+    bound = server.server_address[0]
+    if isinstance(bound, str):
+        return bound
+    return bound.decode()
+
+
+@pytest.mark.asyncio
+async def test_an_undecodable_error_body_is_recorded_and_the_next_row_is_sent(owner, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AISOC_SSRF_ALLOW_HOSTS", "127.0.0.1")
+    for name in _PROXY_VARS:
+        monkeypatch.delenv(name, raising=False)
+    surrogate, surrogate_thread = _serve(500, b"upstream +2AA- error", "text/plain; charset=utf-7")
+    odd, odd_thread = _serve(500, b"upstream error", "text/plain; charset=hex")
+    good, good_thread = _serve(200, b"ok")
+    surrogate_tenant, surrogate_id = await _seed_due(
+        owner, url=f"http://{_host(surrogate)}:{surrogate.server_address[1]}/bad", attempts=PRIOR_ATTEMPTS, age_s=10
+    )
+    odd_tenant, odd_id = await _seed_due(owner, url=f"http://{_host(odd)}:{odd.server_address[1]}/odd", attempts=PRIOR_ATTEMPTS, age_s=8)
+    healthy_tenant, healthy_id = await _seed_due(
+        owner, url=f"http://{_host(good)}:{good.server_address[1]}/good", attempts=PRIOR_ATTEMPTS, age_s=5
+    )
+    try:
+        tally = await run_once()
+        again = await run_once()
+        rows = (
+            await owner.execute(
+                text("SELECT id, attempts, status, last_error FROM aisoc_outbound_deliveries WHERE id IN (:a, :b, :c)"),
+                {"a": surrogate_id, "b": odd_id, "c": healthy_id},
+            )
+        ).all()
+        by_id = {row.id: row for row in rows}
+        assert tally["attempted"] == 3
+        assert again["attempted"] == 0
+        for delivery_id in (surrogate_id, odd_id):
+            row = by_id[delivery_id]
+            assert row.attempts == PRIOR_ATTEMPTS + 1
+            assert row.status == "pending"
+            assert row.last_error
+            assert "\x00" not in row.last_error
+            assert "\ud800" not in row.last_error
+        healthy = by_id[healthy_id]
+        assert healthy.attempts == PRIOR_ATTEMPTS + 1
+        assert healthy.status == "delivered"
+        assert surrogate.count == 1
+        assert odd.count == 1
+        assert good.count == 1
+    finally:
+        for server, thread in ((surrogate, surrogate_thread), (odd, odd_thread), (good, good_thread)):
+            server.shutdown()
+            thread.join(timeout=2)
+        await _delete_tenant(owner, surrogate_tenant)
+        await _delete_tenant(owner, odd_tenant)
         await _delete_tenant(owner, healthy_tenant)
         await app_engine.dispose()
