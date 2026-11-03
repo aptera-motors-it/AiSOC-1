@@ -1,18 +1,3 @@
-"""An enabled destination receives the status moves it subscribes to.
-
-``enqueue_event`` queues one delivery per enabled destination whose
-subscription includes the event. An empty subscription means every event.
-A destination that is disabled, subscribed to a different event, or owned
-by another tenant gets no row. A write that does not change status gets
-no row either.
-
-The request goes through the shipped ASGI app: a real JWT, the alert and
-case PATCH routes, and PostgreSQL with the migration chain applied. The
-app connects as whatever ``DATABASE_URL`` names. Seeding uses
-``DATABASE_MIGRATION_URL`` when that is set, so the owner can create the
-scratch tenant while the runtime role stays the one the request uses.
-"""
-
 from __future__ import annotations
 
 import json
@@ -30,7 +15,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 _OWNER_DSN = os.environ.get("DATABASE_MIGRATION_URL", "").strip() or os.environ.get("DATABASE_URL", "")
 _REQUIRED = os.environ.get("OUTBOUND_ENQUEUE_PROOF_REQUIRED", "").strip() not in ("", "0", "false")
 
-_UNUSABLE_PASSWORD_HASH = "x"  # noqa: S105 - not a credential; no plaintext maps to it
+_LOGIN_HASH = "x"
 
 ALERT_STATUS_CHANGED = "alert.status_changed"
 CASE_STATUS_CHANGED = "case.status_changed"
@@ -63,7 +48,6 @@ async def _release_the_app_pool():
 
 @pytest_asyncio.fixture
 async def world():
-    """Two tenants, one analyst each, and one open alert on the first."""
     from app.core.security import create_access_token
 
     engine = create_async_engine(_OWNER_DSN)
@@ -96,7 +80,7 @@ async def world():
                     "t": tid,
                     "e": f"{name}-{suffix}@example.com",
                     "u": f"{name}-{suffix}",
-                    "h": _UNUSABLE_PASSWORD_HASH,
+                    "h": _LOGIN_HASH,
                 },
             )
         await db.execute(
