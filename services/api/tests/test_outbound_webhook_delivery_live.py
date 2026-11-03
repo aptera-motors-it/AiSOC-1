@@ -127,7 +127,9 @@ async def test_two_workers_leave_attempts_at_n_plus_one(owner, monkeypatch: pyte
     webhook_id = uuid.uuid4()
     delivery_id = uuid.uuid4()
     server, thread = _start_server()
-    host, port = server.server_address[:2]
+    bound_host = server.server_address[0]
+    host = bound_host.decode() if isinstance(bound_host, bytes) else bound_host
+    port = server.server_address[1]
     monkeypatch.setenv("AISOC_SSRF_ALLOW_HOSTS", "127.0.0.1")
     for name in _PROXY_VARS:
         monkeypatch.delenv(name, raising=False)
@@ -174,8 +176,9 @@ async def test_two_workers_leave_attempts_at_n_plus_one(owner, monkeypatch: pyte
         ).one()
         assert posts == 1, f"one due row was posted {posts} times while both workers ran"
         errors = [result for result in finished if isinstance(result, BaseException)]
+        tallies = [result for result in finished if isinstance(result, dict)]
         assert not errors, errors
-        assert sum(result["attempted"] for result in finished) == 1
+        assert sum(result["attempted"] for result in tallies) == 1
         assert row.attempts == N + 1
         assert row.status == "delivered"
         with server.lock:
