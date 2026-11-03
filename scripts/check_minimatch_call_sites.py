@@ -31,13 +31,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--modules-dir", type=Path, default=None)
     args = parser.parse_args(argv)
     root = (args.root or repo_root()).resolve()
-    modules = args.modules_dir
-    if modules is None:
-        modules = root / _GLOB_MODULES
-    if not modules.is_dir():
-        print(f"check_minimatch_call_sites: missing {modules}", file=sys.stderr)
-        return 1
-    code, output = run_check(root, modules)
+    code, output = run_check(root, args.modules_dir)
     if output.strip():
         print(output.rstrip())
     return code
@@ -45,11 +39,8 @@ def main(argv: list[str] | None = None) -> int:
 
 def _self_test_cases() -> list[tuple[str, bool]]:
     root = repo_root()
-    modules = root / _GLOB_MODULES
-    if not modules.is_dir():
-        return [("glob@7 fixture present", False)]
-    code, _ = run_check(root, modules)
-    return [("glob.sync and related call sites pass at repo head", code == 0)]
+    code, _ = run_check(root, None)
+    return [("wildcard glob/rimraf/serve/eslint call sites pass at repo head", code == 0)]
 
 
 if __name__ == "__main__":
