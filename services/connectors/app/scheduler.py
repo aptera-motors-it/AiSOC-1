@@ -49,6 +49,7 @@ Design rationale
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -184,6 +185,8 @@ class ConnectorScheduler:
         self._poll_claims: dict[str, datetime] = {}
         self._connector_leases: dict[str, LeaderLease] = {}
         self._fetches_in_flight: set[str] = set()
+        self._fetches_idle = asyncio.Event()
+        self._fetches_idle.set()
         # Cache of {connector_id_str: last_seen_config_signature} so reloads
         # can detect when an instance's poll interval / config changed and
         # need its job rescheduled, vs leaving an unchanged job alone.
@@ -379,13 +382,13 @@ class ConnectorScheduler:
         """Stop the scheduler and release resources."""
         self._stopping = True
         if self._scheduler is not None:
-            # ``wait=False`` so we don't block shutdown waiting for an
-            # in-flight poll to finish; the next start picks up where we
-            # left off (record_poll_success has already been written for
-            # successful polls before this point).
             self._scheduler.shutdown(wait=False)
             self._scheduler = None
         await self._release_connector_leases()
+        # The lifespan disposes the engine when stop() returns. An in-flight
+        # fetch releases its own lease after fetch_alerts returns; that write
+        # has to finish first.
+        await self._fetches_idle.wait()
         if self._ingest_client is not None:
             await self._ingest_client.aclose()
         self._known_signatures.clear()
@@ -693,6 +696,7 @@ class ConnectorScheduler:
             return
         inflight_key = str(connector_id)
         self._fetches_in_flight.add(inflight_key)
+        self._fetches_idle.clear()
         try:
             try:
                 raw_events = await connector.fetch_alerts(since_seconds=since_seconds)
@@ -710,8 +714,12 @@ class ConnectorScheduler:
                 return
         finally:
             self._fetches_in_flight.discard(inflight_key)
-            if self._stopping:
-                await self._release_connector_leases()
+            try:
+                if self._stopping:
+                    await self._release_connector_leases()
+            finally:
+                if not self._fetches_in_flight:
+                    self._fetches_idle.set()
 
         # A scanner's findings are asset state, not events. The alert path
         # above carries neither the asset nor the CVE a vulnerability row

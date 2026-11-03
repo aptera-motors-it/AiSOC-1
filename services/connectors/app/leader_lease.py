@@ -153,18 +153,32 @@ _ACQUIRE_SQL = text(
     """
 )
 
-#: Renewing. Conditional on still being the holder *and* on the lease not
-#: having already lapsed: a process that was paused past its expiry must
-#: not resume and renew a lease someone else has taken.
-_RENEW_SQL = text(
+#: Renewing. Conditional on still being the holder and on the lease not
+#: having already lapsed at the start of the transaction. ``now()`` is that
+#: start, so a lock wait can outlast the row. The new expiry is taken from
+#: ``clock_timestamp()`` and the caller rejects the renew when the previous
+#: expiry is already behind that clock. The row is still extended: a
+#: rejected renew must not leave an expiry another replica can take.
+_RENEW_LOCK_SQL = text(
     """
-    UPDATE scheduler_leases
-       SET renewed_at = now(),
-           expires_at = now() + make_interval(secs => :lease)
+    SELECT expires_at > clock_timestamp()
+      FROM scheduler_leases
      WHERE scope = :scope
        AND holder = :holder
        AND expires_at >= now()
-    RETURNING fenced_at, expires_at
+     FOR UPDATE
+    """
+)
+
+_RENEW_SQL = text(
+    """
+    UPDATE scheduler_leases
+       SET renewed_at = clock_timestamp(),
+           expires_at = clock_timestamp() + make_interval(secs => :lease)
+     WHERE scope = :scope
+       AND holder = :holder
+       AND expires_at >= now()
+    RETURNING fenced_at, expires_at, expires_at > clock_timestamp()
     """
 )
 
@@ -245,25 +259,45 @@ class LeaderLease:
         return True
 
     async def renew(self) -> bool:
-        """Extend the lease. Returns whether it is still held.
+        """Extend the lease. Returns whether this process may keep using it.
 
-        A ``False`` here is a leadership loss and the caller must stop
-        scheduling. It is not an error to retry past: the lease has gone
-        to someone else, or this process was paused past its own expiry,
-        and continuing to poll in either case is the double-poll this
-        exists to prevent.
+        A ``False`` here means stop scheduling. The lease has gone to
+        someone else, or this process was paused past its own expiry, or
+        the lock wait outlasted the time left on the row. In that last
+        case the row is still extended from ``clock_timestamp()``, so
+        another replica cannot take an expiry the wait already passed.
         """
         async with self._engine.begin() as conn:
-            row = (await conn.execute(_RENEW_SQL, {"scope": self._scope, "holder": self._holder, "lease": self._lease})).first()
-        if row is None:
-            if self._held:
-                logger.warning(
-                    "scheduler.lease.lost scope=%s holder=%s term=%s — stopping scheduling",
-                    self._scope,
-                    self._holder,
-                    self._term,
+            locked = (
+                await conn.execute(
+                    _RENEW_LOCK_SQL,
+                    {"scope": self._scope, "holder": self._holder},
                 )
+            ).first()
+            if locked is None:
+                if self._held:
+                    logger.warning(
+                        "scheduler.lease.lost scope=%s holder=%s term=%s — stopping scheduling",
+                        self._scope,
+                        self._holder,
+                        self._term,
+                    )
+                self._held = False
+                return False
+            row = (
+                await conn.execute(
+                    _RENEW_SQL,
+                    {"scope": self._scope, "holder": self._holder, "lease": self._lease},
+                )
+            ).first()
+        if row is None or not row[2] or not locked[0]:
             self._held = False
+            logger.info(
+                "scheduler.lease.expired_on_renew scope=%s holder=%s expires=%s",
+                self._scope,
+                self._holder,
+                None if row is None else row[1],
+            )
             return False
         self._held = True
         return True

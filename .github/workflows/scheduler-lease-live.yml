@@ -204,3 +204,113 @@ jobs:
             exit 1
           fi
           echo "OK: without the expiry check the blocked acquire leads and the suite goes red, as it must."
+
+      # A lock wait longer than the time left on the row uses transaction-start
+      # now(). Dropping the clock check lets that renew count, and the holder
+      # fetches. Stamping the new expiry from now() instead of clock_timestamp()
+      # leaves the row in the past, and the other replica takes it.
+      - name: The gate fails when renew ignores an already-past lease
+        working-directory: services/connectors
+        env:
+          ISOLATION_LEASE_DSN: ${{ env.LEASE_DSN }}
+          ISOLATION_CONNECTOR_DSN: ${{ env.LEASE_DSN }}
+          PYTHONPATH: .
+        run: |
+          set -euo pipefail
+          cp app/leader_lease.py /tmp/lease-renew.bak
+          python - <<'PY'
+          import pathlib, sys
+          p = pathlib.Path("app/leader_lease.py")
+          s = p.read_text()
+          needle = " or not locked[0]"
+          if s.count(needle) != 1:
+              print("negative control could not find the expired-on-renew check; "
+                    "renew has been reshaped and this control no longer proves anything")
+              sys.exit(1)
+          p.write_text(s.replace(needle, "", 1))
+          PY
+          set +e
+          python -m pytest \
+            ../../tests/isolation/test_scheduler_lease_live.py::TestRenewal::test_a_renew_that_waits_out_the_remaining_lease_does_not_open_the_row \
+            ../../tests/isolation/test_connector_poll_once_live.py::test_a_renew_that_waits_out_the_remaining_lease_does_not_fetch \
+            -q >/dev/null 2>&1
+          rc=$?
+          set -e
+          cp /tmp/lease-renew.bak app/leader_lease.py
+          if [ "$rc" -eq 0 ]; then
+            echo "FAIL: a renew that waited out its lease still authorized a fetch."
+            exit 1
+          fi
+          echo "OK: without the renew clock check the waited renew fetches and the suite goes red, as it must."
+
+      - name: The gate fails when renew stamps transaction-start now()
+        working-directory: services/connectors
+        env:
+          ISOLATION_LEASE_DSN: ${{ env.LEASE_DSN }}
+          PYTHONPATH: .
+        run: |
+          set -euo pipefail
+          cp app/leader_lease.py /tmp/lease-renew-stamp.bak
+          python - <<'PY'
+          import pathlib, sys
+          p = pathlib.Path("app/leader_lease.py")
+          s = p.read_text()
+          needle = "           expires_at = clock_timestamp() + make_interval(secs => :lease)\n"
+          if s.count(needle) != 1:
+              print("negative control could not find the renew expiry stamp; "
+                    "renew has been reshaped and this control no longer proves anything")
+              sys.exit(1)
+          p.write_text(s.replace(
+              needle,
+              "           expires_at = now() + make_interval(secs => :lease)\n",
+              1,
+          ))
+          PY
+          set +e
+          python -m pytest \
+            ../../tests/isolation/test_scheduler_lease_live.py::TestRenewal::test_a_renew_that_waits_out_the_remaining_lease_does_not_open_the_row \
+            -q >/dev/null 2>&1
+          rc=$?
+          set -e
+          cp /tmp/lease-renew-stamp.bak app/leader_lease.py
+          if [ "$rc" -eq 0 ]; then
+            echo "FAIL: a renew stamped from now() left the row for the other replica."
+            exit 1
+          fi
+          echo "OK: stamping renew from now() opens the row and the suite goes red, as it must."
+
+      # stop() returns into the lifespan, which disposes the engine. Dropping
+      # the wait lets the in-flight release run after that, the write is
+      # swallowed, and the other replica does not fetch.
+      - name: The gate fails when stop returns before the in-flight release
+        working-directory: services/connectors
+        env:
+          ISOLATION_LEASE_DSN: ${{ env.LEASE_DSN }}
+          ISOLATION_CONNECTOR_DSN: ${{ env.LEASE_DSN }}
+          PYTHONPATH: .
+        run: |
+          set -euo pipefail
+          cp app/scheduler.py /tmp/scheduler-stop.bak
+          python - <<'PY'
+          import pathlib, sys
+          p = pathlib.Path("app/scheduler.py")
+          s = p.read_text()
+          needle = "        await self._fetches_idle.wait()\n"
+          if s.count(needle) != 1:
+              print("negative control could not find the in-flight wait; "
+                    "stop has been reshaped and this control no longer proves anything")
+              sys.exit(1)
+          p.write_text(s.replace(needle, "", 1))
+          PY
+          set +e
+          python -m pytest \
+            ../../tests/isolation/test_connector_poll_once_live.py::test_an_in_flight_lease_is_released_before_the_engine_closes \
+            -q >/dev/null 2>&1
+          rc=$?
+          set -e
+          cp /tmp/scheduler-stop.bak app/scheduler.py
+          if [ "$rc" -eq 0 ]; then
+            echo "FAIL: stop returned before the in-flight release and the other replica still fetched."
+            exit 1
+          fi
+          echo "OK: without the wait the in-flight release is swallowed and the suite goes red, as it must."

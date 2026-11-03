@@ -250,7 +250,10 @@ async def _stop_during_fetch() -> tuple[int, bool, int]:
         await second.start()
         first_poll = asyncio.create_task(first._poll_one(connector_id=connector_id))
         await asyncio.wait_for(vendor.entered.wait(), 10)
-        await first.stop()
+        # stop() waits until this fetch releases its lease. Waiting here
+        # would sit on the hold gate below.
+        stop_task = asyncio.create_task(first.stop())
+        await asyncio.sleep(0.05)
         still_in_fetch = not first_poll.done()
         vendor.entered.clear()
         second_poll = asyncio.create_task(second._poll_one(connector_id=connector_id))
@@ -260,6 +263,7 @@ async def _stop_during_fetch() -> tuple[int, bool, int]:
         except TimeoutError:
             second_entered = False
         vendor.hold.set()
+        await asyncio.wait_for(stop_task, 10)
         await asyncio.gather(first_poll, second_poll)
         before = len(vendor.fetches)
         await second._poll_one(connector_id=connector_id)
@@ -432,3 +436,207 @@ def test_the_holder_polls_on_the_next_tick_while_its_lease_is_live() -> None:
     assert during == 0, during
     assert again == 1, again
     assert after == 0, after
+
+
+async def _remaining_seconds(engine: Any, connector_id: uuid.UUID) -> float:
+    from sqlalchemy import text
+
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text("SELECT EXTRACT(EPOCH FROM (expires_at - clock_timestamp())) FROM scheduler_leases WHERE scope = :s"),
+                {"s": f"connector-poll:{connector_id}"},
+            )
+        ).first()
+    if row is None or row[0] is None:
+        return -1.0
+    return float(row[0])
+
+
+async def _renew_past_the_remaining_lease() -> tuple[int, int, float, int, int, bool]:
+    from app.connectors import CONNECTOR_REGISTRY
+    from app.ingest_client import IngestClient
+    from app.leader_lease import LeaderLease
+    from app.scheduler import ConnectorScheduler
+    from app.security.credential_vault import get_vault
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    vendor = _stub_vendor()
+    vendor.fetches = []
+    CONNECTOR_REGISTRY["stub_vendor"] = vendor
+    os.environ["AISOC_SCHEDULER_LEADER_ELECTION"] = "false"
+
+    server, url = _ingest_url()
+    engine = create_async_engine(_dsn())
+    connector_id = _connector_id()
+    holder = ConnectorScheduler(engine=engine, ingest_client=IngestClient(url), vault=get_vault())
+    other = ConnectorScheduler(engine=engine, ingest_client=IngestClient(url), vault=get_vault())
+    scope = f"connector-poll:{connector_id}"
+    original_acquire = LeaderLease.acquire
+    late: asyncio.Task[None] | None = None
+    lock = None
+    try:
+        await _seed(engine, connector_id)
+        await holder.start()
+        await other.start()
+        await holder._poll_one(connector_id=connector_id)
+        await other._poll_one(connector_id=connector_id)
+        during = len(vendor.fetches)
+        await holder._poll_one(connector_id=connector_id)
+        valid = len(vendor.fetches) - during
+        remaining = await _remaining_seconds(engine, connector_id)
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("UPDATE scheduler_leases SET expires_at = clock_timestamp() + interval '4 seconds' WHERE scope = :s"),
+                {"s": scope},
+            )
+        lock = await engine.connect()
+        await lock.begin()
+        await lock.execute(
+            text("UPDATE scheduler_leases SET renewed_at = renewed_at WHERE scope = :s"),
+            {"s": scope},
+        )
+
+        async def _acquire_loses(self: LeaderLease) -> bool:
+            del self
+            return False
+
+        # acquire() takes the same row lock. Losing without a statement lets
+        # the wait sit inside renew(), which is what authorizes the fetch.
+        LeaderLease.acquire = _acquire_loses  # type: ignore[method-assign]
+        late = asyncio.create_task(holder._poll_one(connector_id=connector_id))
+        await asyncio.sleep(1.0)
+        renew_blocked = not late.done()
+        await asyncio.sleep(4.0)
+        await lock.commit()
+        await late
+        late = None
+        late_fetches = len(vendor.fetches) - during - valid
+        before = len(vendor.fetches)
+        await other._poll_one(connector_id=connector_id)
+        return valid, during, remaining, late_fetches, len(vendor.fetches) - before, renew_blocked
+    finally:
+        LeaderLease.acquire = original_acquire  # type: ignore[method-assign]
+        if lock is not None:
+            await lock.close()
+        if late is not None and not late.done():
+            late.cancel()
+        await holder.stop()
+        await other.stop()
+        await _drop(engine, connector_id)
+        await engine.dispose()
+        server.shutdown()
+        CONNECTOR_REGISTRY.pop("stub_vendor", None)
+
+
+def test_a_renew_that_waits_out_the_remaining_lease_does_not_fetch() -> None:
+    """A lock wait uses transaction-start now().
+
+    When the wait outlasts the time left on the row, this replica must not
+    fetch and the other replica must not take the row. A renew of a lease
+    that is still valid must still fetch, and must not shorten that lease.
+    """
+    valid, during, remaining, late_fetches, other_after, renew_blocked = asyncio.run(_renew_past_the_remaining_lease())
+    assert renew_blocked is True, renew_blocked
+    assert valid == 1, valid
+    assert during == 1, during
+    assert remaining >= 200.0, remaining
+    assert late_fetches == 0, late_fetches
+    assert other_after == 0, other_after
+
+
+class _ClosedEngine:
+    """A process engine the lifespan has finished with. Writes must fail."""
+
+    def begin(self) -> None:
+        raise RuntimeError("engine disposed")
+
+
+def _close_process_engine(scheduler: Any) -> None:
+    closed = _ClosedEngine()
+    scheduler._engine = closed
+    for lease in scheduler._connector_leases.values():
+        lease._engine = closed
+
+
+async def _in_flight_release_after_stop() -> tuple[int, int, int, int]:
+    from app.connectors import CONNECTOR_REGISTRY
+    from app.ingest_client import IngestClient
+    from app.scheduler import ConnectorScheduler
+    from app.security.credential_vault import get_vault
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    vendor = _gated_vendor()
+    vendor.fetches = []
+    vendor.in_flight = 0
+    vendor.max_in_flight = 0
+    vendor.hold = asyncio.Event()
+    vendor.entered = asyncio.Event()
+    CONNECTOR_REGISTRY["stub_vendor"] = vendor
+    os.environ["AISOC_SCHEDULER_LEADER_ELECTION"] = "false"
+
+    server, url = _ingest_url()
+    holder_engine = create_async_engine(_dsn())
+    survivor_engine = create_async_engine(_dsn())
+    connector_id = _connector_id()
+    holder = ConnectorScheduler(engine=holder_engine, ingest_client=IngestClient(url), vault=get_vault())
+    survivor = ConnectorScheduler(engine=survivor_engine, ingest_client=IngestClient(url), vault=get_vault())
+    poll: asyncio.Task[None] | None = None
+    shutdown: asyncio.Task[None] | None = None
+    try:
+        await _seed(holder_engine, connector_id)
+        await holder.start()
+        await survivor.start()
+        poll = asyncio.create_task(holder._poll_one(connector_id=connector_id))
+        await asyncio.wait_for(vendor.entered.wait(), 10)
+
+        async def _lifespan_shutdown() -> None:
+            await holder.stop()
+            # dispose() installs a fresh pool, so a later begin() still
+            # writes. The lifespan has finished with this engine: close it.
+            await holder_engine.dispose()
+            _close_process_engine(holder)
+
+        shutdown = asyncio.create_task(_lifespan_shutdown())
+        await asyncio.wait({shutdown}, timeout=1.0)
+        await survivor._poll_one(connector_id=connector_id)
+        while_fetch_runs = len(vendor.fetches) - 1
+        vendor.hold.set()
+        try:
+            await asyncio.wait_for(poll, 10)
+        except Exception:
+            pass
+        await asyncio.wait_for(shutdown, 10)
+        before = len(vendor.fetches)
+        await survivor._poll_one(connector_id=connector_id)
+        return while_fetch_runs, len(vendor.fetches) - before, vendor.max_in_flight, before
+    finally:
+        if vendor.hold is not None:
+            vendor.hold.set()
+        for task in (poll, shutdown):
+            if task is not None and not task.done():
+                try:
+                    await asyncio.wait_for(task, 10)
+                except Exception:
+                    pass
+        await survivor.stop()
+        await holder.stop()
+        await _drop(survivor_engine, connector_id)
+        await survivor_engine.dispose()
+        server.shutdown()
+        CONNECTOR_REGISTRY.pop("stub_vendor", None)
+
+
+def test_an_in_flight_lease_is_released_before_the_engine_closes() -> None:
+    """The lifespan disposes the engine as soon as stop() returns.
+
+    A release that runs after that cannot write, and the other replica
+    waits out the poll window. Releasing at the start of stop() would let
+    that replica fetch while this one is still inside fetch_alerts.
+    """
+    while_fetch_runs, after_stop, max_in_flight, fetches_before_survivor = asyncio.run(_in_flight_release_after_stop())
+    assert while_fetch_runs == 0, while_fetch_runs
+    assert max_in_flight == 1, max_in_flight
+    assert fetches_before_survivor == 1, fetches_before_survivor
+    assert after_stop == 1, after_stop

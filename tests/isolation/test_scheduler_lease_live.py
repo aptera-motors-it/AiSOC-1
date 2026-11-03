@@ -200,6 +200,49 @@ class TestRenewal:
         await asyncio.sleep(1.2)
         assert await a.renew() is False, "a lapsed holder renewed its own expired lease"
 
+    async def test_a_renew_that_waits_out_the_remaining_lease_does_not_open_the_row(self, engine, scope):
+        """``now()`` is the start of the transaction.
+
+        A lock wait longer than the lease must not count as a renew, and the
+        row must not be left where another replica can take it. A renew that
+        does not wait still extends the full lease.
+        """
+        from sqlalchemy import text
+
+        holder = _lease(engine, scope, "replica-a", seconds=30.0)
+        assert await holder.acquire() is True
+        assert await holder.renew() is True
+        async with engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text("SELECT EXTRACT(EPOCH FROM (expires_at - clock_timestamp())) FROM scheduler_leases WHERE scope = :s"),
+                    {"s": scope},
+                )
+            ).first()
+        remaining = -1.0 if row is None or row[0] is None else float(row[0])
+        assert remaining >= 29.0, remaining
+        await holder.release()
+
+        short = _lease(engine, scope, "replica-a", seconds=1.0)
+        assert await short.acquire() is True
+        blocker = await engine.connect()
+        try:
+            await blocker.begin()
+            await blocker.execute(
+                text("UPDATE scheduler_leases SET renewed_at = renewed_at WHERE scope = :s"),
+                {"s": scope},
+            )
+            renew_task = asyncio.create_task(short.renew())
+            await asyncio.sleep(2.0)
+            await blocker.commit()
+        finally:
+            await blocker.close()
+
+        renewed = await asyncio.wait_for(renew_task, timeout=5)
+        other = _lease(engine, scope, "replica-b", seconds=30.0)
+        other_took = await other.acquire()
+        assert (renewed, short.held, other_took) == (False, False, False)
+
     async def test_renewal_does_not_advance_the_term(self, engine, scope):
         # The term counts leadership changes. A heartbeat that incremented
         # it would make the number useless for the one question it answers.
