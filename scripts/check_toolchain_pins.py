@@ -476,6 +476,8 @@ _SETUP_ACTION = re.compile(r"uses:\s*actions/setup-(?P<runtime>node|go|python)@"
 # though no `*-version:` key appears.
 _JOB_CONTAINER = re.compile(r"^\s*image:\s*(?P<image>[\w./-]+:[\w.-]+)\s*$", re.MULTILINE)
 _PNPM_ACTION = re.compile(r"uses:\s*pnpm/action-setup@\w+\s*#\s*(?P<version>v[\d.]+)")
+_USES_ACTION = re.compile(r"^\s*(?:-\s*)?uses:\s*(?P<ref>[^\s#]+)", re.MULTILINE)
+_ACTION_COMMIT_SHA = re.compile(r"@[0-9a-f]{40}\b", re.IGNORECASE)
 
 # `FROM node:20-alpine AS base`, `FROM golang:1.26-alpine`, `FROM python:3.11-slim`.
 _DOCKER_FROM = re.compile(
@@ -1918,6 +1920,25 @@ def check_pnpm_actions(data: Scan) -> list[str]:
     return problems
 
 
+def check_workflow_action_pins(root: Path) -> list[str]:
+    """Third-party workflow actions pinned to a commit SHA, not a movable tag."""
+    problems: list[str] = []
+    workflows = root / ".github" / "workflows"
+    if not workflows.is_dir():
+        return problems
+    for path in sorted(workflows.glob("*.yml")):
+        rel = path.relative_to(root).as_posix()
+        text = path.read_text(encoding="utf-8")
+        for match in _USES_ACTION.finditer(text):
+            ref = match.group("ref")
+            if ref.startswith("./"):
+                continue
+            if _ACTION_COMMIT_SHA.search(ref):
+                continue
+            problems.append(f"{rel} uses `{ref}` without a commit SHA — a tag move can change what CI executes (workflow action pin)")
+    return problems
+
+
 # Loose enough to see a declaration the strict parsers miss, strict enough not
 # to fire on prose. Used only to compare against what the parser extracted.
 _RUNTIME_MENTION = re.compile(
@@ -2054,6 +2075,7 @@ def run(root: Path, verbose: bool = False) -> tuple[int, list[str]]:
         + check_published_service_ci(root, data)
         + check_esbuild_overrides(root, data)
         + check_pnpm_actions(data)
+        + check_workflow_action_pins(root)
         + check_node_root_corpus(data)
         + check_override_propagation(root, data)
         + check_override_parser_coverage(root, data)
@@ -2156,13 +2178,13 @@ def _fixture(root: Path) -> None:
     (root / ".github" / "workflows" / "ci.yml").write_text(
         "name: CI\njobs:\n"
         "  node:\n    steps:\n"
-        "      - uses: pnpm/action-setup@aaa # v6.0.9\n"
-        "      - uses: actions/setup-node@bbb # v6\n"
+        "      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9\n"
+        "      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6\n"
         "        with:\n          node-version: '22'\n"
         "      - run: pnpm install --frozen-lockfile\n"
         "      - run: |\n          cd services/web-svc\n          npm test\n"
         "  go:\n    steps:\n"
-        "      - uses: actions/setup-go@ccc # v7\n"
+        "      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7\n"
         "        with:\n          go-version: '1.26'\n"
         "          cache-dependency-path: services/go-svc/go.sum\n"
         "      - run: |\n          cd services/go-svc\n          go build ./...\n"
@@ -2171,7 +2193,7 @@ def _fixture(root: Path) -> None:
         # above. Keeping it in the clean fixture means removing job scoping
         # breaks `clean fixture passes`, not merely one injected case.
         "  py:\n    strategy:\n      matrix:\n        service:\n          - py-svc\n    steps:\n"
-        "      - uses: actions/setup-python@ddd # v7\n"
+        "      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7\n"
         "        with:\n          python-version: '3.11'\n"
         "      - run: |\n          cd services/${{ matrix.service }}\n          pytest\n"
         "  gofmt:\n    steps:\n"
@@ -2512,6 +2534,12 @@ def self_test() -> int:
         (root / "pnpm-lock.yaml").unlink()
         (root / "apps" / "satellite" / "pnpm-lock.yaml").unlink()
 
+    def drift_floating_workflow_action(root: Path) -> None:
+        (root / ".github" / "workflows" / "chaos.yml").write_text(
+            "name: Chaos\njobs:\n  j:\n    steps:\n      - uses: actions/checkout@v7\n",
+            encoding="utf-8",
+        )
+
     cases = [
         ("clean fixture passes", None, None),
         ("ship -> test (image behind CI)", drift_node_image_behind_ci, "ship -> test"),
@@ -2556,6 +2584,7 @@ def self_test() -> int:
         ("override block the parser cannot read", drift_override_block_the_parser_cannot_read, "override parser coverage"),
         ("range the comparison cannot evaluate", drift_range_the_comparison_cannot_evaluate, "cannot evaluate"),
         ("no install root at all", drift_no_install_root_at_all, "no Node install root"),
+        ("floating workflow action tag", drift_floating_workflow_action, "workflow action pin"),
     ]
 
     failures: list[str] = []

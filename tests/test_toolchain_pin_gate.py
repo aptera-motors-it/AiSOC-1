@@ -328,6 +328,27 @@ def test_a_pnpm_exemption_for_a_workflow_without_pnpm_has_rotted():
     assert any("rot" in p for p in gate.check_pnpm_actions(scan))
 
 
+def test_floating_workflow_action_ref_is_rejected(tmp_path: Path) -> None:
+    workflows = tmp_path / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "chaos.yml").write_text(
+        "jobs:\n  j:\n    steps:\n      - uses: actions/checkout@v7\n",
+        encoding="utf-8",
+    )
+    problems = gate.check_workflow_action_pins(tmp_path)
+    assert any("chaos.yml" in p and "checkout@v7" in p for p in problems)
+
+
+def test_local_composite_actions_skip_sha_enforcement(tmp_path: Path) -> None:
+    workflows = tmp_path / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "live.yml").write_text(
+        "jobs:\n  j:\n    steps:\n      - uses: ./.github/actions/start-postgres\n",
+        encoding="utf-8",
+    )
+    assert gate.check_workflow_action_pins(tmp_path) == []
+
+
 def test_every_declared_exemption_carries_a_reason():
     """An exemption without a reason is a hole with a comment next to it."""
     for registry in (gate.PNPM_ACTION_EXEMPT, gate.UNLOCKED_INSTALL_EXEMPT, gate.EXPECTED_ESBUILD):
