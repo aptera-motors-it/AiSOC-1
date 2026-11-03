@@ -1673,7 +1673,41 @@ jobs:
           SECRET_KEY: ci-dummy-secret-key-at-least-32bytes!
           DATABASE_URL: postgresql+asyncpg://x:x@localhost/x
         run: |
-          $RUNNER_TEMP/.venv-api/bin/python -m pytest tests/ -v --tb=short
+          # This URL is a placeholder, so the live delivery file would skip
+          # and the job would stay green. The step below runs it on Postgres.
+          $RUNNER_TEMP/.venv-api/bin/python -m pytest tests/ -v --tb=short \
+            --ignore=tests/test_outbound_webhook_delivery_live.py
+      - name: Start PostgreSQL with registry fallback
+        uses: ./.github/actions/start-postgres
+        with:
+          password: aisoc_ci_secret
+          tag: "16"
+      - name: Apply the migration chain for the webhook delivery suite
+        working-directory: services/api
+        env:
+          ENVIRONMENT: development
+          SECRET_KEY: ci-dummy-secret-key-at-least-32bytes!
+          DATABASE_URL: postgresql+asyncpg://aisoc_app:aisoc_app_ci_secret@localhost:5432/aisoc
+          DATABASE_MIGRATION_URL: postgresql+asyncpg://aisoc:aisoc_ci_secret@localhost:5432/aisoc
+          AISOC_APP_DB_PASSWORD: aisoc_app_ci_secret
+          AISOC_MIGRATIONS_STRICT: "1"
+        run: $RUNNER_TEMP/.venv-api/bin/python -m app.scripts.run_migrations
+      - name: Two delivery workers attempt one due webhook once (live Postgres)
+        working-directory: services/api
+        env:
+          ENVIRONMENT: development
+          SECRET_KEY: ci-dummy-secret-key-at-least-32bytes!
+          DATABASE_URL: postgresql+asyncpg://aisoc_app:aisoc_app_ci_secret@localhost:5432/aisoc
+          DATABASE_MIGRATION_URL: postgresql+asyncpg://aisoc:aisoc_ci_secret@localhost:5432/aisoc
+          MSSP_ISOLATION_REQUIRED: "1"
+        run: |
+          set -euo pipefail
+          $RUNNER_TEMP/.venv-api/bin/python -m pytest tests/test_outbound_webhook_delivery_live.py -v --tb=short -rs \
+            | tee /tmp/webhook-delivery.log
+          grep -qE '[1-9][0-9]* passed' /tmp/webhook-delivery.log \
+            || { echo "::error::the webhook delivery live suite did not report any passing test"; exit 1; }
+          ! grep -qE 'skipped' /tmp/webhook-delivery.log \
+            || { echo "::error::the webhook delivery live suite skipped a test"; exit 1; }
       # This used to be a hand-maintained list of 26 file paths, which is the
       # same "a matrix is a list somebody has to remember to add to" shape
       # called out for the Go modules further down, and it had the same
