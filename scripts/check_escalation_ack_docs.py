@@ -64,9 +64,23 @@ MIGRATION_ACK_WRITE = re.compile(
 )
 
 CASE_ACK_SET = re.compile(
-    r"UPDATE\s+aisoc_cases\s+SET[^;]*acknowledged_at",
-    re.IGNORECASE | re.DOTALL,
+    r"UPDATE\s+aisoc_cases\s+SET[^\n;]*acknowledged_at",
+    re.IGNORECASE,
 )
+
+
+def _bridge_module_doc(root: Path) -> str:
+    path = root / BRIDGE
+    if not path.is_file():
+        return ""
+    text = path.read_text(encoding="utf-8")
+    if text.startswith('"""'):
+        parts = text.split('"""', 2)
+        return parts[1] if len(parts) > 2 else ""
+    if text.startswith("'''"):
+        parts = text.split("'''", 2)
+        return parts[1] if len(parts) > 2 else ""
+    return ""
 
 
 def _mentions_case_ack_write(body: str) -> bool:
@@ -74,7 +88,7 @@ def _mentions_case_ack_write(body: str) -> bool:
     if CASE_ACK_SET.search(body):
         return True
     if re.search(
-        r"UPDATE[\s\S]{0,40}aisoc_cases[\s\S]{0,80}SET[\s\S]{0,80}acknowledged_at",
+        r"UPDATE[^\n]{0,160}aisoc_cases[^\n]{0,120}SET[^\n]{0,120}acknowledged_at",
         body,
         re.IGNORECASE,
     ):
@@ -189,9 +203,7 @@ def gate_escalation_ack_docs(root: Path) -> list[Finding]:
     findings: list[Finding] = []
     readme = _read(root, README)
     bridge_path = root / BRIDGE
-    bridge_doc = ""
-    if bridge_path.is_file():
-        bridge_doc = bridge_path.read_text(encoding="utf-8").split('"""', 2)[1]
+    bridge_doc = _bridge_module_doc(root)
 
     if not readme:
         findings.append(Finding(str(README), "missing; operators cannot read what stops paging"))
@@ -439,6 +451,47 @@ def _self_test() -> int:
         print(f"  {'PASS' if caught_branch else 'FAIL'}  ack write outside acknowledge branch is refused")
     finally:
         shutil.rmtree(wrong_branch, ignore_errors=True)
+
+    triple = Path(tempfile.mkdtemp(prefix="esc-ack-triple-quote-"))
+    try:
+        _write_minimal_tree(
+            triple,
+            readme=GOOD_README,
+            bridge_doc=(
+                "'''Ack bridge.\n\n"
+                "* today only the war-room acknowledge decision writes it "
+                "(`services/api/app/services/war_room.py`).\n'''\n"
+            ),
+            war_room=WAR_ROOM_ACK_SNIPPET,
+        )
+        caught_triple = gate_escalation_ack_docs(triple)
+        passed_triple = len(caught_triple) == 0
+        ok &= passed_triple
+        print(f"  {'PASS' if passed_triple else 'FAIL'}  triple-quoted bridge docstring is read without crashing")
+    finally:
+        shutil.rmtree(triple, ignore_errors=True)
+
+    noise = Path(tempfile.mkdtemp(prefix="esc-ack-noise-"))
+    try:
+        _write_minimal_tree(
+            noise,
+            readme=GOOD_README,
+            bridge_doc=GOOD_BRIDGE_DOC,
+            war_room=WAR_ROOM_ACK_SNIPPET,
+        )
+        rogue = noise / "services/api/app/noise.py"
+        rogue.parent.mkdir(parents=True, exist_ok=True)
+        rogue.write_text(
+            'def f(row):\n'
+            '    db.execute("UPDATE aisoc_cases SET status = %s", row["status"])\n'
+            '    return row["acknowledged_at"]\n',
+            encoding="utf-8",
+        )
+        passed_noise = len(gate_escalation_ack_docs(noise)) == 0
+        ok &= passed_noise
+        print(f"  {'PASS' if passed_noise else 'FAIL'}  status-only UPDATE is not a false-positive writer")
+    finally:
+        shutil.rmtree(noise, ignore_errors=True)
 
     empty = Path(tempfile.mkdtemp(prefix="esc-ack-empty-"))
     try:
