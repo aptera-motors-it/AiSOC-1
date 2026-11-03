@@ -136,6 +136,7 @@ async def suspend(
     run_context: dict[str, Any],
     step_results: list[dict[str, Any]],
     approval_id: str | None = None,
+    approval: dict[str, Any] | None = None,
     ttl_hours: float | None = None,
     verification_stage: str | None = None,
     verification_subject: str | None = None,
@@ -150,6 +151,10 @@ async def suspend(
     failed step: a pause that was not written is a run nothing can resume,
     and continuing past the approval step would be the original defect
     (running the action a human was meant to authorise).
+
+    ``approval`` opens the approval this pause waits on, in the same
+    statement: written apart, a decision can land on the approval before
+    its pause exists and wake nothing.
     """
     pool = await _pool()
     if pool is None:
@@ -157,11 +162,28 @@ async def suspend(
         return None
 
     pause_id = str(uuid.uuid4())
+    opening = ""
+    opened: tuple[str, ...] = ()
+    if approval is not None:
+        approval_id = str(uuid.uuid4())
+        opening = """
+            WITH opened AS (
+                INSERT INTO agent_approvals (id, tenant_id, requested_by, title, summary, action)
+                VALUES ($10::uuid, $2::uuid, $21, $22, $23, $24::jsonb)
+            )
+        """
+        opened = (
+            approval["requested_by"][:120],
+            approval["title"][:200],
+            approval["summary"],
+            json.dumps(approval["action"], default=str),
+        )
     expires_at = datetime.now(UTC) + timedelta(hours=ttl_hours or DEFAULT_TTL_HOURS)
     try:
         async with pool.acquire() as conn:
             await conn.execute(
-                """
+                f"""
+                {opening}
                 INSERT INTO aisoc_playbook_pauses
                     (id, tenant_id, run_id, playbook_id, playbook_name, step_index,
                      step_id, run_context, step_results, approval_id, expires_at,
@@ -192,6 +214,7 @@ async def suspend(
                 timeout_outcome,
                 timeout_capability,
                 json.dumps(timeout_params or {}, default=str),
+                *opened,
             )
     except Exception as exc:  # noqa: BLE001
         logger.warning("playbook_pause: write failed for run %s: %s", run_id, exc)
@@ -222,31 +245,6 @@ async def suspend(
         verification_subject=verification_subject,
         verification_manager=verification_manager,
     )
-
-
-async def open_approval(*, tenant_id: str, title: str, summary: str, requested_by: str, action: dict[str, Any]) -> str | None:
-    pool = await _pool()
-    if pool is None:
-        return None
-    approval_id = str(uuid.uuid4())
-    try:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO agent_approvals (id, tenant_id, requested_by, title, summary, action)
-                VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6::jsonb)
-                """,
-                approval_id,
-                tenant_id,
-                requested_by[:120],
-                title[:200],
-                summary,
-                json.dumps(action, default=str),
-            )
-    except Exception as exc:
-        logger.warning("playbook_pause: approval write failed for tenant %s: %s", tenant_id, exc)
-        return None
-    return approval_id
 
 
 async def approval_decision(*, approval_id: str, tenant_id: str) -> dict[str, Any] | None:

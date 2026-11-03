@@ -811,11 +811,10 @@ async def _emit(run_id: str, event_type: str, payload: dict, http: httpx.AsyncCl
 async def _suspend_for_approval(pr: PlaybookRun, step: PlaybookStep, step_idx: int) -> Any:
     """Create the approval and persist where to resume.
 
-    Order matters. The approval row is created **first**, so the pause can
-    name it: a pause with no approval has nothing for a human to decide
-    against, and a human deciding against an approval with no pause wakes
-    nothing. If the approval cannot be created the pause is not written
-    either, and the caller fails the step closed.
+    A pause with no approval has nothing for a human to decide against,
+    and a human deciding against an approval with no pause wakes nothing.
+    If either cannot be written neither is, and the caller fails the step
+    closed.
     """
     tenant_id = str(pr.context.get("tenant_id") or pr.trigger_context.get("tenant_id") or "")
     if not tenant_id:
@@ -834,18 +833,6 @@ async def _suspend_for_approval(pr: PlaybookRun, step: PlaybookStep, step_idx: i
         logger.error("Approval step %s declares an unusable timeout outcome: %s", step.name, exc)
         return None
 
-    approval_id = await _create_approval(pr, step, tenant_id)
-    if not approval_id:
-        # A pause written with no approval is a run halted forever with
-        # nothing for any human to decide against. Failing the step closed
-        # at least surfaces.
-        logger.error(
-            "Approval step %s could not open an approval; not suspending run %s",
-            step.name,
-            pr.run_id,
-        )
-        return None
-
     return await playbook_pause.suspend(
         tenant_id=tenant_id,
         run_id=pr.run_id,
@@ -855,7 +842,12 @@ async def _suspend_for_approval(pr: PlaybookRun, step: PlaybookStep, step_idx: i
         step_id=step.id,
         run_context=pr.context,
         step_results=pr.step_results,
-        approval_id=approval_id,
+        approval={
+            "title": step.name or f"Approval for {pr.playbook_name}",
+            "summary": str(step.params.get("prompt") or step.params.get("reason") or ""),
+            "requested_by": f"playbook:{pr.playbook_id}",
+            "action": {"run_id": pr.run_id, "step_id": step.id},
+        },
         ttl_hours=_approval_ttl(step),
         **declared_timeout.to_row(),
     )
@@ -932,23 +924,6 @@ def _approval_ttl(step: PlaybookStep) -> float | None:
         return float(raw) if raw is not None else None
     except (TypeError, ValueError):
         return None
-
-
-async def _create_approval(pr: PlaybookRun, step: PlaybookStep, tenant_id: str) -> str | None:
-    """Write the approval row here. None when it could not be created.
-
-    The API's create route is the console path. A playbook step used to
-    post there and the service principal was refused, so the pause was
-    written with nothing a human could decide. The row is written by the
-    same service that writes the pause.
-    """
-    return await playbook_pause.open_approval(
-        tenant_id=tenant_id,
-        title=step.name or f"Approval for {pr.playbook_name}",
-        summary=str(step.params.get("prompt") or step.params.get("reason") or ""),
-        requested_by=f"playbook:{pr.playbook_id}",
-        action={"run_id": pr.run_id, "step_id": step.id},
-    )
 
 
 async def deny_approval(*, approval_id: str, tenant_id: str, decided_by: str = "", comment: str = "") -> bool:
