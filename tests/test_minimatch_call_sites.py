@@ -59,6 +59,7 @@ def test_legacy_minimatch_three_call_sites_in_isolated_tree(tmp_path: Path) -> N
             "rimraf@3.0.2",
             "serve-handler@6.1.7",
             "eslint@9.39.5",
+            "eslint-plugin-import@2.32.0",
             "eslint-plugin-react@7.37.5",
         ],
         cwd=tmp_path,

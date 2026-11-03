@@ -57,7 +57,9 @@ const modulesDir = (() => {
 })();
 
 function resolveFrom(name, searchPaths) {
-  const paths = searchPaths || (modulesDir ? [modulesDir] : [repoRoot, path.join(repoRoot, 'node_modules')]);
+  const paths = modulesDir
+    ? [modulesDir]
+    : searchPaths || [repoRoot, path.join(repoRoot, 'node_modules')];
   return require(require.resolve(name, { paths }));
 }
 
@@ -139,18 +141,20 @@ async function checkServeHandlerHeaders() {
       });
     }
   };
-  response.end = () => {};
+  response.end = (...args) => Writable.prototype.end.apply(response, args);
   await handler(request, response, {
     public: tmp,
     cleanUrls: false,
     headers: [{ source: '**/*.html', headers: [{ key: 'X-Probe', value: 'matched' }] }],
   });
   assert(captured['x-probe'] === 'matched', 'serve-handler headers glob did not match **/*.html');
-  await new Promise((resolve) => {
-    response.on('finish', resolve);
+  await new Promise((resolve, reject) => {
     if (response.writableFinished) {
       resolve();
+      return;
     }
+    response.once('finish', resolve);
+    response.once('error', reject);
   });
   fs.rmSync(tmp, { recursive: true, force: true });
 }
