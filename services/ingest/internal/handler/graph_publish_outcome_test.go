@@ -14,12 +14,22 @@ import (
 	"testing"
 	"time"
 
+	"github.com/beenuar/aisoc/services/ingest/internal/graph"
 	"github.com/beenuar/aisoc/services/ingest/internal/publisher"
 	"github.com/segmentio/kafka-go/protocol"
 	"github.com/segmentio/kafka-go/protocol/apiversions"
 	"github.com/segmentio/kafka-go/protocol/metadata"
 	"github.com/segmentio/kafka-go/protocol/produce"
 )
+
+type contextSnapshot struct{}
+
+func (contextSnapshot) Apply(ctx context.Context, event *graph.Event) {
+	if ctx.Err() != nil {
+		return
+	}
+	event.Nodes = append(event.Nodes, graph.Node{Label: graph.NodeConfiguration})
+}
 
 type outcomeBroker struct {
 	listener     net.Listener
@@ -267,6 +277,34 @@ func TestIngest_KafkaAckAfterRequestCancelWritesGraph(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+func TestIngest_KafkaAckAfterRequestCancelAddsConfiguration(t *testing.T) {
+	broker := startOutcomeBroker(t, 100*time.Millisecond)
+	h, _ := newAuthHandler(t, "")
+	h.pub = newOutcomePublisher(t, broker.address())
+	graphWriter := &recordingGraphWriter{}
+	h.SetGraphWriter(graphWriter)
+	h.SetSnapshotApplier(contextSnapshot{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		for broker.received.Load() == 0 {
+			time.Sleep(time.Millisecond)
+		}
+		cancel()
+	}()
+	pushEvents(t, h, 1, ctx)
+
+	if len(graphWriter.events) != 1 {
+		t.Fatalf("graph received %d event(s), want 1", len(graphWriter.events))
+	}
+	for _, node := range graphWriter.events[0].Nodes {
+		if node.Label == graph.NodeConfiguration {
+			return
+		}
+	}
+	t.Fatal("Kafka-accepted event has no Configuration node")
 }
 
 func TestIngest_PartialKafkaBatchProjectsAcceptedEvents(t *testing.T) {
