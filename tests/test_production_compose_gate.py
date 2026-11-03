@@ -20,9 +20,11 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 
@@ -468,6 +470,21 @@ class TestNoDatastoreIsBoundToTheHost:
 # program rather than reading the file that describes it.
 
 
+def _load_resource_limits():
+    spec = importlib.util.spec_from_file_location(
+        "production_compose_resource_limits",
+        REPO / "scripts" / "production_compose_resource_limits.py",
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _production_service_bounds():
+    return _load_resource_limits().PRODUCTION_SERVICE_BOUNDS
+
+
 def _load_checker():
     spec = importlib.util.spec_from_file_location("check_published_secrets", REPO / "scripts" / "check_published_secrets.py")
     assert spec and spec.loader
@@ -569,3 +586,109 @@ class TestAPublishedValueCannotSatisfyAGuard:
         overlay = set(_services(PROD))
         missing = sorted(set(_services(DEV)) - overlay - {checker.PREFLIGHT_SERVICE})
         assert not missing, f"defined in docker-compose.yml and not restated here, so ungated: {missing}"
+
+
+_MIB = 1024 * 1024
+_GIB = 1024 * 1024 * 1024
+
+
+def _memory_to_bytes(value: str | int | None) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    text = str(value).strip().lower()
+    for suffix, mult in (("g", _GIB), ("m", _MIB), ("k", 1024)):
+        if text.endswith(suffix):
+            return int(float(text[:-1]) * mult)
+    return int(text)
+
+
+def _service_bounds(service: dict) -> tuple[int | None, int | None]:
+    deploy = (service or {}).get("deploy") or {}
+    limits = ((deploy.get("resources") or {}).get("limits") or {})
+    memory = _memory_to_bytes(limits.get("memory"))
+    pids = (service or {}).get("pids_limit")
+    return memory, int(pids) if pids is not None else None
+
+
+class TestProductionOverlayBoundsMemoryAndPids:
+    """F70: the prod overlay must cap memory and pids per service.
+
+    The README profile table publishes ~8 GB for CORE and ~12 GB for full; without
+    per-container ceilings one OOM takes the VM. Limits are declared in
+    ``docker-compose.prod.yml`` and checked against
+    ``scripts/production_compose_resource_limits.py``, which derives them from
+    the base compose ``mem_limit`` values, Helm single-host limits, and the
+    measured ollama footprint documented beside that table.
+    """
+
+    def test_every_overlay_service_declares_bounds(self, prod: dict) -> None:
+        missing: list[str] = []
+        for name in prod:
+            memory, pids = _service_bounds(prod[name] or {})
+            if memory is None or pids is None:
+                missing.append(name)
+        assert not missing, f"these services lack deploy.resources.limits.memory and/or pids_limit: {missing}"
+
+    def test_bounds_match_the_published_table(self, prod: dict) -> None:
+        wrong: list[str] = []
+        for name, expected in _production_service_bounds().items():
+            service = prod.get(name) or {}
+            memory, pids = _service_bounds(service)
+            if _memory_to_bytes(expected.memory) != memory or expected.pids_limit != pids:
+                wrong.append(
+                    f"{name}: expected memory={expected.memory} pids={expected.pids_limit}, "
+                    f"got memory={memory} pids={pids}"
+                )
+        assert not wrong, "\n".join(wrong)
+
+    def test_docker_compose_config_shows_the_same_limits(self) -> None:
+        """When Docker is present, ``docker compose config`` is what the daemon applies."""
+        if shutil.which("docker") is None:
+            pytest.skip("docker not installed")
+        env = os.environ.copy()
+        env.setdefault("POSTGRES_PASSWORD", "9b20969c058203d8a725c09800645f4666f913d80590c094")  # gitleaks:allow
+        env.setdefault("AISOC_APP_DB_PASSWORD", "9b20969c058203d8a725c09800645f4666f913d80590c094")  # gitleaks:allow
+        env.setdefault("REDIS_PASSWORD", "9b20969c058203d8a725c09800645f4666f913d80590c094")  # gitleaks:allow
+        env.setdefault("SECRET_KEY", "9b20969c058203d8a725c09800645f4666f913d80590c094")  # gitleaks:allow
+        env.setdefault("AISOC_CREDENTIAL_KEY", "9b20969c058203d8a725c09800645f4666f913d80590c094")  # gitleaks:allow
+        env.setdefault("AISOC_SERVICE_TOKEN", "9b20969c058203d8a725c09800645f4666f913d80590c094")  # gitleaks:allow
+        env.setdefault("AISOC_ACTIONS_SERVICE_TOKEN", "9b20969c058203d8a725c09800645f4666f913d80590c094")  # gitleaks:allow
+        env.setdefault("AISOC_AGENTS_SERVICE_TOKEN", "9b20969c058203d8a725c09800645f4666f913d80590c094")  # gitleaks:allow
+        env.setdefault("AISOC_REALTIME_JWT_SECRET", "9b20969c058203d8a725c09800645f4666f913d80590c094")  # gitleaks:allow
+        env.setdefault("REALTIME_INTERNAL_TOKEN", "9b20969c058203d8a725c09800645f4666f913d80590c094")  # gitleaks:allow
+        env.setdefault("METRICS_TOKEN", "9b20969c058203d8a725c09800645f4666f913d80590c094")  # gitleaks:allow
+        env.setdefault("JWT_SECRET", "9b20969c058203d8a725c09800645f4666f913d80590c094")  # gitleaks:allow
+        env.setdefault("NEO4J_PASSWORD", "9b20969c058203d8a725c09800645f4666f913d80590c094")  # gitleaks:allow
+        env.setdefault("CLICKHOUSE_PASSWORD", "9b20969c058203d8a725c09800645f4666f913d80590c094")  # gitleaks:allow
+        env.setdefault("GRAFANA_ADMIN_PASSWORD", "9b20969c058203d8a725c09800645f4666f913d80590c094")  # gitleaks:allow
+        result = subprocess.run(  # noqa: S603
+            [
+                "docker",
+                "compose",
+                "-f",
+                str(DEV),
+                "-f",
+                str(PROD),
+                "config",
+                "--format",
+                "json",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+            cwd=REPO,
+        )
+        assert result.returncode == 0, result.stderr
+        model = json.loads(result.stdout)
+        services = model.get("services") or {}
+        for name, expected in _production_service_bounds().items():
+            svc = services.get(name) or {}
+            deploy = svc.get("deploy") or {}
+            limits = ((deploy.get("resources") or {}).get("limits") or {})
+            memory = _memory_to_bytes(limits.get("memory"))
+            pids = svc.get("pids_limit")
+            assert _memory_to_bytes(expected.memory) == memory, f"{name} config memory mismatch"
+            assert expected.pids_limit == int(pids), f"{name} config pids mismatch"
