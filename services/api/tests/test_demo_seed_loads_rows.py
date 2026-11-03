@@ -79,15 +79,17 @@ def test_make_demo_seed_loads_rows() -> None:
     if not os.getenv("AISOC_RUN_INTEGRATION"):
         pytest.skip("set AISOC_RUN_INTEGRATION=1 to run the seed against Postgres")
 
-    base = os.environ.get("DATABASE_URL") or _DEFAULT_URL
+    runtime = os.environ.get("DATABASE_URL", "").strip() or _DEFAULT_URL
+    owner = os.environ.get("DATABASE_MIGRATION_URL", "").strip() or runtime
     name = f"aisoc_demo_seed_{uuid.uuid4().hex[:12]}"
-    admin_dsn = _asyncpg_dsn(base, "postgres")
-    target_dsn = _asyncpg_dsn(base, name)
+    admin_dsn = _asyncpg_dsn(owner, "postgres")
+    seed_dsn = _asyncpg_dsn(runtime, name)
+    migrate_dsn = _asyncpg_dsn(owner, name)
     env = os.environ.copy()
     env.update(
         {
-            "DATABASE_URL": _sqlalchemy_url(target_dsn),
-            "DATABASE_MIGRATION_URL": _sqlalchemy_url(target_dsn),
+            "DATABASE_URL": _sqlalchemy_url(seed_dsn),
+            "DATABASE_MIGRATION_URL": _sqlalchemy_url(migrate_dsn),
             "ENVIRONMENT": "development",
             "SECRET_KEY": "ci-dummy-secret-key-at-least-32bytes!",
             "AISOC_ALLOW_SEED": "1",
@@ -104,7 +106,7 @@ def test_make_demo_seed_loads_rows() -> None:
         assert migrated.returncode == 0, migrated.stderr[-4000:]
         seeded = _run("app.scripts.seed_demo", env)
         assert seeded.returncode == 0, seeded.stderr[-4000:]
-        alerts, cases = asyncio.run(_demo_counts(target_dsn))
+        alerts, cases = asyncio.run(_demo_counts(seed_dsn))
         assert alerts > 0
         assert cases > 0
     finally:
