@@ -13,7 +13,8 @@ What it checks
 Every ``services/*/Dockerfile`` is parsed stage by stage. The **last** ``FROM``
 is the runtime image; the effective user is the last ``USER`` in that stage, or
 root when there is none. Any ``USER`` whose uid is ``0`` or ``root`` (including
-``USER root:nogroup``) is treated as root.
+quoted forms and ``USER root:nogroup``) is treated as root. A ``USER`` value
+containing ``$`` is a finding because the gate cannot verify the runtime uid.
 
 Optional ``--probe SERVICE`` builds the image compose would build for one
 service and runs ``id -u`` inside it. That is the observation half: a
@@ -62,7 +63,26 @@ def _strip_comment(line: str) -> str:
     return line.strip()
 
 
-_HEREDOC_START = re.compile(r"<<-?\s*(\w+)")
+_HEREDOC_REDIRECT = re.compile(
+    r"(?:^|\s)<<-?"
+    r"(?:"
+    r"'(?P<dq>[^']+)'"
+    r"|\"(?P<sq>[^\"]+)\""
+    r"|(?P<uq>[A-Za-z_][A-Za-z0-9_]*)"
+    r")",
+)
+_USER_DIRECTIVE = re.compile(r"^USER\s+(.+)$", re.IGNORECASE)
+_COPY_OR_RUN = re.compile(r"^(COPY|RUN)\s+", re.IGNORECASE)
+
+
+def _heredoc_delimiter(instruction: str) -> str | None:
+    """Return the heredoc delimiter when ``instruction`` is COPY/RUN with ``<<``."""
+    if not _COPY_OR_RUN.match(instruction):
+        return None
+    match = _HEREDOC_REDIRECT.search(instruction)
+    if not match:
+        return None
+    return match.group("dq") or match.group("sq") or match.group("uq")
 
 
 def _logical_instruction_lines(text: str) -> list[str]:
@@ -86,24 +106,49 @@ def _logical_instruction_lines(text: str) -> list[str]:
             break
         if not stripped:
             continue
-        match = _HEREDOC_START.search(stripped)
-        if match:
+        delim = _heredoc_delimiter(stripped)
+        if delim is not None:
             in_heredoc = True
-            heredoc_delim = match.group(1)
+            heredoc_delim = delim
         logical.append(stripped)
     return logical
+
+
+def _uid_part(user_spec: str) -> str:
+    part = user_spec.split(":", 1)[0].strip()
+    if len(part) >= 2 and part[0] == part[-1] and part[0] in "\"'":
+        part = part[1:-1].strip()
+    return part
 
 
 def _runs_as_root(user_spec: str | None) -> bool:
     if not user_spec:
         return True
-    uid_part = user_spec.split(":", 1)[0].strip()
+    uid_part = _uid_part(user_spec)
     if uid_part.lower() == "root":
         return True
     try:
         return int(uid_part, 10) == 0
     except ValueError:
         return False
+
+
+def _effective_user_spec(user_spec: str | None) -> str | None:
+    """Return the declared user when it is a static non-root spec; else ``None`` (finding)."""
+    if user_spec is None:
+        return None
+    if "$" in user_spec:
+        return None
+    if _runs_as_root(user_spec):
+        return None
+    return user_spec
+
+
+def _parse_user_directive(line: str) -> str | None:
+    match = _USER_DIRECTIVE.match(line)
+    if not match:
+        return None
+    return match.group(1).strip()
 
 
 def effective_runtime_user(text: str) -> StageUser:
@@ -118,11 +163,11 @@ def effective_runtime_user(text: str) -> StageUser:
     for line in logical[start + 1 :]:
         if line.upper().startswith("FROM "):
             break
-        if line.upper().startswith("USER "):
-            declared = line[4:].strip()
-    if _runs_as_root(declared):
-        return StageUser("", stage, None)
-    return StageUser("", stage, declared)
+        parsed = _parse_user_directive(line)
+        if parsed is not None:
+            declared = parsed
+    user = _effective_user_spec(declared)
+    return StageUser("", stage, user)
 
 
 def scan(root: Path) -> list[tuple[str, StageUser]]:
@@ -248,8 +293,35 @@ def self_test() -> int:
     uid_00 = effective_runtime_user("FROM alpine:3.19\nUSER 00\nCMD []\n")
     record("USER 00 is treated as root", uid_00.user is None)
 
+    quoted_zero = effective_runtime_user('FROM alpine:3.19\nUSER "0"\nCMD []\n')
+    record('USER "0" is treated as root', quoted_zero.user is None)
+
+    single_quoted = effective_runtime_user("FROM alpine:3.19\nUSER '0'\nCMD []\n")
+    record("USER '0' is treated as root", single_quoted.user is None)
+
+    quoted_root = effective_runtime_user('FROM alpine:3.19\nUSER "root"\nCMD []\n')
+    record('USER "root" is treated as root', quoted_root.user is None)
+
+    tab_user = effective_runtime_user("FROM alpine:3.19\nUSER nobody\nUSER\t0\nCMD []\n")
+    record("USER with tab before uid 0 is treated as root", tab_user.user is None)
+
+    arg_expand = effective_runtime_user("FROM alpine:3.19\nARG U=0\nUSER ${U}\nCMD []\n")
+    record("USER with variable expansion is a finding", arg_expand.user is None)
+
+    env_expand = effective_runtime_user("FROM alpine:3.19\nENV U=root\nUSER $U\nCMD []\n")
+    record("USER with env substitution is a finding", env_expand.user is None)
+
     run_not_user = effective_runtime_user("FROM alpine:3.19\nRUN echo start \\\nUSER nobody\nCMD []\n")
     record("USER in a continued RUN is not a USER instruction", run_not_user.user is None)
+
+    shell_shift = effective_runtime_user("FROM alpine:3.19\nUSER nobody\nRUN echo $((1<<4))\nUSER 0\nCMD []\n")
+    record("shell << shift does not swallow a later USER 0", shell_shift.user is None)
+
+    heredoc = effective_runtime_user("FROM alpine:3.19\nCOPY <<EOF /etc/motd\nUSER nobody\nEOF\nCMD []\n")
+    record("USER inside an unquoted heredoc body is not a USER instruction", heredoc.user is None)
+
+    quoted_heredoc = effective_runtime_user("FROM alpine:3.19\nRUN cat <<'EOF'\nUSER nobody\nEOF\nCMD []\n")
+    record("USER inside a quoted heredoc body is not a USER instruction", quoted_heredoc.user is None)
 
     ok = effective_runtime_user("FROM python:3.11-slim\nUSER nobody\nCMD []\n")
     record("USER nobody is accepted", ok.user == "nobody")
