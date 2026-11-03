@@ -29,6 +29,7 @@ type outcomeBroker struct {
 	partitions   int32
 	failedPart   int32
 	failureCode  int16
+	appendOnFail bool
 	received     atomic.Int64
 	mu           sync.Mutex
 	accepted     map[string]struct{}
@@ -164,7 +165,7 @@ func (b *outcomeBroker) serve(conn net.Conn) {
 			b.mu.Lock()
 			for partition, ids := range outcomes {
 				target := b.accepted
-				if partition == b.failedPart {
+				if partition == b.failedPart && !b.appendOnFail {
 					target = b.rejected
 				}
 				for _, id := range ids {
@@ -300,5 +301,23 @@ func TestIngest_PartialKafkaBatchProjectsAcceptedEvents(t *testing.T) {
 		if _, ok := projected[id]; ok {
 			t.Fatalf("rejected event %s was projected", id)
 		}
+	}
+}
+
+func TestIngest_KafkaAppendErrorProjectsEvent(t *testing.T) {
+	broker := startOutcomeBroker(t, 0)
+	broker.failedPart = 0
+	broker.failureCode = 20
+	broker.appendOnFail = true
+	h, _ := newAuthHandler(t, "")
+	h.pub = newOutcomePublisher(t, broker.address())
+	graphWriter := &recordingGraphWriter{}
+	h.SetGraphWriter(graphWriter)
+
+	pushEvents(t, h, 1, context.Background())
+
+	accepted, _ := broker.eventSets()
+	if len(accepted) != 1 || len(graphWriter.events) != 1 {
+		t.Fatalf("Kafka appended %d event(s), graph received %d", len(accepted), len(graphWriter.events))
 	}
 }
