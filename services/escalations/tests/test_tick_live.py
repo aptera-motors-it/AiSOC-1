@@ -161,3 +161,33 @@ def test_failed_state_write_still_pages_every_open_case(monkeypatch, receiver, c
     assert receiver.delivered_for(cases["refused_ref"]) == 1, error
     assert receiver.delivered_for(cases["other_ref"]) == 1, error
     assert len(receiver.digests()) == 1, error
+
+
+def test_idle_tick_persists_a_state_write_that_failed(monkeypatch, tmp_path, receiver, cases):
+    state_file = tmp_path / "escalation-state.json"
+    monkeypatch.setattr(bridge, "DATABASE_URL", DSN)
+    monkeypatch.setattr(bridge, "TEAMS_URL", receiver.url)
+    monkeypatch.setattr(bridge, "STATE_FILE", "escalation-state.json")
+    monkeypatch.setattr(bridge, "ACK_GRACE_MINUTES", 0)
+    monkeypatch.setattr(bridge, "DIGEST_HOUR_UTC", 24)
+
+    state = bridge.load_state()
+    error = _run_tick(state)
+    assert error is None
+    assert receiver.delivered_for(cases["refused_ref"]) == 1, error
+    assert receiver.delivered_for(cases["other_ref"]) == 1, error
+    assert not state_file.exists()
+
+    monkeypatch.setattr(bridge, "STATE_FILE", str(state_file))
+    error = _run_tick(state)
+    assert error is None
+    assert receiver.delivered_for(cases["refused_ref"]) == 1
+    assert receiver.delivered_for(cases["other_ref"]) == 1
+    saved = json.loads(state_file.read_text(encoding="utf-8"))
+    assert cases["refused_id"] in saved["escalations"]
+    assert cases["other_id"] in saved["escalations"]
+
+    error = _run_tick(bridge.load_state())
+    assert error is None
+    assert receiver.delivered_for(cases["refused_ref"]) == 1
+    assert receiver.delivered_for(cases["other_ref"]) == 1
