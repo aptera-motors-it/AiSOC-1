@@ -7,8 +7,10 @@ again, and must not enrich again or put a second approval in front of the
 analyst for one alert.
 
 The real worker reads a real topic and triages through its production sinks
-on Postgres. The only stand-in is an HTTP receiver at the enrichment and API
-addresses, which answers and counts what reached it.
+on Postgres. The stand-ins are an HTTP receiver at the enrichment, realtime
+and API addresses, which answers and counts what reached it; deterministic
+triage in place of a model, with graph escalation off; and a playbook store
+in a temporary directory that holds the test playbook.
 """
 
 from __future__ import annotations
@@ -167,7 +169,12 @@ def _fused_alert(tenant: str) -> dict:
 
 
 async def _set_committed(brokers: str, group: str, topic: str, partition: int, offset: int) -> None:
-    """Leave the group's committed offset where a consumer that crashed before committing leaves it."""
+    """Commit ``offset`` for the group, so the next replica starts at that record.
+
+    The first call keeps a new group, which the worker starts at the end of the
+    topic, from skipping the record. The second puts the offset back where a
+    replica that crashed before committing leaves it.
+    """
     from aiokafka import AIOKafkaConsumer, TopicPartition
     from aiokafka.structs import OffsetAndMetadata
 
