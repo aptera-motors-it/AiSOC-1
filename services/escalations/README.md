@@ -17,12 +17,12 @@ double-send. All thresholds are env-tunable (`ESC_*`, see docker-compose.yml).
 Two semantics to know before enabling it:
 
 - **What stops the clock:** a case counts as acknowledged only when
-  `aisoc_cases.acknowledged_at` is written — today that is the console's
-  acknowledge action and joining the case's war room. Editing, assigning or
-  moving a case along the status ladder does **not** stop the clock; an
-  actively-investigated CRITICAL that nobody acknowledged still escalates (up
-  to the nag cap). That is the point of an ack clock, stated here so nobody
-  expects otherwise.
+  `aisoc_cases.acknowledged_at` is written — today that is the war-room
+  **acknowledge** decision in `services/api/app/services/war_room.py`.
+  Editing, assigning or moving a case along the status ladder does **not**
+  stop the clock; an actively-investigated CRITICAL that nobody acknowledged
+  still escalates (up to the nag cap). That is the point of an ack clock,
+  stated here so nobody expects otherwise.
 - **The sweep is deployment-wide.** Every tenant's unacknowledged cases
   escalate to the one configured webhook — this is a deployment-level pager,
   not per-tenant notification (that is the native outbound-webhook

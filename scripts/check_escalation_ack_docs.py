@@ -40,6 +40,8 @@ FORBIDDEN_DOC_PHRASES = (
     "war-room join write",
 )
 
+WAR_ROOM_ACK = re.compile(r"war-room\s+acknowledge", re.IGNORECASE)
+
 CASE_ACK_SET = re.compile(
     r"UPDATE\s+aisoc_cases\s+SET[^;]*acknowledged_at",
     re.IGNORECASE | re.DOTALL,
@@ -110,7 +112,7 @@ def gate_escalation_ack_docs(root: Path) -> list[Finding]:
                         f"still claims {phrase!r}; only the war-room acknowledge decision writes the ack clock",
                     )
                 )
-        if "war-room acknowledge" not in lowered and "war-room acknowledge" not in plain:
+        if not WAR_ROOM_ACK.search(lowered) and not WAR_ROOM_ACK.search(plain):
             findings.append(
                 Finding(
                     str(rel),
@@ -127,12 +129,12 @@ def gate_escalation_ack_docs(root: Path) -> list[Finding]:
 
     writers: list[str] = []
     for path in (root / "services").rglob("*.py"):
-        rel = path.relative_to(root).as_posix()
-        if "/migrations/" in rel or rel.startswith("services/api/migrations/"):
+        py_rel = path.relative_to(root).as_posix()
+        if "/migrations/" in py_rel or py_rel.startswith("services/api/migrations/"):
             continue
         body = path.read_text(encoding="utf-8", errors="replace")
         if CASE_ACK_SET.search(body):
-            writers.append(rel)
+            writers.append(py_rel)
 
     expected = WAR_ROOM.as_posix()
     if writers != [expected]:
@@ -151,7 +153,7 @@ def gate_escalation_ack_docs(root: Path) -> list[Finding]:
         findings.append(
             Finding(
                 str(WAR_ROOM),
-                'no acknowledge decision branch; console-ack must stay a channel decision row',
+                "no acknowledge decision branch; console-ack must stay a channel decision row",
             )
         )
 

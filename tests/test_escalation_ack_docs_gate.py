@@ -13,8 +13,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GATE = REPO_ROOT / "scripts" / "check_escalation_ack_docs.py"
 
@@ -28,11 +26,22 @@ def _import_gate():
     return module
 
 
-def test_the_gate_refuses_the_pinned_sha_claims() -> None:
-    """At base, operator docs still name a console ack path that does not exist."""
+def test_stale_console_ack_claim_is_refused(tmp_path: Path) -> None:
+    """The gate must refuse operator docs that resurrect the console-ack myth."""
     module = _import_gate()
-    findings = module.gate_escalation_ack_docs(REPO_ROOT)
-    assert findings, "expected stale paging docs at the pinned base"
+    root = tmp_path
+    stale_readme = module.GOOD_README.replace(
+        "war-room **acknowledge**",
+        "console's acknowledge action and joining the case's war room",
+    )
+    module._write_minimal_tree(
+        root,
+        readme=stale_readme,
+        bridge_doc=module.GOOD_BRIDGE_DOC,
+        war_room='if decision == "acknowledge":\n    "UPDATE aisoc_cases SET acknowledged_at = COALESCE(acknowledged_at, :now)"\n',
+    )
+    findings = module.gate_escalation_ack_docs(root)
+    assert findings
     joined = " ".join(f.render() for f in findings)
     assert "console" in joined.lower() or "joining" in joined.lower()
 
