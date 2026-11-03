@@ -72,7 +72,7 @@ from app.db.connector_repo import (
 )
 from app.db.engine import get_engine
 from app.ingest_client import IngestClient, IngestClientError
-from app.leader_lease import LeaderLease, election_enabled
+from app.leader_lease import LeaderLease, election_enabled, holder_identity
 from app.pipeline import (
     apply_filter_rules,
     compute_fingerprint,
@@ -177,6 +177,11 @@ class ConnectorScheduler:
         # None when leader election is off, which is the default and
         # means this replica always schedules.
         self._lease: LeaderLease | None = None
+        # Distinct from any other scheduler in this process. The hostname
+        # alone collides when two schedulers share a process, and a shared
+        # holder would treat the second as the replica that already won.
+        self._holder = f"{holder_identity()}:{uuid.uuid4().hex[:12]}"
+        self._poll_claims: dict[str, datetime] = {}
         # Cache of {connector_id_str: last_seen_config_signature} so reloads
         # can detect when an instance's poll interval / config changed and
         # need its job rescheduled, vs leaving an unchanged job alone.
@@ -216,13 +221,10 @@ class ConnectorScheduler:
                 logger.error("connector.scheduler.vault_unavailable: %s", exc)
                 raise
 
-        # Parity 6.8. Without an election, two replicas each add one job
-        # per connector instance and every vendor is polled twice on every
-        # cycle — which on a rate-limited API is worse than duplication,
-        # because the second replica's poll is what gets throttled and a
-        # throttled connector looks identical to one whose credentials
-        # expired. Off by default: a single-replica deployment gains
-        # nothing from an election and gains a new way to fail to start.
+        # Election chooses which replica schedules. Off by default: a
+        # single replica has nothing to elect, and a failed election must
+        # not stop it from polling. Overlap is stopped per connector in
+        # the poll, whether or not this flag is on.
         if election_enabled():
             self._lease = LeaderLease(self._engine)
             if not await self._lease.acquire():
@@ -312,6 +314,35 @@ class ConnectorScheduler:
         a lease table it never populated says nobody leads.
         """
         return self._lease is None or self._lease.held
+
+    async def _claim_connector_poll(self, connector_id: uuid.UUID, window_seconds: float, *, backfill: bool) -> bool:
+        """Whether this replica may fetch the connector during this window.
+
+        The lease is taken even when leader election is off. Election
+        chooses who schedules; the lease chooses who fetches. A backfill
+        from the replica that already holds the window may fetch again.
+        """
+        if self._engine is None:
+            return False
+        key = str(connector_id)
+        now = datetime.now(UTC)
+        held_until = self._poll_claims.get(key)
+        if backfill and held_until is not None and held_until > now:
+            return True
+        try:
+            lease = LeaderLease(
+                self._engine,
+                scope=f"connector-poll:{key}",
+                holder=self._holder,
+                lease=window_seconds,
+            )
+            if not await lease.acquire():
+                return False
+        except Exception:
+            logger.exception("connector.scheduler.lease_failed id=%s", connector_id)
+            return False
+        self._poll_claims[key] = now + timedelta(seconds=window_seconds)
+        return True
 
     async def _maintain_lease(self) -> None:
         """Renew the lease, or try to take one.
@@ -631,6 +662,16 @@ class ConnectorScheduler:
             )
         else:
             since_seconds = _coerce_poll_interval(target.connector_config)
+        if not await self._claim_connector_poll(
+            connector_id,
+            float(_coerce_poll_interval(target.connector_config)),
+            backfill=backfill_seconds is not None,
+        ):
+            logger.info(
+                "connector.scheduler.poll_skipped id=%s reason=connector_lease_held",
+                connector_id,
+            )
+            return
         try:
             raw_events = await connector.fetch_alerts(since_seconds=since_seconds)
         except Exception:

@@ -3,15 +3,15 @@
 Why it is needed
 ----------------
 ``ConnectorScheduler`` adds one APScheduler job per enabled connector
-instance, in process. Two replicas therefore each run every job: every
-vendor is polled twice on every cycle. On a rate-limited vendor API that
-is worse than duplication, because the second replica's poll is what gets
-throttled and a throttled connector looks identical to one whose
-credentials have expired.
+instance, in process. Each poll takes a lease scoped to that connector
+for the poll window, so a second replica does not fetch. This election
+is the outer one: when it is on, only one replica schedules at all.
+It stays off by default, because a single replica has nothing to elect
+and a failed election must not stop that replica from polling.
 
-Without this, `connectors` has to be pinned to one replica — which the
-Helm chart does — and a deployment that scales it for availability
-silently doubles its vendor call volume.
+On a rate-limited vendor API a second fetch is worse than duplication,
+because the second replica's poll is what gets throttled and a throttled
+connector looks identical to one whose credentials have expired.
 
 The mechanism, and the one thing that makes it correct
 ------------------------------------------------------
