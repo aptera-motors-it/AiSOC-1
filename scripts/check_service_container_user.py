@@ -12,8 +12,8 @@ What it checks
 --------------
 Every ``services/*/Dockerfile`` is parsed stage by stage. The **last** ``FROM``
 is the runtime image; the effective user is the last ``USER`` in that stage, or
-root when there is none. ``USER root``, ``USER 0``, and ``USER 0:0`` are
-treated as root.
+root when there is none. Any ``USER`` whose uid is ``0`` or ``root`` (including
+``USER root:nogroup``) is treated as root.
 
 Optional ``--probe SERVICE`` builds the image compose would build for one
 service and runs ``id -u`` inside it. That is the observation half: a
@@ -43,12 +43,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from gate_toolkit import repo_root, scratch_tree, self_test_if_requested
-
-self_test_if_requested(__file__)
+from gate_toolkit import refuses_an_empty_tree, repo_root, scratch_tree
 
 _SERVICES_GLOB = "services/*/Dockerfile"
-_ROOT_USERS = frozenset({"root", "0", "0:0"})
 
 
 @dataclass(frozen=True)
@@ -62,6 +59,13 @@ def _strip_comment(line: str) -> str:
     if "#" in line:
         return line.split("#", 1)[0].strip()
     return line.strip()
+
+
+def _runs_as_root(user_spec: str | None) -> bool:
+    if not user_spec:
+        return True
+    uid_part = user_spec.split(":", 1)[0].strip().lower()
+    return uid_part in {"root", "0"}
 
 
 def effective_runtime_user(text: str) -> StageUser:
@@ -81,7 +85,7 @@ def effective_runtime_user(text: str) -> StageUser:
             break
         if stripped.upper().startswith("USER "):
             declared = stripped[4:].strip()
-    if declared is None or declared.lower() in _ROOT_USERS:
+    if _runs_as_root(declared):
         return StageUser("", stage, None)
     return StageUser("", stage, declared)
 
@@ -203,6 +207,9 @@ def self_test() -> int:
     root_user = effective_runtime_user("FROM alpine:3.19\nUSER root\nCMD []\n")
     record("USER root is treated as root", root_user.user is None)
 
+    uid_zero_group = effective_runtime_user("FROM alpine:3.19\nUSER 0:65534\nCMD []\n")
+    record("USER with uid 0 is treated as root", uid_zero_group.user is None)
+
     ok = effective_runtime_user("FROM python:3.11-slim\nUSER nobody\nCMD []\n")
     record("USER nobody is accepted", ok.user == "nobody")
 
@@ -222,6 +229,9 @@ def self_test() -> int:
         (svc / "Dockerfile").write_text("FROM python:3.11-slim\nUSER nobody\nCMD []\n", encoding="utf-8")
         good = scan(tree)
         record("scan is clean when USER is set", not good)
+
+    refused, detail = refuses_an_empty_tree(Path(__file__).name, [])
+    record("refuses a tree with no content rather than reporting it clean", refused, detail.replace("\n", " | "))
 
     print()
     if not all(passed for _, passed in checks):

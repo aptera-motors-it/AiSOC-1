@@ -17,9 +17,11 @@ GATE = REPO / "scripts" / "check_service_container_user.py"
 
 
 def _load_gate():
-    spec = importlib.util.spec_from_file_location("check_service_container_user", GATE)
+    name = "check_service_container_user"
+    spec = importlib.util.spec_from_file_location(name, GATE)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
 
