@@ -361,3 +361,60 @@ async def test_failed_pin_does_not_commit_a_later_offset(monkeypatch: pytest.Mon
         assert committed is None, f"committed offset {committed} moved past an event whose pin failed"
     finally:
         await _stop(consumer, task)
+
+
+@pytest.mark.asyncio
+async def test_rejected_pin_is_not_skipped_on_restart(monkeypatch: pytest.MonkeyPatch) -> None:
+    brokers = _broker()
+    real_commit = AIOKafkaConsumer.commit
+    failed = False
+
+    async def commit(self: AIOKafkaConsumer, offsets: Any = None) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise CommitFailedError("generation changed")
+        await real_commit(self, offsets)
+
+    monkeypatch.setattr(AIOKafkaConsumer, "commit", commit)
+    suffix = uuid.uuid4().hex[:8]
+    topic = f"ueba.commit.{suffix}"
+    group = f"ueba-commit-{suffix}"
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    monkeypatch.delenv("KAFKA_SECURITY_PROTOCOL", raising=False)
+    monkeypatch.setattr(settings, "database_url", "postgresql+asyncpg://aisoc:x@127.0.0.1:1/aisoc")
+    monkeypatch.setattr(settings, "kafka_bootstrap_servers", brokers)
+    monkeypatch.setattr(settings, "kafka_input_topic", topic)
+    monkeypatch.setattr(settings, "kafka_output_topic", f"{topic}.out")
+    monkeypatch.setattr(settings, "kafka_consumer_group", group)
+    await _create_topic(brokers, topic)
+    first = UEBAKafkaConsumer()
+    first_task = asyncio.create_task(first.run())
+    try:
+        await _until(lambda: first.attached, 20, "first consumer did not attach")
+        await _produce(brokers, topic, [json.dumps(SCOREABLE).encode()])
+        await _until(lambda: first_task.done(), 20, f"first consumer kept running: {first.stats()}")
+        if not first_task.cancelled():
+            error = first_task.exception()
+            if error is not None:
+                raise error
+    finally:
+        await _stop(first, first_task)
+
+    second = UEBAKafkaConsumer()
+    second_task = asyncio.create_task(second.run())
+    try:
+        await _until(
+            lambda: second.stats()["handler_failures"] >= 1 or second_task.done(),
+            20,
+            f"restart skipped the record fetched before the rejected pin: {second.stats()}",
+        )
+        if second_task.done() and not second_task.cancelled():
+            error = second_task.exception()
+            if error is not None:
+                raise error
+        assert second.stats()["handler_failures"] >= 1, second.stats()
+        committed = await _committed(brokers, group, topic)
+        assert committed == 0, f"committed offset {committed} moved past the unhandled event"
+    finally:
+        await _stop(second, second_task)
