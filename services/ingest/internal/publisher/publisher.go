@@ -4,6 +4,7 @@ package publisher
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -327,7 +328,7 @@ func (p *Publisher) PublishBatch(ctx context.Context, events []*normalizer.Norma
 		}
 		accepted := make([]*normalizer.NormalizedEvent, 0, len(publishable)-writeErrors.Count())
 		for i, writeErr := range writeErrors {
-			if writeErr == nil {
+			if writeErr == nil || errors.Is(writeErr, kafka.NotEnoughReplicasAfterAppend) {
 				accepted = append(accepted, publishable[i])
 			}
 		}
