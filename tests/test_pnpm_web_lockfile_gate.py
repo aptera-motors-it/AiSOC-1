@@ -3,7 +3,9 @@
 ``pnpm audit`` on the root workspace still reddened every push with moderate
 ``minimatch`` and low ``deepmerge`` advisories while ``security_audit.py`` only
 failed on high/critical findings. The gate below reads resolved versions in
-``pnpm-lock.yaml`` and fails closed on the known-vulnerable ranges.
+``pnpm-lock.yaml`` and fails closed on vulnerable ``minimatch`` copies and on
+``deepmerge`` pins below 4.2.0 (the unsafe downgrade that removes the merge
+guard).
 """
 
 from __future__ import annotations
@@ -37,7 +39,7 @@ def tree(tmp_path: Path) -> Path:
             "packages:",
             "  /minimatch@11.0.4:",
             "    resolution: {integrity: sha512-ok}",
-            "  /deepmerge@4.1.2:",
+            "  /deepmerge@4.3.1:",
             "    resolution: {integrity: sha512-ok}",
         ]
     )
@@ -54,6 +56,13 @@ def test_clean_fixture_passes(tree: Path) -> None:
     assert gate.check_root_lockfile(tree) == []
 
 
+def test_flags_legacy_minimatch_three(tree: Path) -> None:
+    text = (tree / "pnpm-lock.yaml").read_text(encoding="utf-8").replace("/minimatch@11.0.4:", "/minimatch@3.1.5:")
+    (tree / "pnpm-lock.yaml").write_text(text, encoding="utf-8")
+    problems = gate.check_root_lockfile(tree)
+    assert any("minimatch@3.1.5" in p for p in problems), problems
+
+
 def test_flags_scoped_vulnerable_minimatch(tree: Path) -> None:
     text = (tree / "pnpm-lock.yaml").read_text(encoding="utf-8").replace("11.0.4", "10.2.6")
     (tree / "pnpm-lock.yaml").write_text(text, encoding="utf-8")
@@ -61,19 +70,11 @@ def test_flags_scoped_vulnerable_minimatch(tree: Path) -> None:
     assert any("minimatch@10.2.6" in p for p in problems), problems
 
 
-def test_allows_legacy_minimatch_three(tree: Path) -> None:
-    text = (tree / "pnpm-lock.yaml").read_text(encoding="utf-8").replace(
-        "/minimatch@11.0.4:", "  /minimatch@3.1.5:\n    resolution: {integrity: sha512-legacy}\n  /minimatch@11.0.4:"
-    )
-    (tree / "pnpm-lock.yaml").write_text(text, encoding="utf-8")
-    assert gate.check_root_lockfile(tree) == []
-
-
-def test_flags_vulnerable_deepmerge(tree: Path) -> None:
-    text = (tree / "pnpm-lock.yaml").read_text(encoding="utf-8").replace("4.1.2", "4.3.1")
+def test_flags_deepmerge_regression_pin(tree: Path) -> None:
+    text = (tree / "pnpm-lock.yaml").read_text(encoding="utf-8").replace("4.3.1", "4.1.2")
     (tree / "pnpm-lock.yaml").write_text(text, encoding="utf-8")
     problems = gate.check_root_lockfile(tree)
-    assert any("deepmerge@4.3.1" in p for p in problems), problems
+    assert any("deepmerge@4.1.2" in p for p in problems), problems
 
 
 def test_missing_lockfile_is_not_clean(tree: Path) -> None:
@@ -83,13 +84,25 @@ def test_missing_lockfile_is_not_clean(tree: Path) -> None:
 
 
 def test_flags_quoted_minimatch_key(tree: Path) -> None:
-    text = (tree / "pnpm-lock.yaml").read_text(encoding="utf-8").replace(
-        "/minimatch@11.0.4:", "'/minimatch@10.2.6':"
-    )
+    text = (tree / "pnpm-lock.yaml").read_text(encoding="utf-8").replace("/minimatch@11.0.4:", "'/minimatch@3.1.5':")
     (tree / "pnpm-lock.yaml").write_text(text, encoding="utf-8")
     problems = gate.check_root_lockfile(tree)
-    assert any("minimatch@10.2.6" in p for p in problems), problems
+    assert any("minimatch@3.1.5" in p for p in problems), problems
 
 
 def test_gate_cli_on_this_repository() -> None:
     assert gate.main(["--root", str(REPO_ROOT)]) == 0
+
+
+def test_base_upstream_lockfile_fails_minimatch() -> None:
+    base_lock = (REPO_ROOT / "pnpm-lock.yaml").read_text(encoding="utf-8")
+    # Simulate pre-fix tree: minimatch 3.x/5.x still present, deepmerge already 4.3.1.
+    unfixed = base_lock
+    if "/minimatch@3.1.5:" not in unfixed:
+        unfixed = unfixed.replace(
+            "  /minimatch@11.0.4:",
+            "  /minimatch@3.1.5:\n    resolution: {integrity: legacy}\n  /minimatch@11.0.4:",
+            1,
+        )
+    problems = gate.findings_for_lockfile(unfixed)
+    assert any("minimatch@" in p and "below 11.0.1" in p for p in problems), problems

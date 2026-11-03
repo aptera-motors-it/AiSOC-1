@@ -10,11 +10,14 @@ Dependabot and ``pnpm audit`` still name them on every push.
 This gate is narrower and stricter than ``security_audit.py`` for two packages it
 can actually move without breaking the tree:
 
-* **deepmerge** — refuse GHSA-gcqx-w48m-w2h4 (4.2.0 through 4.3.1); pin below 4.2.0.
-* **minimatch** — refuse GHSA-g3hv-75wg-m249 only on **major >= 9** copies below 11.0.1
-  (the same range the root ``minimatch@>=9.0.0`` override already fixes). Legacy
-  ``minimatch@3`` / ``5`` lines stay on their toolchain majors: forcing them to 11
-  breaks ``glob@7`` and ``nyc`` (see CHANGELOG / #1574).
+* **minimatch** — refuse GHSA-g3hv-75wg-m249 on **every** resolved copy below
+  11.0.1 (including legacy 3.x on the ``apps/docs`` → ``serve-handler`` path and
+  5.x under OpenAPI tooling). Scoped pnpm overrides replace a blunt
+  ``minimatch@3`` → 11 bump that breaks ``test-exclude@6`` / ``nyc``.
+* **deepmerge** — refuse versions below 4.2.0 (no ``__proto__`` merge guard).
+  Do **not** pin 4.1.2 to silence GHSA-gcqx-w48m-w2h4: that downgrade removes
+  the guard added in 4.2.0 while npm still has no release above 4.3.1. Keep
+  4.2.0+ and clear minimatch instead.
 
 Package keys using registry tarballs or quoted paths are parsed the same as
 ``/pkg@version:`` entries. ``apps/mobile`` is out of scope.
@@ -41,9 +44,7 @@ _PNPM_TARBALL = re.compile(
 )
 
 _MINIMATCH_FLOOR = (11, 0, 1)
-_MINIMATCH_SCOPED_MAJOR = 9
-_DEEPMERGE_VULN_LOW = (4, 2, 0)
-_DEEPMERGE_VULN_HIGH = (4, 3, 1)
+_DEEPMERGE_GUARD_FLOOR = (4, 2, 0)
 
 
 def _parse_version(raw: str) -> tuple[int, ...]:
@@ -62,10 +63,6 @@ def _lt(left: tuple[int, ...], right: tuple[int, ...]) -> bool:
     return left_padded < right_padded
 
 
-def _between(version: tuple[int, ...], low: tuple[int, ...], high: tuple[int, ...]) -> bool:
-    return not _lt(version, low) and not _lt(high, version)
-
-
 def parse_pnpm_lock_versions(text: str) -> dict[str, list[str]]:
     resolved: dict[str, list[str]] = {}
     for match in _PNPM_PKG.finditer(text):
@@ -79,11 +76,11 @@ def _minimatch_problems(versions: set[str]) -> list[str]:
     problems: list[str] = []
     for version in sorted(versions):
         parsed = _parse_version(version)
-        if parsed[0] < _MINIMATCH_SCOPED_MAJOR:
-            continue
         if _lt(parsed, _MINIMATCH_FLOOR):
             problems.append(
-                f"minimatch@{version} is below 11.0.1 (GHSA-g3hv-75wg-m249); raise the minimatch@>=9.0.0 override and refresh the lockfile"
+                f"minimatch@{version} is below 11.0.1 (GHSA-g3hv-75wg-m249); "
+                "use scoped pnpm overrides (serve-handler, glob@7, eslint, "
+                "@redocly/openapi-core, nyc/test-exclude) and refresh the lockfile"
             )
     return problems
 
@@ -99,10 +96,10 @@ def findings_for_lockfile(text: str) -> list[str]:
 
     for version in sorted(set(resolved.get("deepmerge", []))):
         parsed = _parse_version(version)
-        if _between(parsed, _DEEPMERGE_VULN_LOW, _DEEPMERGE_VULN_HIGH):
+        if _lt(parsed, _DEEPMERGE_GUARD_FLOOR):
             problems.append(
-                f"deepmerge@{version} is inside the GHSA-gcqx-w48m-w2h4 range "
-                "(4.2.0 through 4.3.1); pin below 4.2.0 or refresh when upstream ships a fix"
+                f"deepmerge@{version} is below 4.2.0 and lacks the __proto__ merge guard; "
+                "do not pin 4.1.2 to silence GHSA-gcqx-w48m-w2h4 — keep 4.2.0+ instead"
             )
 
     return problems
@@ -138,38 +135,29 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _self_test_cases() -> list[tuple[str, bool]]:
-    bad = "\n".join(
-        [
-            "lockfileVersion: '9.0'",
-            "packages:",
-            "  /minimatch@10.2.6:",
-            "    resolution: {integrity: x}",
-            "  /deepmerge@4.3.1:",
-            "    resolution: {integrity: y}",
-        ]
-    )
-    good = bad.replace("10.2.6", "11.0.4").replace("4.3.1", "4.1.2")
-    quoted = bad.replace("/minimatch@10.2.6:", "'/minimatch@10.2.6':")
-    tarball = bad.replace(
-        "  /minimatch@10.2.6:",
-        "  '@registry.npmjs.org/minimatch/-/minimatch-10.2.6.tgz':",
-    )
-    legacy = "\n".join(
+    bad_minimatch = "\n".join(
         [
             "lockfileVersion: '9.0'",
             "packages:",
             "  /minimatch@3.1.5:",
             "    resolution: {integrity: x}",
-            "  /deepmerge@4.1.2:",
+            "  /deepmerge@4.3.1:",
             "    resolution: {integrity: y}",
         ]
     )
+    bad_deepmerge = bad_minimatch.replace("4.3.1", "4.1.2").replace("3.1.5", "11.0.4")
+    good = bad_minimatch.replace("3.1.5", "11.0.4")
+    quoted = bad_minimatch.replace("/minimatch@3.1.5:", "'/minimatch@3.1.5':")
+    tarball = bad_minimatch.replace(
+        "  /minimatch@3.1.5:",
+        "  '@registry.npmjs.org/minimatch/-/minimatch-3.1.5.tgz':",
+    )
     return [
-        ("flags scoped minimatch and vulnerable deepmerge", len(findings_for_lockfile(bad)) >= 2),
+        ("flags legacy minimatch below 11.0.1", bool(findings_for_lockfile(bad_minimatch))),
+        ("flags deepmerge below 4.2.0", bool(findings_for_lockfile(bad_deepmerge))),
         ("accepts fixed minimatch/deepmerge versions", not findings_for_lockfile(good)),
         ("flags quoted pnpm package keys", bool(findings_for_lockfile(quoted))),
         ("flags registry tarball package keys", bool(findings_for_lockfile(tarball))),
-        ("allows legacy minimatch 3.x with fixed deepmerge", not findings_for_lockfile(legacy)),
     ]
 
 
