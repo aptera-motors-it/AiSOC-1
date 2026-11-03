@@ -177,6 +177,10 @@ class LiveActionResult(BaseModel):
     capability: str
     vendor_id: str
     summary: str
+    #: Set when a read-back ran: ``verified``, ``failed``, or ``unverified``.
+    #: Absent when nothing checked the effect. ``succeeded`` alone does not
+    #: say which of those it was.
+    verification: str | None = None
     details: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None
     completed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))

@@ -397,6 +397,36 @@ def _override_decision(
     )
 
 
+def _surface_verification(
+    result: LiveActionResult,
+    outcome: str,
+    reason: str,
+    **updates: Any,
+) -> LiveActionResult:
+    """Put the read-back on the result a caller actually reads.
+
+    ``details`` already held the outcome. The case timeline renders
+    ``summary``, and the response body is what a client deserialises, so a
+    ``succeeded`` result has to name the outcome in both. Status is left
+    alone unless the caller passes one.
+    """
+    details = dict(result.details)
+    details["verification"] = outcome
+    details["verification_reason"] = reason
+    summary = updates.pop("summary", None)
+    if summary is None:
+        marker = f"verification={outcome}"
+        summary = result.summary if marker in result.summary else f"{result.summary} ({marker})"
+    return result.model_copy(
+        update={
+            "details": details,
+            "summary": summary,
+            "verification": outcome,
+            **updates,
+        }
+    )
+
+
 async def _verify_effect(
     request: LiveActionRequest,
     result: LiveActionResult,
@@ -424,14 +454,8 @@ async def _verify_effect(
         outcome = await verifier.verify(action_type, request.target or "", dict(request.params))
     except Exception as exc:  # noqa: BLE001 — verification must not mask a completed action
         log.warning("live_action.verification_crashed", error=str(exc))
-        details = dict(result.details)
-        details["verification"] = "unverified"
-        details["verification_reason"] = f"verifier raised {type(exc).__name__}"
-        return result.model_copy(update={"details": details})
+        return _surface_verification(result, "unverified", f"verifier raised {type(exc).__name__}")
 
-    details = dict(result.details)
-    details["verification"] = outcome.outcome.value
-    details["verification_reason"] = outcome.reason
     log.info(
         "live_action.verified",
         verification=outcome.outcome.value,
@@ -442,16 +466,16 @@ async def _verify_effect(
         # The vendor accepted the call and the effect is not there. Saying
         # SUCCEEDED here is how a SOC ends up believing a host is contained
         # when it is not.
-        return result.model_copy(
-            update={
-                "status": LiveActionStatus.FAILED,
-                "details": details,
-                "error": result.error or f"action reported success but verification failed: {outcome.reason}",
-                "summary": f"{result.summary} — VERIFICATION FAILED: {outcome.reason}",
-            }
+        return _surface_verification(
+            result,
+            outcome.outcome.value,
+            outcome.reason,
+            status=LiveActionStatus.FAILED,
+            error=result.error or f"action reported success but verification failed: {outcome.reason}",
+            summary=f"{result.summary} — VERIFICATION FAILED: {outcome.reason}",
         )
 
-    return result.model_copy(update={"details": details})
+    return _surface_verification(result, outcome.outcome.value, outcome.reason)
 
 
 def _stopped_by_kill_switch(request: LiveActionRequest, state: KillSwitchState) -> LiveActionResult:
@@ -817,10 +841,11 @@ async def dispatch(request: LiveActionRequest) -> LiveActionResult:
             # an absent `verification` key and a verified one are indis-
             # tinguishable to a reader, and the honest answer here is that
             # nothing checked.
-            details = dict(result.details)
-            details["verification"] = "unverified"
-            details["verification_reason"] = f"no probe is registered for '{request.capability}'; it has no ActionType to key one on"
-            result = result.model_copy(update={"details": details})
+            result = _surface_verification(
+                result,
+                "unverified",
+                f"no probe is registered for '{request.capability}'; it has no ActionType to key one on",
+            )
 
     log.info(
         "live_action.completed",
