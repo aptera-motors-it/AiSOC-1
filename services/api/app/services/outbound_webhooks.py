@@ -284,6 +284,7 @@ async def due_deliveries(db: AsyncSession, *, limit: int = 50) -> list[tuple[Out
                 .where(OutboundDelivery.next_attempt_at <= datetime.now(UTC))
                 .order_by(OutboundDelivery.next_attempt_at)
                 .limit(limit)
+                .with_for_update(skip_locked=True, of=OutboundDelivery)
             )
         )
         .tuples()

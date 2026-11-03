@@ -6,11 +6,9 @@ nothing calls it" shape that this plan keeps finding. The dead-letter view
 would read empty forever, which is the most reassuring possible way to be
 wrong about whether a tenant's SIEM has their alerts.
 
-Safe on several replicas: each attempt is one row read, one HTTP call and
-one commit, and a row already taken by another worker has moved off
-``pending`` by the time this one commits. Two replicas can at worst send
-one event twice, which is why the envelope carries a stable ``id`` the
-receiver can deduplicate on — exactly backwards from losing one.
+Each pass claims one due row (``FOR UPDATE SKIP LOCKED``) and commits that
+attempt before taking the next, so a second replica skips a row this one
+already holds.
 """
 
 from __future__ import annotations
@@ -19,6 +17,7 @@ import asyncio
 import os
 
 import structlog
+from sqlalchemy import text
 
 from app.db.database import AsyncSessionLocal
 from app.services.outbound_webhooks import attempt_delivery, due_deliveries
@@ -38,13 +37,24 @@ BATCH_SIZE = int(os.getenv("OUTBOUND_WEBHOOK_BATCH_SIZE", "25"))
 async def run_once() -> dict[str, int]:
     """Attempt every delivery that has come due. Returns a small tally."""
     attempted = delivered = dead = 0
-    async with AsyncSessionLocal() as db:
-        for delivery, webhook in await due_deliveries(db, limit=BATCH_SIZE):
+    for _ in range(BATCH_SIZE):
+        async with AsyncSessionLocal() as db:
+            claimed = await due_deliveries(db, limit=1)
+            if not claimed:
+                break
+            delivery, webhook = claimed[0]
+            # The claim is unbound, so every tenant is visible. The write has
+            # to name the row's tenant: the runtime role's WITH CHECK rejects
+            # an unbound update, and the attempt would be sent and then lost.
+            await db.execute(
+                text("SELECT set_config('app.current_tenant_id', :tenant_id, true)"),
+                {"tenant_id": str(delivery.tenant_id)},
+            )
             await attempt_delivery(delivery, webhook)
             attempted += 1
             delivered += delivery.status == "delivered"
             dead += delivery.status == "dead"
-        await db.commit()
+            await db.commit()
     if attempted:
         logger.info("outbound_webhook.swept", attempted=attempted, delivered=delivered, dead=dead)
     return {"attempted": attempted, "delivered": delivered, "dead": dead}
