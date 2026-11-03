@@ -173,6 +173,7 @@ class UEBAKafkaConsumer:
     async def run(self) -> None:
         try:
             from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
+            from aiokafka.errors import CommitFailedError, IllegalStateError
         except ImportError:
             LOG.error("aiokafka not installed; Kafka consumer disabled.")
             return
@@ -195,11 +196,40 @@ class UEBAKafkaConsumer:
         self._running = True
         self._attached = True
         LOG.info("UEBA Kafka consumer started (topic=%s)", settings.kafka_input_topic)
+        lost = (CommitFailedError, IllegalStateError)
+
+        async def commit_position(tp: TopicPartition, offset: int) -> bool:
+            try:
+                await consumer.commit({tp: offset})
+            except lost as exc:
+                LOG.warning(
+                    "UEBA offset commit skipped; the group lost this partition. topic=%s partition=%s offset=%s error=%s",
+                    tp.topic,
+                    tp.partition,
+                    offset,
+                    exc,
+                )
+                return False
+            return True
+
+        # One lookup per partition. A group with no commit resumes at the log
+        # end, so the first record is pinned before it is handled.
+        pinned: set[TopicPartition] = set()
 
         try:
             async for msg in consumer:
                 if not self._running:
                     break
+                tp = TopicPartition(msg.topic, msg.partition)
+                if tp not in pinned:
+                    try:
+                        current = await consumer.committed(tp)
+                    except lost:
+                        continue
+                    pinned.add(tp)
+                    if current is None and not await commit_position(tp, msg.offset):
+                        pinned.discard(tp)
+                        continue
                 try:
                     await self._process_message(msg.value, producer)
                 except Exception as exc:  # noqa: BLE001
@@ -207,7 +237,8 @@ class UEBAKafkaConsumer:
                         break
                 else:
                     self._stats["processed"] += 1
-                await consumer.commit({TopicPartition(msg.topic, msg.partition): msg.offset + 1})
+                if not await commit_position(tp, msg.offset + 1):
+                    continue
         finally:
             # Before the awaits below, not after: ``consumer.stop()`` can
             # itself raise on a broker that has gone away, and readiness must
@@ -238,7 +269,7 @@ class UEBAKafkaConsumer:
         payload: Any
         try:
             payload = json.loads(raw) if isinstance(raw, bytes | bytearray) else raw
-        except (json.JSONDecodeError, UnicodeDecodeError):
+        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
             payload = {"undecodable": str(raw)[:500]}
 
         tenant_id = payload.get("tenant_id") if isinstance(payload, dict) else None
@@ -255,7 +286,7 @@ class UEBAKafkaConsumer:
             self._stats["dead_lettered"] += 1
         LOG.error(
             "UEBA handler failed; %s. topic=%s partition=%s offset=%s error=%s: %s",
-            "event dead-lettered and the subscription kept" if recorded else "offset left uncommitted",
+            "event dead-lettered and the subscription kept" if recorded else "subscription stopped with the event unconsumed",
             topic,
             partition,
             offset,
