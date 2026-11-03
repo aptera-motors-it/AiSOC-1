@@ -50,7 +50,7 @@ deliberate sign-off.
 
 from __future__ import annotations
 
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 from sqlalchemy import or_
 from sqlalchemy.sql.elements import ColumnElement
@@ -91,6 +91,24 @@ WRITTEN_STATUSES: Final[tuple[str, ...]] = (
     # Terminal.
     *RESOLVED_STATUSES,
 )
+
+#: Statuses ``PATCH /alerts`` will store. This is `WRITTEN_STATUSES`: every
+#: value a writer in this repository puts in `alerts.status`, and nothing
+#: else. An unknown value is a 422 and the row is left unchanged.
+AlertStatus = Literal[
+    "new",
+    "triaging",
+    "triaged",
+    "investigating",
+    "in_progress",
+    "escalated",
+    "snoozed",
+    "resolved",
+    "closed",
+    "false_positive",
+    "fp",
+    "dismissed",
+]
 
 #: An analyst still has to do something about these. Derived rather than
 #: typed, so it cannot drift from `WRITTEN_STATUSES` the way the old
@@ -158,6 +176,7 @@ def resolved_filter(column: Any) -> ColumnElement[bool]:
 
 
 __all__ = [
+    "AlertStatus",
     "BULK_CLOSE_STATUSES",
     "PRE_INVESTIGATION_STATUSES",
     "RESOLVED_STATUSES",
