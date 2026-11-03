@@ -43,6 +43,26 @@ FORBIDDEN_DOC_PHRASES = (
 
 WAR_ROOM_ACK = re.compile(r"war-room\s+acknowledge", re.IGNORECASE)
 
+EXCLUSIVE_WRITER = re.compile(
+    r"today\s+only\s+(?:the\s+)?war-room\s+acknowledge[\s\S]{0,120}\bwrites\b",
+    re.IGNORECASE,
+)
+
+EXCLUSIVE_README_WRITER = re.compile(
+    r"today\s+only\s+the\s+war-room\s+acknowledge",
+    re.IGNORECASE,
+)
+
+ALT_ACK_WRITER = re.compile(
+    r"console|clicking\s+acknowledge|acknowledge\s+button|joining\s+(?:the\s+)?(?:case'?s\s+)?war[- ]room|,\s*or\s+[^.\n]{0,100}\bwrite",
+    re.IGNORECASE,
+)
+
+MIGRATION_ACK_WRITE = re.compile(
+    r"\bCREATE\s+TRIGGER\b|NEW\.acknowledged_at\s*:=|UPDATE\s+aisoc_cases\s+SET[^;]*acknowledged_at\s*=",
+    re.IGNORECASE,
+)
+
 CASE_ACK_SET = re.compile(
     r"UPDATE\s+aisoc_cases\s+SET[^;]*acknowledged_at",
     re.IGNORECASE | re.DOTALL,
@@ -53,13 +73,13 @@ def _mentions_case_ack_write(body: str) -> bool:
     """True when source looks like it writes ``aisoc_cases.acknowledged_at``."""
     if CASE_ACK_SET.search(body):
         return True
-    upper = body.upper()
-    return (
-        "AISOC_CASES" in upper
-        and "ACKNOWLEDGED_AT" in upper
-        and "UPDATE" in upper
-        and "SET" in upper
-    )
+    if re.search(
+        r"UPDATE[\s\S]{0,40}aisoc_cases[\s\S]{0,80}SET[\s\S]{0,80}acknowledged_at",
+        body,
+        re.IGNORECASE,
+    ):
+        return True
+    return bool(re.search(r"\.values\s*\([^)]*acknowledged_at\s*=", body, re.IGNORECASE))
 
 
 @dataclass(frozen=True)
@@ -99,6 +119,72 @@ def _doc_section(text: str, heading: str) -> str:
     return "\n".join(lines) if lines else text
 
 
+def _gate_war_room_ack_path(source: str) -> list[Finding]:
+    findings: list[Finding] = []
+    if not source:
+        return [Finding(str(WAR_ROOM), "missing; cannot verify the ack-clock writer")]
+
+    if not re.search(r'CHANNEL_DECISIONS[^)]*"acknowledge"', source):
+        findings.append(
+            Finding(
+                str(WAR_ROOM),
+                'CHANNEL_DECISIONS must include "acknowledge" so the documented writer exists',
+            )
+        )
+
+    ack_branch = re.search(
+        r'if decision == "acknowledge":(.*?)elif decision == "escalate":',
+        source,
+        re.DOTALL,
+    )
+    if ack_branch is None:
+        findings.append(
+            Finding(
+                str(WAR_ROOM),
+                'acknowledged_at must be written only under `if decision == "acknowledge":`',
+            )
+        )
+        return findings
+
+    if not CASE_ACK_SET.search(ack_branch.group(1)):
+        findings.append(
+            Finding(
+                str(WAR_ROOM),
+                "the acknowledge branch must UPDATE aisoc_cases.acknowledged_at",
+            )
+        )
+
+    without_ack = re.sub(
+        r'if decision == "acknowledge":.*?elif decision == "escalate":',
+        "",
+        source,
+        count=1,
+        flags=re.DOTALL,
+    )
+    if CASE_ACK_SET.search(without_ack):
+        findings.append(
+            Finding(
+                str(WAR_ROOM),
+                "aisoc_cases.acknowledged_at must not be written outside the acknowledge branch",
+            )
+        )
+    return findings
+
+
+def _migration_case_ack_writers(root: Path) -> list[str]:
+    mig_dir = root / "services" / "api" / "migrations"
+    if not mig_dir.is_dir():
+        return []
+    hits: list[str] = []
+    for path in sorted(mig_dir.glob("*.sql")):
+        body = path.read_text(encoding="utf-8", errors="replace")
+        if "aisoc_cases" not in body or "acknowledged_at" not in body:
+            continue
+        if MIGRATION_ACK_WRITE.search(body):
+            hits.append(path.relative_to(root).as_posix())
+    return hits
+
+
 def gate_escalation_ack_docs(root: Path) -> list[Finding]:
     findings: list[Finding] = []
     readme = _read(root, README)
@@ -133,6 +219,29 @@ def gate_escalation_ack_docs(root: Path) -> list[Finding]:
                     "does not name the war-room acknowledge decision as the ack-clock writer",
                 )
             )
+        if rel == README:
+            if not EXCLUSIVE_README_WRITER.search(plain):
+                findings.append(
+                    Finding(
+                        str(rel),
+                        'must say today only the war-room acknowledge decision (exclusive writer)',
+                    )
+                )
+        else:
+            if not EXCLUSIVE_WRITER.search(plain):
+                findings.append(
+                    Finding(
+                        str(rel),
+                        'module docstring must say today only the war-room acknowledge decision writes it',
+                    )
+                )
+        if ALT_ACK_WRITER.search(lowered) or ALT_ACK_WRITER.search(plain):
+            findings.append(
+                Finding(
+                    str(rel),
+                    "names an alternate ack-clock writer (console, join, or trailing or-clause)",
+                )
+            )
         if "war_room.py" not in text:
             findings.append(
                 Finding(
@@ -163,21 +272,32 @@ def gate_escalation_ack_docs(root: Path) -> list[Finding]:
         findings.append(Finding(str(WAR_ROOM), "missing; cannot verify the ack-clock writer"))
 
     channel_block = _read(root, WAR_ROOM)
-    if channel_block and 'decision == "acknowledge"' not in channel_block:
+    findings.extend(_gate_war_room_ack_path(channel_block))
+
+    mig_writers = _migration_case_ack_writers(root)
+    if mig_writers:
         findings.append(
             Finding(
-                str(WAR_ROOM),
-                "no acknowledge decision branch; console-ack must stay a channel decision row",
+                "migrations",
+                f"unexpected aisoc_cases.acknowledged_at writers in SQL: {mig_writers}",
             )
         )
 
     return findings
 
 
+WAR_ROOM_ACK_SNIPPET = (
+    'CHANNEL_DECISIONS = frozenset({"acknowledge", "escalate", "resolve", "note"})\n'
+    'if decision == "acknowledge":\n'
+    '    "UPDATE aisoc_cases SET acknowledged_at = COALESCE(acknowledged_at, :now)"\n'
+    'elif decision == "escalate":\n'
+    '    pass\n'
+)
+
 GOOD_README = """# escalations
 
 - **What stops the clock:** only `aisoc_cases.acknowledged_at` being written —
-  today that is the war-room **acknowledge** decision in
+  today only the war-room **acknowledge** decision in
   `services/api/app/services/war_room.py`.
 """
 
@@ -211,7 +331,7 @@ def _self_test() -> int:
             good,
             readme=GOOD_README,
             bridge_doc=GOOD_BRIDGE_DOC,
-            war_room='if decision == "acknowledge":\n    "UPDATE aisoc_cases SET acknowledged_at = COALESCE(acknowledged_at, :now)"\n',
+            war_room=WAR_ROOM_ACK_SNIPPET,
         )
         passed = not gate_escalation_ack_docs(good)
         ok &= passed
@@ -229,7 +349,7 @@ def _self_test() -> int:
             bad,
             readme=stale,
             bridge_doc=GOOD_BRIDGE_DOC,
-            war_room='if decision == "acknowledge":\n    "UPDATE aisoc_cases SET acknowledged_at = COALESCE(acknowledged_at, :now)"\n',
+            war_room=WAR_ROOM_ACK_SNIPPET,
         )
         caught = bool(gate_escalation_ack_docs(bad))
         ok &= caught
@@ -243,7 +363,7 @@ def _self_test() -> int:
             extra,
             readme=GOOD_README + "\nThe web UI PATCH is also an ack-clock writer.\n",
             bridge_doc=GOOD_BRIDGE_DOC,
-            war_room='if decision == "acknowledge":\n    "UPDATE aisoc_cases SET acknowledged_at = COALESCE(acknowledged_at, :now)"\n',
+            war_room=WAR_ROOM_ACK_SNIPPET,
         )
         caught_extra = bool(gate_escalation_ack_docs(extra))
         ok &= caught_extra
@@ -257,7 +377,7 @@ def _self_test() -> int:
             concat,
             readme=GOOD_README,
             bridge_doc=GOOD_BRIDGE_DOC,
-            war_room='if decision == "acknowledge":\n    "UPDATE aisoc_cases SET acknowledged_at = COALESCE(acknowledged_at, :now)"\n',
+            war_room=WAR_ROOM_ACK_SNIPPET,
         )
         rogue = concat / "services/api/app/cases.py"
         rogue.parent.mkdir(parents=True, exist_ok=True)
@@ -267,6 +387,58 @@ def _self_test() -> int:
         print(f"  {'PASS' if caught_concat else 'FAIL'}  split-string SQL writer is refused")
     finally:
         shutil.rmtree(concat, ignore_errors=True)
+
+    paraphrase = Path(tempfile.mkdtemp(prefix="esc-ack-paraphrase-"))
+    try:
+        readme_bad = GOOD_README.replace(
+            "`services/api/app/services/war_room.py`.",
+            "`services/api/app/services/war_room.py`, or clicking Acknowledge on the case in the console.",
+        )
+        _write_minimal_tree(
+            paraphrase,
+            readme=readme_bad,
+            bridge_doc=GOOD_BRIDGE_DOC,
+            war_room=WAR_ROOM_ACK_SNIPPET,
+        )
+        caught_para = bool(gate_escalation_ack_docs(paraphrase))
+        ok &= caught_para
+        print(f"  {'PASS' if caught_para else 'FAIL'}  console paraphrase in README is refused")
+    finally:
+        shutil.rmtree(paraphrase, ignore_errors=True)
+
+    drop_only = Path(tempfile.mkdtemp(prefix="esc-ack-drop-only-"))
+    try:
+        _write_minimal_tree(
+            drop_only,
+            readme=GOOD_README,
+            bridge_doc=GOOD_BRIDGE_DOC.replace("today only the", "today the"),
+            war_room=WAR_ROOM_ACK_SNIPPET,
+        )
+        caught_drop = bool(gate_escalation_ack_docs(drop_only))
+        ok &= caught_drop
+        print(f"  {'PASS' if caught_drop else 'FAIL'}  bridge doc without only is refused")
+    finally:
+        shutil.rmtree(drop_only, ignore_errors=True)
+
+    wrong_branch = Path(tempfile.mkdtemp(prefix="esc-ack-wrong-branch-"))
+    try:
+        war = (
+            'CHANNEL_DECISIONS = frozenset({"acknowledge", "escalate"})\n'
+            'if decision == "acknowledge":\n    pass\n'
+            'elif decision == "escalate":\n'
+            '    "UPDATE aisoc_cases SET acknowledged_at = COALESCE(acknowledged_at, :now)"\n'
+        )
+        _write_minimal_tree(
+            wrong_branch,
+            readme=GOOD_README,
+            bridge_doc=GOOD_BRIDGE_DOC,
+            war_room=war,
+        )
+        caught_branch = bool(gate_escalation_ack_docs(wrong_branch))
+        ok &= caught_branch
+        print(f"  {'PASS' if caught_branch else 'FAIL'}  ack write outside acknowledge branch is refused")
+    finally:
+        shutil.rmtree(wrong_branch, ignore_errors=True)
 
     empty = Path(tempfile.mkdtemp(prefix="esc-ack-empty-"))
     try:

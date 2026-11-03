@@ -17,7 +17,7 @@ double-send. All thresholds are env-tunable (`ESC_*`, see docker-compose.yml).
 Two semantics to know before enabling it:
 
 - **What stops the clock:** a case counts as acknowledged only when
-  `aisoc_cases.acknowledged_at` is written — today that is the war-room
+  `aisoc_cases.acknowledged_at` is written — today only the war-room
   **acknowledge** decision in `services/api/app/services/war_room.py`.
   Editing, assigning or moving a case along the status ladder does **not**
   stop the clock; an actively-investigated CRITICAL that nobody acknowledged

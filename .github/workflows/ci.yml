@@ -702,6 +702,12 @@ jobs:
         run: python3 scripts/check_outcome_claims.py --self-test
       - name: No customer-outcome figure nobody measured
         run: python3 scripts/check_outcome_claims.py
+      # P-21 / F60. Escalation paging docs must name the war-room acknowledge
+      # decision as the only writer of aisoc_cases.acknowledged_at.
+      - name: Escalation ack-clock docs — self-test
+        run: python3 scripts/check_escalation_ack_docs.py --self-test
+      - name: Escalation ack-clock docs match war_room.py
+        run: python3 scripts/check_escalation_ack_docs.py
       # Wave 2, Phase 9.5 prerequisite. A caveat saying a console page is
       # "not built" reads as modesty and works as an exemption: a surface
       # recorded as absent needs no claim row and no gate. Three shipped

@@ -38,7 +38,7 @@ def test_stale_console_ack_claim_is_refused(tmp_path: Path) -> None:
         root,
         readme=stale_readme,
         bridge_doc=module.GOOD_BRIDGE_DOC,
-        war_room='if decision == "acknowledge":\n    "UPDATE aisoc_cases SET acknowledged_at = COALESCE(acknowledged_at, :now)"\n',
+        war_room=module.WAR_ROOM_ACK_SNIPPET,
     )
     findings = module.gate_escalation_ack_docs(root)
     assert findings
@@ -69,7 +69,7 @@ def test_extra_ack_clock_writer_claim_is_refused(tmp_path: Path) -> None:
         tmp_path,
         readme=module.GOOD_README + "\nThe web UI PATCH is also an ack-clock writer.\n",
         bridge_doc=module.GOOD_BRIDGE_DOC,
-        war_room='if decision == "acknowledge":\n    "UPDATE aisoc_cases SET acknowledged_at = COALESCE(acknowledged_at, :now)"\n',
+        war_room=module.WAR_ROOM_ACK_SNIPPET,
     )
     assert module.gate_escalation_ack_docs(tmp_path)
 
