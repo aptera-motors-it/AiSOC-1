@@ -116,6 +116,19 @@ jobs:
             exit 1
           fi
 
+      - name: Two schedulers fetch one vendor once per window
+        working-directory: services/connectors
+        env:
+          ISOLATION_LEASE_DSN: ${{ env.LEASE_DSN }}
+          PYTHONPATH: .
+        run: |
+          set -euo pipefail
+          python -m pytest ../../tests/isolation/test_connector_poll_once_live.py -v --tb=short 2>&1 | tee /tmp/poll-once.txt
+          if grep -qE '[0-9]+ skipped' /tmp/poll-once.txt; then
+            echo "FAIL: the poll-once case skipped in the job whose whole purpose is to run it live."
+            exit 1
+          fi
+
       # The negative control.
       #
       # Remove the expiry predicate from the acquire. Postgres then has
