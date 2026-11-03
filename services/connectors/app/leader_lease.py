@@ -149,7 +149,7 @@ _ACQUIRE_SQL = text(
            renewed_at  = now(),
            expires_at  = now() + make_interval(secs => :lease)
      WHERE scheduler_leases.expires_at < now()
-    RETURNING fenced_at, expires_at
+    RETURNING fenced_at, expires_at, expires_at > clock_timestamp()
     """
 )
 
@@ -224,19 +224,15 @@ class LeaderLease:
         if row is None:
             self._held = False
             return False
-        expires = row[1]
-        if isinstance(expires, datetime):
-            if expires.tzinfo is None:
-                expires = expires.replace(tzinfo=UTC)
-            if expires <= datetime.now(UTC):
-                self._held = False
-                logger.info(
-                    "scheduler.lease.expired_on_acquire scope=%s holder=%s expires=%s",
-                    self._scope,
-                    self._holder,
-                    expires,
-                )
-                return False
+        if not row[2]:
+            self._held = False
+            logger.info(
+                "scheduler.lease.expired_on_acquire scope=%s holder=%s expires=%s",
+                self._scope,
+                self._holder,
+                row[1],
+            )
+            return False
         self._term = int(row[0])
         self._held = True
         logger.info(

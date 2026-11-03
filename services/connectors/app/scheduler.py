@@ -177,6 +177,8 @@ class ConnectorScheduler:
         # None when leader election is off, which is the default and
         # means this replica always schedules.
         self._lease: LeaderLease | None = None
+        # release() matches this string. Two schedulers in one process share
+        # a hostname, and one stop must not expire the other's row.
         self._holder = unique_holder_identity()
         self._poll_claims: dict[str, datetime] = {}
         self._connector_leases: dict[str, LeaderLease] = {}
@@ -310,6 +312,12 @@ class ConnectorScheduler:
         return self._lease is None or self._lease.held
 
     async def _claim_connector_poll(self, connector_id: uuid.UUID, window_seconds: float, *, backfill: bool) -> bool:
+        """Whether this replica may fetch the connector during this window.
+
+        The lease is taken even when leader election is off. Election
+        chooses who schedules; the lease chooses who fetches. A backfill
+        from the replica that already holds the window may fetch again.
+        """
         key = str(connector_id)
         now = datetime.now(UTC)
         held_until = self._poll_claims.get(key)

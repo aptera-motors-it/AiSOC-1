@@ -962,7 +962,7 @@ class _FakeConnection:
 
     async def execute(self, statement: Any, _params: Any = None) -> _LeaseRow:
         if "INSERT INTO scheduler_leases" in str(statement):
-            return _LeaseRow((1, datetime.now(UTC) + timedelta(seconds=300)))
+            return _LeaseRow((1, datetime.now(UTC) + timedelta(seconds=300), True))
         return _LeaseRow(None)
 
 

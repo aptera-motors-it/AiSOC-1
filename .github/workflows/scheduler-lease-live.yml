@@ -166,3 +166,41 @@ jobs:
             exit 1
           fi
           echo "OK: without the predicate both replicas lead and the suite goes red, as it must."
+
+      # A lock wait longer than the lease commits an expiry that is already
+      # past. ``now()`` in the SET clause is the start of the transaction, so
+      # the statement has to ask Postgres whether that expiry is still ahead
+      # of ``clock_timestamp()``. Dropping the check lets the waiter lead.
+      - name: The gate fails when acquire ignores an already-expired lease
+        working-directory: services/connectors
+        env:
+          ISOLATION_LEASE_DSN: ${{ env.LEASE_DSN }}
+          PYTHONPATH: .
+        run: |
+          set -euo pipefail
+          cp app/leader_lease.py /tmp/lease-expiry.bak
+          python - <<'PY'
+          import pathlib, sys
+          p = pathlib.Path("app/leader_lease.py")
+          s = p.read_text()
+          start = s.find("        if not row[2]:\n")
+          end = s.find("        self._term = int(row[0])\n")
+          block = s[start:end] if start >= 0 and end > start else ""
+          if "expired_on_acquire" not in block or "return False" not in block:
+              print("negative control could not find the expired-on-acquire check; "
+                    "acquire has been reshaped and this control no longer proves anything")
+              sys.exit(1)
+          p.write_text(s[:start] + s[end:])
+          PY
+          set +e
+          python -m pytest \
+            ../../tests/isolation/test_scheduler_lease_live.py \
+            -k blocked_longer -q >/dev/null 2>&1
+          rc=$?
+          set -e
+          cp /tmp/lease-expiry.bak app/leader_lease.py
+          if [ "$rc" -eq 0 ]; then
+            echo "FAIL: an acquire that waited out its lease still led."
+            exit 1
+          fi
+          echo "OK: without the expiry check the blocked acquire leads and the suite goes red, as it must."
