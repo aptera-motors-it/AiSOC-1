@@ -6,6 +6,7 @@ import asyncio
 import json
 import threading
 import urllib.parse
+from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -50,7 +51,7 @@ class _Actions(BaseHTTPRequestHandler):
 
 
 @pytest.fixture
-def actions_url(monkeypatch: pytest.MonkeyPatch) -> str:
+def actions_url(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     _Actions.received = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Actions)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
