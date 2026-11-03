@@ -13,7 +13,8 @@
 # `jsonb_array_elements_text(uuid[]) does not exist` on the first live run.
 #
 # The suites skip when no database answers, which is why this job sets
-# CASE_DEPTH_PROOF_REQUIRED=1: here, a skip is a failure.
+# CASE_DEPTH_PROOF_REQUIRED=1 and WAR_ROOM_TRANSITION_PROOF_REQUIRED=1:
+# here, a skip is a failure.
 #
 # No `paths:` filter, for the reason alert-audit-live.yml states: a guard that
 # only grades pull requests touching a named path is one the next refactor
@@ -50,6 +51,7 @@ jobs:
       ENVIRONMENT: production
       SECRET_KEY: ci-case-depth-signing-secret-at-least-32-chars
       CASE_DEPTH_PROOF_REQUIRED: "1"
+      WAR_ROOM_TRANSITION_PROOF_REQUIRED: "1"
       OTEL_SDK_DISABLED: "true"
 
     steps:
@@ -81,6 +83,10 @@ jobs:
       - name: Merge, bulk triage, custom fields and workload
         working-directory: services/api
         run: python -m pytest tests/test_case_depth.py -v --tb=short
+
+      - name: War-room resolve follows the case transition table
+        working-directory: services/api
+        run: python -m pytest tests/test_war_room_transition.py -v --tb=short
 
       # ── Negative controls ──────────────────────────────────────────────
       #
