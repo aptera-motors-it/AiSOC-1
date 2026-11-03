@@ -399,7 +399,9 @@ async def apply_channel_decision(
         # confirms.
         current = (
             await db.execute(
-                text("SELECT status FROM aisoc_cases WHERE id = :id AND tenant_id = :tenant_id").bindparams(id=case_id, tenant_id=tenant_id)
+                text("SELECT status FROM aisoc_cases WHERE id = :id AND tenant_id = :tenant_id FOR UPDATE").bindparams(
+                    id=case_id, tenant_id=tenant_id
+                )
             )
         ).scalar_one_or_none()
         if current is not None and not case_status.status_transition_ok(current, case_status.RESOLVED):

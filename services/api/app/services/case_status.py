@@ -72,7 +72,6 @@ TERMINAL_STATUSES: Final[tuple[str, ...]] = CLOSED_STATUSES
 
 
 def status_transition_ok(current: str, target: str) -> bool:
-    """Whether ``current → target`` is an edge in :data:`TRANSITIONS`."""
     return target in TRANSITIONS.get(current, set())
 
 
