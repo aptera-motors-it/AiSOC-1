@@ -1,10 +1,3 @@
-"""One refused page must not drop the others, and a restart must not send it again.
-
-Drives ``bridge.tick`` through Postgres and a local HTTP receiver. Set
-``AISOC_TEST_POSTGRES`` to a migrated database, for example
-``postgresql://aisoc@127.0.0.1:5432/aisoc``.
-"""
-
 from __future__ import annotations
 
 import json
@@ -23,8 +16,6 @@ pytestmark = pytest.mark.skipif(not DSN, reason="set AISOC_TEST_POSTGRES=postgre
 
 
 class Receiver:
-    """Records every POST. Answers 500 when the card title contains a marker."""
-
     def __init__(self) -> None:
         self.posts: list[dict] = []
         self.reject: set[str] = set()
@@ -41,7 +32,7 @@ class Receiver:
                 self.send_header("Content-Length", "0")
                 self.end_headers()
 
-            def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+            def log_message(self, format: str, *args: object) -> None:
                 return
 
         self._server = HTTPServer(("127.0.0.1", 0), Handler)
