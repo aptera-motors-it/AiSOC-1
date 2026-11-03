@@ -142,6 +142,42 @@ class TestOnlyOneLeader:
         taking = _lease(engine, scope, "replica-b")
         assert await taking.acquire() is True
 
+    async def test_an_acquire_blocked_longer_than_its_lease_does_not_lead(self, engine, scope):
+        """``now()`` is the start of the transaction. A lock wait longer than
+        the lease commits an expiry that is already past, and that row must
+        not count as held.
+        """
+        from sqlalchemy import text
+
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO scheduler_leases (scope, holder, fenced_at, expires_at) "
+                    "VALUES (:s, 'dead-replica', 1, now() - interval '1 second')"
+                ),
+                {"s": scope},
+            )
+
+        blocker = await engine.connect()
+        try:
+            await blocker.begin()
+            await blocker.execute(
+                text("UPDATE scheduler_leases SET renewed_at = renewed_at WHERE scope = :s"),
+                {"s": scope},
+            )
+            waiter = _lease(engine, scope, "replica-a", seconds=1.0)
+            acquire_task = asyncio.create_task(waiter.acquire())
+            await asyncio.sleep(2.0)
+            await blocker.commit()
+        finally:
+            await blocker.close()
+
+        won = await asyncio.wait_for(acquire_task, timeout=5)
+        assert won is False
+        assert waiter.held is False
+        nxt = _lease(engine, scope, "replica-b", seconds=30.0)
+        assert await nxt.acquire() is True
+
 
 class TestRenewal:
     async def test_the_holder_renews(self, engine, scope):
