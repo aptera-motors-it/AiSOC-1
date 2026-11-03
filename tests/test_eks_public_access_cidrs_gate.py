@@ -53,11 +53,7 @@ def _tfsec_results(module_dir: Path) -> list[dict]:
 
 
 def test_tfsec_does_not_allow_world_reachable_eks_public_endpoint():
-    hits = [
-        row
-        for row in _tfsec_results(EKS_MODULE)
-        if row.get("rule_id") == TFSEC_RULE
-    ]
+    hits = [row for row in _tfsec_results(EKS_MODULE) if row.get("rule_id") == TFSEC_RULE]
     assert not hits, [row.get("description") for row in hits]
 
 
@@ -67,5 +63,13 @@ def test_eks_module_wires_public_access_cidrs_and_rejects_open_internet():
     assert "public_access_cidrs" in main_tf
     assert "public_access_cidrs" in variables_tf
     assert "0.0.0.0/0" in variables_tf
-    assert "validation" in variables_tf
+    assert "tonumber(element(split" in variables_tf
+    assert ">= 16" in variables_tf
+    assert "precondition" in main_tf
     assert "endpoint_public_access" in variables_tf
+
+
+def test_eks_module_rejects_world_open_cidr_literals():
+    variables_tf = (EKS_MODULE / "variables.tf").read_text()
+    assert "0.0.0.0/0" in variables_tf
+    assert ">= 16" in variables_tf

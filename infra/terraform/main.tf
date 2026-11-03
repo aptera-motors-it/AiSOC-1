@@ -64,6 +64,13 @@ locals {
   account_id  = data.aws_caller_identity.current.account_id
 }
 
+check "eks_public_access_requires_named_cidrs" {
+  assert {
+    condition = !var.eks_endpoint_public_access || length(var.eks_public_access_cidrs) > 0
+    error_message = "When eks_endpoint_public_access is true, set eks_public_access_cidrs in a .tfvars file."
+  }
+}
+
 # ─── Modules ──────────────────────────────────────────────────────────────────
 
 module "vpc" {
@@ -84,6 +91,9 @@ module "eks" {
   vpc_id             = module.vpc.vpc_id
   private_subnet_ids = module.vpc.private_subnet_ids
   cluster_version    = var.eks_cluster_version
+
+  endpoint_public_access = var.eks_endpoint_public_access
+  public_access_cidrs    = var.eks_public_access_cidrs
 
   node_groups = {
     general = {
