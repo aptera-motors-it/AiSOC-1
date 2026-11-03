@@ -749,6 +749,27 @@ class TestADecisionBeforeItsPauseIsWritten:
         assert pause == "denied"
 
 
+class TestAPlaybookDeletedWhileItsRunWaits:
+    async def test_an_approval_after_the_delete_fails_the_run(self, api: Any, agents: str, db: Any, tenants: dict[str, str]) -> None:
+        import httpx
+
+        owner = tenants["owner"]
+        pause = await _paused_run(agents, db, owner)
+        async with httpx.AsyncClient(base_url=agents, headers=_service(owner), timeout=10.0) as client:
+            deleted = await client.delete(f"/api/v1/playbooks/{pause['playbook_id']}")
+        assert deleted.status_code == 204, deleted.text
+
+        await _decide(api, tenants, pause, "approve")
+
+        await _finished_run(agents, owner, pause["run_id"])
+        run = await _run_record(agents, owner, pause["run_id"])
+        status = await _pause_status(db, pause)
+        assert run is not None and run["status"] == "failed", (
+            f"the approval was recorded and the run reads {run and run['status']}; its pause is {status}"
+        )
+        assert status == "cancelled"
+
+
 class TestOnlyTheApiServiceDeliversADecision:
     async def test_a_console_session_is_refused(self, api: Any, agents: str, db: Any, tenants: dict[str, str]) -> None:
         pause = await _paused_run(agents, db, tenants["owner"])
