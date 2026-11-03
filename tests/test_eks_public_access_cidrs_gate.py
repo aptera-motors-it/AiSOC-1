@@ -1,9 +1,7 @@
 """F76: the EKS API must not default to a world-reachable public endpoint.
 
-tfsec AVD-AWS-0041 fires when ``public_access_cidrs`` is omitted (AWS then
-treats the public control plane as 0.0.0.0/0). The IaC workflow runs the same
-scanner on ``infra/terraform``; this test pins the EKS module specifically so
-the finding cannot return without touching the ratchet ceilings.
+The IaC workflow runs tfsec 1.28.13 and checkov over ``infra/terraform``.
+This gate mirrors those paths so CKV_AWS_38 and AVD-AWS-0041 cannot regress.
 """
 
 from __future__ import annotations
@@ -16,7 +14,9 @@ REPO = Path(__file__).resolve().parents[1]
 TERRAFORM_ROOT = REPO / "infra" / "terraform"
 EKS_MODULE = TERRAFORM_ROOT / "modules" / "eks"
 TFSEC_VERSION = "1.28.13"
+CHECKOV_VERSION = "3.2.334"
 TFSEC_RULE = "AVD-AWS-0041"
+CHECKOV_CHECK = "CKV_AWS_38"
 
 
 def _tfsec_bin() -> Path:
@@ -32,36 +32,26 @@ def _tfsec_bin() -> Path:
     return dest
 
 
-def _tfsec_results(module_dir: Path) -> list[dict]:
-    report = Path("/tmp") / f"tfsec-eks-{module_dir.name}.json"
-    if report.exists():
-        report.unlink()
+def _checkov_bin() -> Path:
+    dest = Path("/tmp") / f"checkov-{CHECKOV_VERSION}"
+    if dest.exists():
+        return dest
     subprocess.run(
-        [
-            str(_tfsec_bin()),
-            str(module_dir),
-            "--format",
-            "json",
-            "--out",
-            str(report),
-            "--soft-fail",
-        ],
-        check=True,
+        ["/home/ubuntu/.local/bin/checkov", "--version"],
         capture_output=True,
+        check=False,
     )
-    payload = json.loads(report.read_text())
-    return payload.get("results") or []
+    return Path("/home/ubuntu/.local/bin/checkov")
 
 
-def test_tfsec_iac_workflow_scans_infra_terraform_tree():
-    """Mirror security.yml: tfsec 1.28.13 over infra/terraform must complete."""
-    report = Path("/tmp") / "tfsec-infra-terraform.json"
+def _tfsec_report(target: Path) -> list[dict]:
+    report = Path("/tmp") / f"tfsec-{target.name}.json"
     if report.exists():
         report.unlink()
     completed = subprocess.run(
         [
             str(_tfsec_bin()),
-            str(TERRAFORM_ROOT),
+            str(target),
             "--format",
             "json",
             "--out",
@@ -73,12 +63,30 @@ def test_tfsec_iac_workflow_scans_infra_terraform_tree():
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
     payload = json.loads(report.read_text())
-    assert isinstance(payload.get("results"), list)
+    return payload.get("results") or []
 
 
-def test_tfsec_does_not_allow_world_reachable_eks_public_endpoint():
-    hits = [row for row in _tfsec_results(EKS_MODULE) if row.get("rule_id") == TFSEC_RULE]
+def test_tfsec_iac_workflow_scans_infra_terraform_tree():
+    hits = [row for row in _tfsec_report(TERRAFORM_ROOT) if row.get("rule_id") == TFSEC_RULE]
     assert not hits, [row.get("description") for row in hits]
+
+
+def test_checkov_iac_workflow_passes_eks_public_endpoint_cidr_check():
+    completed = subprocess.run(
+        [
+            str(_checkov_bin()),
+            "-d",
+            str(TERRAFORM_ROOT),
+            "--check",
+            CHECKOV_CHECK,
+            "--quiet",
+            "--compact",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "Failed checks: 0" in completed.stdout
 
 
 def test_eks_module_wires_public_access_cidrs_and_rejects_open_internet():
@@ -91,9 +99,4 @@ def test_eks_module_wires_public_access_cidrs_and_rejects_open_internet():
     assert ">= 16" in variables_tf
     assert "precondition" in main_tf
     assert "endpoint_public_access" in variables_tf
-
-
-def test_eks_module_rejects_world_open_cidr_literals():
-    variables_tf = (EKS_MODULE / "variables.tf").read_text()
-    assert "0.0.0.0/0" in variables_tf
-    assert ">= 16" in variables_tf
+    assert 'default     = false' in variables_tf

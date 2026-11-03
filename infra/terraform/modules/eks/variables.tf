@@ -6,7 +6,7 @@ variable "cluster_version" { type = string }
 variable "endpoint_public_access" {
   description = "Whether the EKS control plane is reachable from outside the VPC."
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "public_access_cidrs" {

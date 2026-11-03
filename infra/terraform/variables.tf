@@ -51,7 +51,7 @@ variable "eks_cluster_version" {
 variable "eks_endpoint_public_access" {
   description = "Whether the EKS control plane is reachable from outside the VPC."
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "eks_public_access_cidrs" {

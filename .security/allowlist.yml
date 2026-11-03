@@ -364,8 +364,8 @@ ceilings:
     failed: 272
     measured_with: "3.2.334"
   tfsec:
-    total: 32
-    critical: 7
+    total: 30
+    critical: 5
     high: 5
     measured_with: "1.28.13"
 
