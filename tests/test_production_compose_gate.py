@@ -606,7 +606,7 @@ def _memory_to_bytes(value: str | int | None) -> int | None:
 
 def _service_bounds(service: dict) -> tuple[int | None, int | None]:
     deploy = (service or {}).get("deploy") or {}
-    limits = ((deploy.get("resources") or {}).get("limits") or {})
+    limits = (deploy.get("resources") or {}).get("limits") or {}
     memory = _memory_to_bytes(limits.get("memory"))
     pids = (service or {}).get("pids_limit")
     return memory, int(pids) if pids is not None else None
@@ -637,11 +637,14 @@ class TestProductionOverlayBoundsMemoryAndPids:
             service = prod.get(name) or {}
             memory, pids = _service_bounds(service)
             if _memory_to_bytes(expected.memory) != memory or expected.pids_limit != pids:
-                wrong.append(
-                    f"{name}: expected memory={expected.memory} pids={expected.pids_limit}, "
-                    f"got memory={memory} pids={pids}"
-                )
+                wrong.append(f"{name}: expected memory={expected.memory} pids={expected.pids_limit}, got memory={memory} pids={pids}")
         assert not wrong, "\n".join(wrong)
+
+    def test_the_bounds_table_lists_every_overlay_service(self, prod: dict) -> None:
+        assert set(prod) == set(_production_service_bounds()), (
+            f"overlay-only {sorted(set(prod) - set(_production_service_bounds()))}; "
+            f"table-only {sorted(set(_production_service_bounds()) - set(prod))}"
+        )
 
     def test_docker_compose_config_shows_the_same_limits(self) -> None:
         """When Docker is present, ``docker compose config`` is what the daemon applies."""
@@ -687,8 +690,9 @@ class TestProductionOverlayBoundsMemoryAndPids:
         for name, expected in _production_service_bounds().items():
             svc = services.get(name) or {}
             deploy = svc.get("deploy") or {}
-            limits = ((deploy.get("resources") or {}).get("limits") or {})
+            limits = (deploy.get("resources") or {}).get("limits") or {}
             memory = _memory_to_bytes(limits.get("memory"))
             pids = svc.get("pids_limit")
             assert _memory_to_bytes(expected.memory) == memory, f"{name} config memory mismatch"
+            assert pids is not None, f"{name} missing pids_limit in compose config"
             assert expected.pids_limit == int(pids), f"{name} config pids mismatch"
