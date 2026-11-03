@@ -73,7 +73,11 @@ configure_logging()
 logger = structlog.get_logger("aisoc.slack_bot")
 
 
-def _build_bolt_app(api_client: AisocApiClient, actions_client: AisocActionsClient) -> AsyncApp:
+def _build_bolt_app(
+    api_client: AisocApiClient,
+    actions_client: AisocActionsClient,
+    timeout_scheduler: ApprovalTimeoutScheduler | None = None,
+) -> AsyncApp:
     """
     Construct the Bolt :class:`AsyncApp` and register every Slack handler.
 
@@ -157,6 +161,7 @@ def _build_bolt_app(api_client: AisocApiClient, actions_client: AisocActionsClie
             body=body,
             respond=respond,
             actions_client=actions_client,
+            timeout_scheduler=timeout_scheduler,
         )
 
     # ── Interactive: deny -----------------------------------------------------
@@ -168,6 +173,7 @@ def _build_bolt_app(api_client: AisocApiClient, actions_client: AisocActionsClie
             body=body,
             respond=respond,
             actions_client=actions_client,
+            timeout_scheduler=timeout_scheduler,
         )
 
     # ── Interactive: need-info -----------------------------------------------
@@ -179,6 +185,7 @@ def _build_bolt_app(api_client: AisocApiClient, actions_client: AisocActionsClie
             body=body,
             respond=respond,
             actions_client=actions_client,
+            timeout_scheduler=timeout_scheduler,
         )
 
     # ── Interactive: open-case link ------------------------------------------
@@ -202,6 +209,7 @@ async def _route_action_decision(
     body: dict,
     respond,
     actions_client: AisocActionsClient,
+    timeout_scheduler: ApprovalTimeoutScheduler | None = None,
 ) -> None:
     """
     Pull the routing value out of the Slack ``block_actions`` payload and
@@ -239,6 +247,12 @@ async def _route_action_decision(
             "response_type": "ephemeral",
             "text": f"⚠️ Internal error: {exc}",
         }
+    # A terminal decision replaces the card. Drop the timer first so the
+    # deadline cannot reject an action a person already decided.
+    if timeout_scheduler is not None and payload.get("replace_original"):
+        decided = button_value.split("|", 1)[0].strip()
+        if decided:
+            timeout_scheduler.cancel(decided)
     await respond(payload)
 
 
@@ -258,7 +272,6 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     api_client = AisocApiClient.from_settings()
     actions_client = AisocActionsClient.from_settings()
-    bolt_app = _build_bolt_app(api_client, actions_client)
 
     # The timeout scheduler is shared across the process — one task per
     # pending approval so a forgotten Approve/Deny can't leave the action
@@ -290,6 +303,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         audit_sink=StructlogAuditSink(),
         store=timer_store,
     )
+    bolt_app = _build_bolt_app(api_client, actions_client, timeout_scheduler)
     # Re-arm any timers that survived a restart (no-op for the in-memory store).
     try:
         await timeout_scheduler.recover()

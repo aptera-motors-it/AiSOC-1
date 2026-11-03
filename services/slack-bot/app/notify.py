@@ -141,4 +141,13 @@ async def post_approval_card(
         action_id=body.action.get("id"),
         channel=channel,
     )
+    action_id = str(body.action.get("id") or body.action.get("action_id") or "")
+    timeout_seconds = body.timeout_seconds or 0
+    if action_id and timeout_seconds > 0:
+        request.app.state.timeout_scheduler.schedule(
+            action_id,
+            timeout_seconds=timeout_seconds,
+            case_id=str(body.case.get("id") or ""),
+            channel=channel,
+        )
     return {"posted": True, "channel": channel, "ts": response.get("ts") if hasattr(response, "get") else None}
