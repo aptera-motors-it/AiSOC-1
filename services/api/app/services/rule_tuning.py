@@ -33,13 +33,14 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from fastapi import HTTPException, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.deps import AuthUser
 from app.models.detection_rule import DetectionRule
 from app.services.audit import emit_audit
+from app.services.builtin_rules import builtin_by_uuid
 
 # ─── Tuning heuristics ───────────────────────────────────────────────────────
 #
@@ -198,6 +199,23 @@ class ApplyTuningRequest(BaseModel):
         default=None,
         description="Field values that suppress this rule, stored as suppression_config.suppress_when.",
     )
+
+    @field_validator("note", "suppression_reason", "suppress_when")
+    @classmethod
+    def _reject_nul(cls, value: object) -> object:
+        if _contains_nul(value):
+            raise ValueError("cannot contain a NUL character")
+        return value
+
+
+def _contains_nul(value: object) -> bool:
+    if isinstance(value, str):
+        return "\x00" in value
+    if isinstance(value, dict):
+        return any(_contains_nul(key) or _contains_nul(item) for key, item in value.items())
+    if isinstance(value, list):
+        return any(_contains_nul(item) for item in value)
+    return False
 
 
 class DismissTuningRequest(BaseModel):
@@ -559,9 +577,9 @@ async def _load_rule_for_tenant(
 _SEVERITY_LADDER = ("info", "low", "medium", "high", "critical")
 
 
-def _raised_min_severity(rule_severity: object, existing: object) -> str | None:
+def _raised_min_severity(*values: object) -> str | None:
     ranks: list[int] = []
-    for value in (rule_severity, existing):
+    for value in values:
         if isinstance(value, str):
             key = value.strip().lower()
             if key in _SEVERITY_LADDER:
@@ -598,6 +616,7 @@ def _bumped_threshold(
     override: int | None,
     *,
     rule_severity: str | None,
+    corpus_severity: str | None = None,
 ) -> tuple[dict[str, Any], int, int]:
     next_config = dict(current)
     raw_existing = current.get("event_threshold") or current.get("threshold")
@@ -608,7 +627,7 @@ def _bumped_threshold(
     new_value = override if override is not None else max(existing + 1, 2)
     next_config["event_threshold"] = new_value
     next_config["last_raised_at"] = datetime.now(UTC).isoformat()
-    floor = _raised_min_severity(rule_severity, current.get("min_severity"))
+    floor = _raised_min_severity(rule_severity, corpus_severity, current.get("min_severity"))
     if floor is not None:
         next_config["min_severity"] = floor
     return next_config, existing, new_value
@@ -685,10 +704,12 @@ async def apply_tuning(
     changes_payload: dict[str, Any] = {"action": body.action}
 
     if body.action == "raise_threshold":
+        catalogue_rule = builtin_by_uuid(rule.id, actor.tenant_id)
         next_threshold, old_value, new_value = _bumped_threshold(
             _threshold_config(rule),
             body.threshold,
             rule_severity=rule.severity,
+            corpus_severity=None if catalogue_rule is None else catalogue_rule.severity,
         )
         rule.threshold_config = next_threshold
         changes_payload["threshold"] = {"before": old_value, "after": new_value}
