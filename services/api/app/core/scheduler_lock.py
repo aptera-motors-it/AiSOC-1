@@ -2,10 +2,11 @@
 
 Workers in ``app.main`` run in-process on every API replica. This helper
 provides a per-job Redis lease so only one replica executes a given worker at
-any time while keeping availability-first behavior:
+any time:
 
-* lock held by another replica -> caller gets ``False`` and can skip silently.
-* Redis unavailable -> caller gets ``True`` (fail-open) and work proceeds.
+* lock held by another replica, or Redis unavailable -> caller gets ``False``.
+* lease not renewed before it expires -> the body is cancelled and the block
+  exits, so the caller contends for the lock again.
 """
 
 from __future__ import annotations
@@ -72,9 +73,12 @@ async def _renew_lease_loop(
     token: str,
     ttl_seconds: int,
     renew_every_seconds: int,
+    lease: asyncio.Timeout,
 ) -> None:
+    loop = asyncio.get_running_loop()
     while True:
         await asyncio.sleep(renew_every_seconds)
+        sent_at = loop.time()
         try:
             renewed = await redis_client.eval(
                 _RENEW_IF_OWNER_SCRIPT,
@@ -85,10 +89,14 @@ async def _renew_lease_loop(
             )
         except _BACKEND_ERRORS as exc:
             _warn_backend_unavailable(job_name=job_name, lock_key=lock_key, phase="renew", exc=exc)
-            return
+            continue
 
-        if not renewed:
+        if lease.expired():
             return
+        if not renewed:
+            lease.reschedule(loop.time())
+            return
+        lease.reschedule(sent_at + ttl_seconds)
 
 
 @asynccontextmanager
@@ -104,19 +112,22 @@ async def scheduler_lock(*, job_name: str, ttl_seconds: int) -> AsyncIterator[bo
     token = uuid.uuid4().hex
     renew_task: asyncio.Task[None] | None = None
     redis_client: Redis | None = None
+    loop = asyncio.get_running_loop()
 
     try:
         redis_client = await _get_redis_client()
+        requested_at = loop.time()
         acquired = await redis_client.set(lock_key, token, ex=ttl_seconds, nx=True)
     except _BACKEND_ERRORS as exc:
         _warn_backend_unavailable(job_name=job_name, lock_key=lock_key, phase="acquire", exc=exc)
-        yield True
+        yield False
         return
 
     if not acquired:
         yield False
         return
 
+    lease = asyncio.timeout_at(requested_at + ttl_seconds)
     renew_every_seconds = max(1, ttl_seconds // 3)
     renew_task = asyncio.create_task(
         _renew_lease_loop(
@@ -126,12 +137,18 @@ async def scheduler_lock(*, job_name: str, ttl_seconds: int) -> AsyncIterator[bo
             token=token,
             ttl_seconds=ttl_seconds,
             renew_every_seconds=renew_every_seconds,
+            lease=lease,
         ),
         name=f"scheduler_lock_renew_{job_name}",
     )
 
     try:
-        yield True
+        async with lease:
+            yield True
+    except TimeoutError:
+        if not lease.expired():
+            raise
+        logger.warning("scheduler_lock.lease_lost job_name=%s lock_key=%s", job_name, lock_key)
     finally:
         if renew_task is not None:
             renew_task.cancel()
