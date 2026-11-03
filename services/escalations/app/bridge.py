@@ -231,19 +231,27 @@ def tick(state: dict) -> None:
                 continue
             nag = nag or NagState()
             age = (now - case.opened_at).total_seconds() / 60
-            code = post(TEAMS_URL, crit_payload(case, age, nag.count + 1))
+            try:
+                code = post(TEAMS_URL, crit_payload(case, age, nag.count + 1))
+            except Exception as exc:
+                log(f"ERROR critical escalation {case.ref}: {type(exc).__name__}: {exc}")
+                continue
             log(f"critical escalation {case.ref} HTTP {code}")
             nag.count += 1
             nag.last = now.isoformat()
             state["escalations"][case.id] = nag.__dict__
+            save_state(state)
 
         if should_send_digest(state.get("digest_last", ""), now):
-            highs = fetch_unacked(cur, "high")
-            if highs:
-                code = post(TEAMS_URL, digest_payload(highs, pipeline_health(cur), now))
-                log(f"daily digest HTTP {code} highs={len(highs)}")
-            state["digest_last"] = now.strftime("%Y-%m-%d")
-    save_state(state)
+            try:
+                highs = fetch_unacked(cur, "high")
+                if highs:
+                    code = post(TEAMS_URL, digest_payload(highs, pipeline_health(cur), now))
+                    log(f"daily digest HTTP {code} highs={len(highs)}")
+                state["digest_last"] = now.strftime("%Y-%m-%d")
+                save_state(state)
+            except Exception as exc:
+                log(f"ERROR digest: {type(exc).__name__}: {exc}")
 
 
 def main() -> None:
