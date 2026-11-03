@@ -536,10 +536,12 @@ async def _load_rule_for_tenant(
     # exists, it just isn't tuneable from here) and another tenant's rule is
     # a 404 (it must not be distinguishable from absent).
     result = await db.execute(
-        select(DetectionRule).where(
+        select(DetectionRule)
+        .where(
             DetectionRule.id == rule_id,
             or_(DetectionRule.tenant_id == tenant_id, DetectionRule.tenant_id.is_(None)),
         )
+        .with_for_update()
     )
     rule = result.scalar_one_or_none()
     if rule is None:
@@ -558,11 +560,6 @@ _SEVERITY_LADDER = ("info", "low", "medium", "high", "critical")
 
 
 def _raised_min_severity(rule_severity: object, existing: object) -> str | None:
-    """One step above the higher of the rule severity and any stored floor.
-
-    Fusion holds a match only when the rule sits strictly below
-    ``min_severity``. ``critical`` has no higher step.
-    """
     ranks: list[int] = []
     for value in (rule_severity, existing):
         if isinstance(value, str):
@@ -583,7 +580,6 @@ def _string_list(value: object) -> list[str]:
 
 
 def _merged_suppress_when(current: dict[str, Any], incoming: dict[str, list[str]]) -> dict[str, list[str]]:
-    """Keep values already stored and add the ones this apply named."""
     merged: dict[str, list[str]] = {}
     raw = current.get("suppress_when")
     if isinstance(raw, dict):
@@ -603,11 +599,6 @@ def _bumped_threshold(
     *,
     rule_severity: str | None,
 ) -> tuple[dict[str, Any], int, int]:
-    """Return (new_config, old_threshold, new_threshold).
-
-    ``event_threshold`` stays the event count. ``min_severity`` is the floor
-    fusion compares with the rule's severity.
-    """
     next_config = dict(current)
     raw_existing = current.get("event_threshold") or current.get("threshold")
     try:
@@ -630,11 +621,6 @@ def _appended_suppression(
     actor_email: str | None,
     suppress_when: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
-    """Record a suppression the workbench added.
-
-    ``rules`` is the analyst's note. ``suppress_when`` is the field match
-    fusion reads when deciding whether the rule fires.
-    """
     next_config = dict(current)
     rules_list = list(next_config.get("rules") or [])
     rules_list.append(

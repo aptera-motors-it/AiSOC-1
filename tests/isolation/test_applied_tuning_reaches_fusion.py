@@ -1,12 +1,6 @@
-"""An applied tuning changes the decision fusion makes for that tenant.
-
-The console apply route is the real ASGI app on Postgres. Fusion's answer is
-the real detection engine and the real overlay cache, in a second process so
-the two services do not share an ``app`` package.
-"""
-
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -14,12 +8,14 @@ import sys
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-import httpx
 import pytest
 import pytest_asyncio
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+if TYPE_CHECKING:
+    import httpx
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "services" / "api"))
@@ -46,6 +42,7 @@ from app.services.detection_engine import DetectionEngine
 from app.services.tenant_overlay import OverlayCache
 
 MATCH = {"host": "WIN-FS01", "event": "rename"}
+SECOND = {"host": "WIN-FS02", "event": "rename"}
 OTHER = {"host": "OTHER-01", "event": "rename"}
 
 
@@ -62,12 +59,14 @@ async def main() -> None:
     }
     engine = DetectionEngine(rules=[rule])
     match_event = {"ocsf_event": {"raw_data": json.dumps(MATCH)}}
+    second_event = {"ocsf_event": {"raw_data": json.dumps(SECOND)}}
     other_event = {"ocsf_event": {"raw_data": json.dumps(OTHER)}}
     override = overlay.overrides.get(rule_id)
     print(
         json.dumps(
             {
                 "hits": len(engine.evaluate(match_event, overlay)),
+                "second_hits": len(engine.evaluate(second_event, overlay)),
                 "other_hits": len(engine.evaluate(other_event, overlay)),
                 "severity_floor": overlay.raises_severity_floor(rule_id, severity),
                 "suppresses": overlay.suppresses(rule_id, MATCH),
@@ -84,10 +83,7 @@ asyncio.run(main())
 
 
 def _dsn() -> str:
-    value = os.environ.get("ISOLATION_TUNING_DSN", "").strip()
-    if not value:
-        pytest.skip("ISOLATION_TUNING_DSN is not set; this suite needs a live Postgres")
-    return value
+    return os.environ.get("ISOLATION_TUNING_DSN", "").strip()
 
 
 def _app_dsn(raw: str) -> str:
@@ -132,17 +128,15 @@ def _fusion(tenant: str, rule_id: str) -> dict:
 
 
 def _as_dict(value: object) -> dict:
-    if isinstance(value, str):
-        loaded = json.loads(value)
-        return loaded if isinstance(loaded, dict) else {}
-    if isinstance(value, dict):
-        return value
-    return {}
+    assert isinstance(value, dict), type(value)
+    return value
 
 
 @pytest_asyncio.fixture(scope="module", loop_scope="module")
 async def app_client() -> AsyncIterator[httpx.AsyncClient]:
+    pytest.importorskip("httpx")
     _prepare_env()
+    import httpx
     from app.main import create_application
 
     transport = httpx.ASGITransport(app=create_application())
@@ -152,7 +146,10 @@ async def app_client() -> AsyncIterator[httpx.AsyncClient]:
 
 @pytest_asyncio.fixture(loop_scope="module")
 async def db() -> AsyncIterator[AsyncSession]:
+    pytest.importorskip("sqlalchemy")
     _prepare_env()
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
     engine = create_async_engine(_app_dsn(_dsn()), future=True)
     maker = async_sessionmaker(engine, expire_on_commit=False)
     async with maker() as session:
@@ -161,6 +158,7 @@ async def db() -> AsyncIterator[AsyncSession]:
 
 
 async def _tenant_and_rule(db: AsyncSession) -> tuple[uuid.UUID, uuid.UUID, str, dict[str, str]]:
+    import sqlalchemy
     from app.core.security import get_password_hash
 
     tenant_id = uuid.uuid4()
@@ -169,11 +167,11 @@ async def _tenant_and_rule(db: AsyncSession) -> tuple[uuid.UUID, uuid.UUID, str,
     source = f"det-tune-{uuid.uuid4().hex[:8]}"
     email = f"tune-{user_id.hex[:10]}@example.com"
     await db.execute(
-        text("INSERT INTO tenants (id, name, slug) VALUES (:i, :n, :s)"),
+        sqlalchemy.text("INSERT INTO tenants (id, name, slug) VALUES (:i, :n, :s)"),
         {"i": tenant_id, "n": f"tune-{tenant_id.hex[:8]}", "s": f"tune-{tenant_id.hex[:8]}"},
     )
     await db.execute(
-        text(
+        sqlalchemy.text(
             "INSERT INTO users (id, tenant_id, email, username, role, is_active, hashed_password) "
             "VALUES (:i, :t, :e, :u, 'admin', TRUE, :p)"
         ),
@@ -186,7 +184,7 @@ async def _tenant_and_rule(db: AsyncSession) -> tuple[uuid.UUID, uuid.UUID, str,
         },
     )
     await db.execute(
-        text(
+        sqlalchemy.text(
             "INSERT INTO detection_rules "
             "(id, tenant_id, name, rule_language, rule_body, category, status, severity, provenance) "
             "VALUES (:i, :t, 'Mass file rename', 'sigma', 'title: mass rename', 'impact', 'active', :sev, CAST(:p AS jsonb))"
@@ -207,11 +205,13 @@ async def _bearer(client: httpx.AsyncClient, email: str) -> dict[str, str]:
 
 
 async def _stored(db: AsyncSession, rule_id: uuid.UUID) -> dict:
+    import sqlalchemy
+
     await db.rollback()
     row = (
         (
             await db.execute(
-                text("SELECT status, threshold_config, suppression_config FROM detection_rules WHERE id = :i"),
+                sqlalchemy.text("SELECT status, threshold_config, suppression_config FROM detection_rules WHERE id = :i"),
                 {"i": rule_id},
             )
         )
@@ -273,4 +273,32 @@ async def test_add_suppression_reaches_fusion(app_client: httpx.AsyncClient, db:
     assert decision["enabled"] is True, decision
     assert decision["suppresses"], {"decision": decision, "stored": stored}
     assert decision["hits"] == 0, {"decision": decision, "stored": stored}
+    assert decision["other_hits"] == 1, {"decision": decision, "stored": stored}
+
+
+async def test_concurrent_suppressions_both_reach_fusion(app_client: httpx.AsyncClient, db: AsyncSession) -> None:
+    tenant_id, rule_id, source, user = await _tenant_and_rule(db)
+    headers = await _bearer(app_client, user["email"])
+
+    async def apply(host: str) -> httpx.Response:
+        return await app_client.post(
+            f"/api/v1/detection/tuning/{rule_id}/apply",
+            json={
+                "action": "add_suppression",
+                "suppression_reason": host,
+                "suppress_when": {"host": [host]},
+            },
+            headers=headers,
+        )
+
+    responses = await asyncio.gather(apply("WIN-FS01"), apply("WIN-FS02"))
+    assert [response.status_code for response in responses] == [200, 200]
+
+    stored = await _stored(db, rule_id)
+    decision = _fusion(str(tenant_id), source)
+    hosts = stored["suppression"].get("suppress_when", {}).get("host", [])
+    assert set(hosts) == {"WIN-FS01", "WIN-FS02"}, stored
+    assert len(stored["suppression"].get("rules", [])) == 2, stored
+    assert decision["hits"] == 0, {"decision": decision, "stored": stored}
+    assert decision["second_hits"] == 0, {"decision": decision, "stored": stored}
     assert decision["other_hits"] == 1, {"decision": decision, "stored": stored}
