@@ -13,7 +13,8 @@ import subprocess
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-EKS_MODULE = REPO / "infra" / "terraform" / "modules" / "eks"
+TERRAFORM_ROOT = REPO / "infra" / "terraform"
+EKS_MODULE = TERRAFORM_ROOT / "modules" / "eks"
 TFSEC_VERSION = "1.28.13"
 TFSEC_RULE = "AVD-AWS-0041"
 
@@ -50,6 +51,29 @@ def _tfsec_results(module_dir: Path) -> list[dict]:
     )
     payload = json.loads(report.read_text())
     return payload.get("results") or []
+
+
+def test_tfsec_iac_workflow_scans_infra_terraform_tree():
+    """Mirror security.yml: tfsec 1.28.13 over infra/terraform must complete."""
+    report = Path("/tmp") / "tfsec-infra-terraform.json"
+    if report.exists():
+        report.unlink()
+    completed = subprocess.run(
+        [
+            str(_tfsec_bin()),
+            str(TERRAFORM_ROOT),
+            "--format",
+            "json",
+            "--out",
+            str(report),
+            "--soft-fail",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(report.read_text())
+    assert isinstance(payload.get("results"), list)
 
 
 def test_tfsec_does_not_allow_world_reachable_eks_public_endpoint():
