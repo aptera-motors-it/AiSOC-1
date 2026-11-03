@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 import urllib.parse
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,6 +19,7 @@ from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
 TOKEN = "internal-secret"
 ACTION_ID = "act-timeout-1"
+_slack_posts: list[object] = []
 
 CARD = {
     "action": {
@@ -34,13 +36,18 @@ CARD = {
 
 class _Actions(BaseHTTPRequestHandler):
     received: list[tuple[str, bytes]] = []
+    hold_approve_seconds: float = 0
+    approve_status: int = 200
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler method name
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else b""
         type(self).received.append((self.path, body))
-        payload = json.dumps({"id": ACTION_ID, "status": "rejected"}).encode()
-        self.send_response(200)
+        if self.path.endswith("/approve") and type(self).hold_approve_seconds > 0:
+            time.sleep(type(self).hold_approve_seconds)
+        status_code = type(self).approve_status if self.path.endswith("/approve") else 200
+        payload = json.dumps({"id": ACTION_ID, "status": "ok"}).encode()
+        self.send_response(status_code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
@@ -53,6 +60,9 @@ class _Actions(BaseHTTPRequestHandler):
 @pytest.fixture
 def actions_url(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     _Actions.received = []
+    _Actions.hold_approve_seconds = 0
+    _Actions.approve_status = 200
+    _slack_posts.clear()
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Actions)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -67,6 +77,7 @@ def actions_url(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     get_settings.cache_clear()
 
     async def chat_post_message(self: AsyncWebClient, **kwargs: object) -> dict[str, object]:
+        _slack_posts.append(kwargs.get("channel"))
         return {"ok": True, "ts": "1700000000.000100", "channel": kwargs.get("channel")}
 
     async def auth_test(self: AsyncWebClient, **kwargs: object) -> AsyncSlackResponse:
@@ -125,13 +136,13 @@ async def test_an_undecided_approval_card_is_rejected_when_its_deadline_passes()
     assert _reject_bodies() == [b""]
 
 
-def _deny_click() -> str:
+def _click(slack_action_id: str) -> str:
     payload = {
         "type": "block_actions",
         "user": {"id": "U-SOC-LEAD"},
         "channel": {"id": "C-SOC"},
         "team": {"id": "T1"},
-        "actions": [{"action_id": "aisoc_action_deny", "value": f"{ACTION_ID}|case-9", "type": "button"}],
+        "actions": [{"action_id": slack_action_id, "value": f"{ACTION_ID}|case-9", "type": "button"}],
         "response_url": "http://127.0.0.1:9/never",
         "trigger_id": "1.2.3",
     }
@@ -146,7 +157,7 @@ async def test_a_decision_before_the_deadline_is_not_followed_by_the_timeout() -
             await _post_card(client)
             click = await client.post(
                 "/slack/events",
-                content=_deny_click(),
+                content=_click("aisoc_action_deny"),
                 headers={"content-type": "application/x-www-form-urlencoded"},
             )
             assert click.status_code == 200
@@ -155,3 +166,82 @@ async def test_a_decision_before_the_deadline_is_not_followed_by_the_timeout() -
     bodies = _reject_bodies()
     assert len(bodies) == 1
     assert json.loads(bodies[0])["chatops_approver"]["platform_user_id"] == "U-SOC-LEAD"
+
+
+def _paths() -> list[str]:
+    return [path for path, _ in _Actions.received]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("actions_url")
+async def test_a_slow_approve_before_the_deadline_is_not_also_rejected() -> None:
+    _Actions.hold_approve_seconds = 0.8
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://bot") as client:
+            await _post_card(client)
+            await asyncio.sleep(0.6)
+            click = await client.post(
+                "/slack/events",
+                content=_click("aisoc_action_approve"),
+                headers={"content-type": "application/x-www-form-urlencoded"},
+            )
+            assert click.status_code == 200
+            await asyncio.sleep(1.1)
+
+    assert _paths() == [f"/api/v1/actions/{ACTION_ID}/approve"]
+    assert json.loads(_Actions.received[0][1])["chatops_approver"]["platform_user_id"] == "U-SOC-LEAD"
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("actions_url")
+async def test_a_failed_approve_still_rejects_when_the_deadline_passes() -> None:
+    _Actions.approve_status = 500
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://bot") as client:
+            await _post_card(client)
+            click = await client.post(
+                "/slack/events",
+                content=_click("aisoc_action_approve"),
+                headers={"content-type": "application/x-www-form-urlencoded"},
+            )
+            assert click.status_code == 200
+            deadline = asyncio.get_running_loop().time() + 5
+            while asyncio.get_running_loop().time() < deadline and not _reject_bodies():
+                await asyncio.sleep(0.05)
+
+    assert f"/api/v1/actions/{ACTION_ID}/approve" in _paths()
+    assert _reject_bodies() == [b""]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("actions_url")
+async def test_need_info_leaves_the_deadline_armed() -> None:
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://bot") as client:
+            await _post_card(client)
+            click = await client.post(
+                "/slack/events",
+                content=_click("aisoc_action_need_info"),
+                headers={"content-type": "application/x-www-form-urlencoded"},
+            )
+            assert click.status_code == 200
+            deadline = asyncio.get_running_loop().time() + 5
+            while asyncio.get_running_loop().time() < deadline and not _reject_bodies():
+                await asyncio.sleep(0.05)
+
+    assert _paths() == [f"/api/v1/actions/{ACTION_ID}/reject"]
+    assert _reject_bodies() == [b""]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("actions_url")
+async def test_an_absurd_timeout_is_refused_before_slack_is_called() -> None:
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://bot") as client:
+            response = await client.post(
+                "/internal/approval-card",
+                json={**CARD, "timeout_seconds": 10**400},
+                headers={"X-AiSOC-Internal-Token": TOKEN},
+            )
+    assert response.status_code == 422
+    assert _slack_posts == []
