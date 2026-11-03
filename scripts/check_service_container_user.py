@@ -115,9 +115,7 @@ def _logical_instruction_lines(text: str) -> list[str]:
 
 
 def _uid_part(user_spec: str) -> str:
-    spec = user_spec.strip()
-    if len(spec) >= 2 and spec[0] == spec[-1] and spec[0] in "\"'":
-        spec = spec[1:-1].strip()
+    spec = user_spec.strip().replace('"', "").replace("'", "")
     return spec.split(":", 1)[0].strip()
 
 
@@ -310,6 +308,9 @@ def self_test() -> int:
 
     sq_zero_group = effective_runtime_user("FROM alpine:3.19\nUSER '0:0'\nCMD []\n")
     record("USER '0:0' is treated as root", sq_zero_group.user is None)
+
+    partial_quote = effective_runtime_user('FROM alpine:3.19\nUSER "0":0\nCMD []\n')
+    record('USER "0":0 is treated as root', partial_quote.user is None)
 
     tab_user = effective_runtime_user("FROM alpine:3.19\nUSER nobody\nUSER\t0\nCMD []\n")
     record("USER with tab before uid 0 is treated as root", tab_user.user is None)
