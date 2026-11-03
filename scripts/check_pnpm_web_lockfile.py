@@ -16,8 +16,10 @@ can actually move without breaking the tree:
   ``minimatch@3`` → 11 bump that breaks ``test-exclude@6`` / ``nyc``.
 * **deepmerge** — refuse versions below 4.2.0 (no ``__proto__`` merge guard).
   Do **not** pin 4.1.2 to silence GHSA-gcqx-w48m-w2h4: that downgrade removes
-  the guard added in 4.2.0 while npm still has no release above 4.3.1. Keep
-  4.2.0+ and clear minimatch instead.
+  the guard added in 4.2.0. Keep 4.3.1 (or newer when upstream ships). The
+  advisory is low severity with patched versions ``<0.0.0`` — no npm fix yet;
+  ``pnpm audit`` legitimately exits 1 on that finding until a patched release
+  lands. No pnpm audit ignore and no override exception for it.
 
 Package keys using registry tarballs or quoted paths are parsed the same as
 ``/pkg@version:`` entries. ``apps/mobile`` is out of scope.
