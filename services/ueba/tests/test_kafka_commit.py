@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
 from aiokafka.admin import AIOKafkaAdminClient, NewTopic
-from aiokafka.errors import IllegalStateError
+from aiokafka.errors import CommitFailedError, IllegalStateError
 from app.core.config import settings
 from app.services.dead_letters import DeadLetterSink
 from app.services.kafka_consumer import UEBAKafkaConsumer
@@ -313,5 +313,51 @@ async def test_lost_partition_on_commit_keeps_the_subscription(
         assert consumer.stats()["processed"] >= 2
         committed = await _committed(brokers, group, topic)
         assert committed == 0, f"committed offset {committed} advanced after a lost partition"
+    finally:
+        await _stop(consumer, task)
+
+
+@pytest.mark.asyncio
+async def test_failed_pin_does_not_commit_a_later_offset(monkeypatch: pytest.MonkeyPatch) -> None:
+    brokers = _broker()
+    real_commit = AIOKafkaConsumer.commit
+    failed = False
+
+    async def commit(self: AIOKafkaConsumer, offsets: Any = None) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise CommitFailedError("generation changed")
+        await real_commit(self, offsets)
+
+    monkeypatch.setattr(AIOKafkaConsumer, "commit", commit)
+    suffix = uuid.uuid4().hex[:8]
+    topic = f"ueba.commit.{suffix}"
+    group = f"ueba-commit-{suffix}"
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    monkeypatch.delenv("KAFKA_SECURITY_PROTOCOL", raising=False)
+    monkeypatch.setattr(settings, "database_url", "postgresql+asyncpg://aisoc:x@127.0.0.1:1/aisoc")
+    monkeypatch.setattr(settings, "kafka_bootstrap_servers", brokers)
+    monkeypatch.setattr(settings, "kafka_input_topic", topic)
+    monkeypatch.setattr(settings, "kafka_output_topic", f"{topic}.out")
+    monkeypatch.setattr(settings, "kafka_consumer_group", group)
+    await _create_topic(brokers, topic)
+    consumer = UEBAKafkaConsumer()
+    task = asyncio.create_task(consumer.run())
+    try:
+        await _until(lambda: consumer.attached, 20, "consumer did not attach")
+        await _produce(brokers, topic, [NOT_JSON, NOT_JSON])
+        await _until(
+            lambda: task.done() or consumer.stats()["processed"] > 0,
+            20,
+            "pin failure neither stopped the consumer nor skipped ahead",
+        )
+        if task.done() and not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                raise error
+        assert consumer.stats()["processed"] == 0, consumer.stats()
+        committed = await _committed(brokers, group, topic)
+        assert committed is None, f"committed offset {committed} moved past an event whose pin failed"
     finally:
         await _stop(consumer, task)
