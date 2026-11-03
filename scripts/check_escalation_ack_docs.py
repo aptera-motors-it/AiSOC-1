@@ -38,6 +38,7 @@ FORBIDDEN_DOC_PHRASES = (
     "console acknowledge action",
     "joining the case's war room",
     "war-room join write",
+    "also an ack-clock writer",
 )
 
 WAR_ROOM_ACK = re.compile(r"war-room\s+acknowledge", re.IGNORECASE)
@@ -46,6 +47,19 @@ CASE_ACK_SET = re.compile(
     r"UPDATE\s+aisoc_cases\s+SET[^;]*acknowledged_at",
     re.IGNORECASE | re.DOTALL,
 )
+
+
+def _mentions_case_ack_write(body: str) -> bool:
+    """True when source looks like it writes ``aisoc_cases.acknowledged_at``."""
+    if CASE_ACK_SET.search(body):
+        return True
+    upper = body.upper()
+    return (
+        "AISOC_CASES" in upper
+        and "ACKNOWLEDGED_AT" in upper
+        and "UPDATE" in upper
+        and "SET" in upper
+    )
 
 
 @dataclass(frozen=True)
@@ -133,7 +147,7 @@ def gate_escalation_ack_docs(root: Path) -> list[Finding]:
         if "/migrations/" in py_rel or py_rel.startswith("services/api/migrations/"):
             continue
         body = path.read_text(encoding="utf-8", errors="replace")
-        if CASE_ACK_SET.search(body):
+        if _mentions_case_ack_write(body):
             writers.append(py_rel)
 
     expected = WAR_ROOM.as_posix()
@@ -222,6 +236,37 @@ def _self_test() -> int:
         print(f"  {'PASS' if caught else 'FAIL'}  stale console-ack claim is refused")
     finally:
         shutil.rmtree(bad, ignore_errors=True)
+
+    extra = Path(tempfile.mkdtemp(prefix="esc-ack-extra-writer-"))
+    try:
+        _write_minimal_tree(
+            extra,
+            readme=GOOD_README + "\nThe web UI PATCH is also an ack-clock writer.\n",
+            bridge_doc=GOOD_BRIDGE_DOC,
+            war_room='if decision == "acknowledge":\n    "UPDATE aisoc_cases SET acknowledged_at = COALESCE(acknowledged_at, :now)"\n',
+        )
+        caught_extra = bool(gate_escalation_ack_docs(extra))
+        ok &= caught_extra
+        print(f"  {'PASS' if caught_extra else 'FAIL'}  extra ack-clock writer claim is refused")
+    finally:
+        shutil.rmtree(extra, ignore_errors=True)
+
+    concat = Path(tempfile.mkdtemp(prefix="esc-ack-concat-"))
+    try:
+        _write_minimal_tree(
+            concat,
+            readme=GOOD_README,
+            bridge_doc=GOOD_BRIDGE_DOC,
+            war_room='if decision == "acknowledge":\n    "UPDATE aisoc_cases SET acknowledged_at = COALESCE(acknowledged_at, :now)"\n',
+        )
+        rogue = concat / "services/api/app/cases.py"
+        rogue.parent.mkdir(parents=True, exist_ok=True)
+        rogue.write_text('cur.execute("UPDATE " + "aisoc_cases SET acknowledged_at = now()")\n', encoding="utf-8")
+        caught_concat = bool(gate_escalation_ack_docs(concat))
+        ok &= caught_concat
+        print(f"  {'PASS' if caught_concat else 'FAIL'}  split-string SQL writer is refused")
+    finally:
+        shutil.rmtree(concat, ignore_errors=True)
 
     empty = Path(tempfile.mkdtemp(prefix="esc-ack-empty-"))
     try:
