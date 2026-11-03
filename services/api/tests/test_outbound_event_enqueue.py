@@ -1,9 +1,10 @@
 """An enabled destination receives the status moves it subscribes to.
 
 ``enqueue_event`` queues one delivery per enabled destination whose
-subscription includes the event (an empty subscription means every event).
-Nothing outside the tests calls it, so a destination that is enabled and
-then watches an alert or a case change status never gets a row.
+subscription includes the event. An empty subscription means every event.
+A destination that is disabled, subscribed to a different event, or owned
+by another tenant gets no row. A write that does not change status gets
+no row either.
 
 The request goes through the shipped ASGI app: a real JWT, the alert and
 case PATCH routes, and PostgreSQL with the migration chain applied. The
