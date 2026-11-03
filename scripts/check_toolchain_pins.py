@@ -477,7 +477,7 @@ _SETUP_ACTION = re.compile(r"uses:\s*actions/setup-(?P<runtime>node|go|python)@"
 _JOB_CONTAINER = re.compile(r"^\s*image:\s*(?P<image>[\w./-]+:[\w.-]+)\s*$", re.MULTILINE)
 _PNPM_ACTION = re.compile(r"uses:\s*pnpm/action-setup@\w+\s*#\s*(?P<version>v[\d.]+)")
 _USES_ACTION = re.compile(r"^\s*(?:-\s*)?uses:\s*(?P<ref>[^\s#]+)", re.MULTILINE)
-_ACTION_COMMIT_SHA = re.compile(r"@[0-9a-f]{40}\b", re.IGNORECASE)
+_ACTION_SHA_SUFFIX = re.compile(r"^[0-9a-f]{40}$")
 
 # `FROM node:20-alpine AS base`, `FROM golang:1.26-alpine`, `FROM python:3.11-slim`.
 _DOCKER_FROM = re.compile(
@@ -1920,20 +1920,31 @@ def check_pnpm_actions(data: Scan) -> list[str]:
     return problems
 
 
+def _workflow_action_is_sha_pinned(ref: str) -> bool:
+    ref = ref.strip("\"'")
+    if ref.startswith("./"):
+        return True
+    if ref.startswith("docker://") and "@sha256:" in ref:
+        return True
+    if "@" not in ref:
+        return False
+    suffix = ref.rsplit("@", 1)[1]
+    return bool(_ACTION_SHA_SUFFIX.match(suffix))
+
+
 def check_workflow_action_pins(root: Path) -> list[str]:
     """Third-party workflow actions pinned to a commit SHA, not a movable tag."""
     problems: list[str] = []
     workflows = root / ".github" / "workflows"
     if not workflows.is_dir():
         return problems
-    for path in sorted(workflows.glob("*.yml")):
+    workflow_files = sorted(set(workflows.glob("*.yml")) | set(workflows.glob("*.yaml")))
+    for path in workflow_files:
         rel = path.relative_to(root).as_posix()
         text = path.read_text(encoding="utf-8")
         for match in _USES_ACTION.finditer(text):
             ref = match.group("ref")
-            if ref.startswith("./"):
-                continue
-            if _ACTION_COMMIT_SHA.search(ref):
+            if _workflow_action_is_sha_pinned(ref):
                 continue
             problems.append(f"{rel} uses `{ref}` without a commit SHA — a tag move can change what CI executes (workflow action pin)")
     return problems
