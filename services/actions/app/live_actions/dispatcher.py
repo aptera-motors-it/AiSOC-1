@@ -824,9 +824,8 @@ async def dispatch(request: LiveActionRequest) -> LiveActionResult:
     #
     # Verification runs only for a real execution that actually succeeded. A
     # dry run and a SIMULATED result have nothing to verify, and a failed
-    # execution is already an honest negative.
-    if result.verification is not None:
-        result = result.model_copy(update={"verification": None})
+    # execution is already an honest negative. Anything short of that read-back
+    # drops an executor's verification claim, including one buried in details.
     if decision is not None and decision.requires_verification and not request.dry_run and result.status is LiveActionStatus.SUCCEEDED:
         if action_type is not None:
             result = await _verify_effect(request, result, action_type, log)
@@ -841,6 +840,9 @@ async def dispatch(request: LiveActionRequest) -> LiveActionResult:
                 VerificationOutcome.UNVERIFIED,
                 f"no probe is registered for '{request.capability}'; it has no ActionType to key one on",
             )
+    else:
+        details = {key: value for key, value in result.details.items() if key not in {"verification", "verification_reason"}}
+        result = result.model_copy(update={"verification": None, "details": details, "summary": "preview only"})
 
     log.info(
         "live_action.completed",

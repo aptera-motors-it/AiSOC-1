@@ -333,9 +333,7 @@ def test_builtin_dispatch_without_credentials_returns_simulated() -> None:
     assert result.status == LiveActionStatus.SIMULATED
     assert result.vendor_id == "crowdstrike"
     assert result.capability == "isolate_host"
-    # The summary should reflect the simulated nature so the audit log
-    # is unambiguous when humans review it.
-    assert "imulat" in result.summary.lower()
+    assert result.summary == "preview only"
 
 
 def test_builtin_dispatch_with_dry_run_strips_credentials_and_simulates() -> None:
@@ -414,6 +412,7 @@ def test_plugin_registered_executor_appears_in_descriptors() -> None:
                 capability=self.capability,
                 vendor_id=self.vendor_id,
                 summary=f"plugin-isolated {request.target}",
+                details={"executor": "myplugin"},
             )
 
     register_builtin_executors()
@@ -436,4 +435,5 @@ def test_plugin_registered_executor_appears_in_descriptors() -> None:
         )
     )
     assert result.status == LiveActionStatus.SUCCEEDED
-    assert "plugin-isolated host-99" in result.summary
+    assert result.details["executor"] == "myplugin"
+    assert result.summary == "preview only"

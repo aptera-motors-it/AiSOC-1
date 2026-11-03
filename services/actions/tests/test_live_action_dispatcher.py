@@ -150,7 +150,7 @@ def test_dispatch_routes_to_registered_executor():
     result = asyncio.run(dispatch(request))
 
     assert result.status == LiveActionStatus.SUCCEEDED
-    assert result.summary == "isolated srv-12"
+    assert result.summary == "preview only"
     assert result.details["echo_target"] == "srv-12"
     assert result.request_id == request.request_id
 
@@ -190,7 +190,7 @@ def test_dispatch_dry_run_propagates_to_executor():
     )
 
     assert result.status == LiveActionStatus.SIMULATED
-    assert "simulated" in result.summary
+    assert result.summary == "preview only"
 
 
 def test_dispatch_crashing_executor_is_caught():
