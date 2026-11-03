@@ -951,15 +951,34 @@ async def _create_approval(pr: PlaybookRun, step: PlaybookStep, tenant_id: str) 
     )
 
 
+async def deny_approval(*, approval_id: str, tenant_id: str, decided_by: str = "", comment: str = "") -> bool:
+    """Record a denial against the run suspended on this approval.
+
+    True only when this call stopped a waiting run. A denial whose pause
+    already resumed, or a second delivery of the same denial, stops nothing.
+    """
+    pause = await playbook_pause.find_waiting(approval_id=approval_id, tenant_id=tenant_id)
+    if pause is None:
+        return False
+    denied = await playbook_pause.resolve(
+        pause_id=pause.id,
+        tenant_id=pause.tenant_id,
+        status="denied",
+        resolution=f"denied by {decided_by or 'an analyst'}: {comment}"[:500],
+    )
+    if denied:
+        logger.info("Playbook run %s halted: approval denied", pause.run_id)
+    return denied
+
+
 async def resume_after_approval(
     *,
     approval_id: str,
     tenant_id: str,
-    approved: bool,
     decided_by: str = "",
     comment: str = "",
 ) -> PlaybookRun | None:
-    """Continue a run suspended on this approval, or record the denial.
+    """Continue a run suspended on this approval.
 
     Returns the completed run, or None when there is nothing waiting. The
     pause is resolved **before** the run continues, so a decision that
@@ -968,16 +987,6 @@ async def resume_after_approval(
     """
     pause = await playbook_pause.find_waiting(approval_id=approval_id, tenant_id=tenant_id)
     if pause is None:
-        return None
-
-    if not approved:
-        await playbook_pause.resolve(
-            pause_id=pause.id,
-            tenant_id=pause.tenant_id,
-            status="denied",
-            resolution=f"denied by {decided_by or 'an analyst'}: {comment}"[:500],
-        )
-        logger.info("Playbook run %s halted: approval denied", pause.run_id)
         return None
 
     claimed = await playbook_pause.resolve(

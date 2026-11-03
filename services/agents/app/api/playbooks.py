@@ -13,7 +13,9 @@ Endpoints:
 
 from __future__ import annotations
 
+import copy
 import html
+import itertools
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -131,14 +133,25 @@ class _OwnedRun:
 
     tenant_id: str
     run: PlaybookRun
+    leg: int
 
 
 # In-memory run store for Pillar-2 (swap for Redis/DB in production)
 _runs: dict[str, _OwnedRun] = {}
 
+#: Numbers each leg of a run — its start and every resume — as it begins. A
+#: resume begins only after the pause it continues was written, so a higher
+#: number is always a later point in the run.
+_legs = itertools.count()
 
-def _remember(tenant_id: str, run: PlaybookRun) -> None:
-    _runs[run.run_id] = _OwnedRun(tenant_id=tenant_id, run=run)
+
+def _remember(tenant_id: str, run: PlaybookRun, leg: int) -> None:
+    # A pause can be decided before the leg that wrote it returns, so legs
+    # return out of order and an earlier leg's snapshot can arrive last.
+    current = _runs.get(run.run_id)
+    if current is not None and current.leg > leg:
+        return
+    _runs[run.run_id] = _OwnedRun(tenant_id=tenant_id, run=run, leg=leg)
 
 
 def _run_or_404(run_id: str, tenant_id: str) -> PlaybookRun:
@@ -154,7 +167,7 @@ def _run_or_404(run_id: str, tenant_id: str) -> PlaybookRun:
     return owned.run
 
 
-def _remember_resumed(run: PlaybookRun) -> None:
+def _remember_resumed(run: PlaybookRun, leg: int) -> None:
     """Record a run that resumed from a durable pause.
 
     The two callback routes have no session — a vendor webhook and the subject
@@ -168,7 +181,7 @@ def _remember_resumed(run: PlaybookRun) -> None:
     if not tenant_id:
         logger.warning("playbook run %s resumed with no tenant; not recording it", run.run_id)
         return
-    _remember(tenant_id, run)
+    _remember(tenant_id, run, leg)
 
 
 # ---------------------------------------------------------------------------
@@ -324,8 +337,9 @@ def _execution_context(body_context: dict[str, Any], tenant_id: str) -> dict[str
 async def _execute(playbook: Playbook, context: dict[str, Any], dry_run: bool, run_holder: list, tenant_id: str) -> None:
     """Background task: run the playbook and store the result."""
     engine = PlaybookEngine()
+    leg = next(_legs)
     pr = await engine.run(playbook, context, dry_run=dry_run)
-    _remember(tenant_id, pr)
+    _remember(tenant_id, pr, leg)
     run_holder.append(pr.run_id)
 
 
@@ -351,9 +365,10 @@ async def run_playbook(
 
     placeholder = _PR(pb, context)
     placeholder.status = _RS.PENDING
-    _remember(tenant_id, placeholder)
+    leg = next(_legs)
+    _remember(tenant_id, placeholder, leg)
 
-    background_tasks.add_task(_execute_and_update, pb, context, body.dry_run, placeholder.run_id, tenant_id)
+    background_tasks.add_task(_execute_and_update, pb, context, body.dry_run, placeholder.run_id, tenant_id, leg)
 
     return {
         "run_id": placeholder.run_id,
@@ -369,11 +384,12 @@ async def _execute_and_update(
     dry_run: bool,
     run_id: str,
     tenant_id: str,
+    leg: int,
 ) -> None:
     """Background task: overwrite placeholder with real run."""
     engine = PlaybookEngine()
     pr = await engine.run(playbook, context, dry_run=dry_run, resume_run_id=run_id)
-    _remember(tenant_id, pr)
+    _remember(tenant_id, pr, leg)
 
 
 @router.post("/approvals/{approval_id}/resume", summary="Deliver a recorded approval decision", status_code=202)
@@ -390,22 +406,30 @@ async def resume_approval(approval_id: UUID, background_tasks: BackgroundTasks, 
 
 
 async def _resume_approval_in_background(approval_id: str, tenant_id: str, decision: dict[str, Any]) -> None:
-    approved = decision["status"] == "approved"
-    run = await engine_module.resume_after_approval(
-        approval_id=approval_id,
-        tenant_id=tenant_id,
-        approved=approved,
-        decided_by=str(decision["decided_by_id"] or ""),
-        comment=decision["decision_comment"] or "",
-    )
-    if run is not None:
-        _remember(tenant_id, run)
+    leg = next(_legs)
+    decided_by = str(decision["decided_by_id"] or "")
+    comment = decision["decision_comment"] or ""
+    if decision["status"] == "approved":
+        run = await engine_module.resume_after_approval(
+            approval_id=approval_id, tenant_id=tenant_id, decided_by=decided_by, comment=comment
+        )
+        if run is not None:
+            _remember(tenant_id, run, leg)
+        return
+    # Two decides that both read the row pending can leave it denied after its
+    # pause resumed; only a denial that stopped the pause may cancel the run.
+    if not await engine_module.deny_approval(approval_id=approval_id, tenant_id=tenant_id, decided_by=decided_by, comment=comment):
         return
     owned = _runs.get(str(decision["run_id"] or ""))
-    if not approved and owned is not None and owned.tenant_id == tenant_id and owned.run.status == RunStatus.PAUSED:
-        owned.run.status = RunStatus.CANCELLED
-        owned.run.error = "approval denied"
-        owned.run.finished_at = datetime.now(UTC).isoformat()
+    if owned is not None and owned.tenant_id == tenant_id:
+        # The stored record can be an earlier leg's in any status (a verification
+        # answered after its prompt failed to send leaves it failed), or a later
+        # leg's that _remember must keep, so cancel a copy.
+        cancelled = copy.copy(owned.run)
+        cancelled.status = RunStatus.CANCELLED
+        cancelled.error = "approval denied"
+        cancelled.finished_at = datetime.now(UTC).isoformat()
+        _remember(tenant_id, cancelled, leg)
 
 
 # ---------------------------------------------------------------------------
@@ -442,13 +466,14 @@ async def resume_wait(resume_token: str, background_tasks: BackgroundTasks) -> d
 
 
 async def _resume_wait_in_background(resume_token: str) -> None:
+    leg = next(_legs)
     run = await engine_module.resume_wait(resume_token=resume_token)
     if run is None:
         # Not an error: another delivery of the same callback, or the
         # sweeper's timer, got there first.
         logger.info("playbook wait callback matched no waiting run (already resumed)")
         return
-    _remember_resumed(run)
+    _remember_resumed(run, leg)
 
 
 # ---------------------------------------------------------------------------
@@ -482,11 +507,12 @@ async def answer_verification(resume_token: str, answer: str, sig: str = Query("
     if answer not in verification.ANSWERS:
         return HTMLResponse(_verification_html(_VERIFY_REFUSED_TITLE, _VERIFY_REFUSED_BODY, ok=False), status_code=400)
 
+    leg = next(_legs)
     run = await engine_module.resume_verification(resume_token=resume_token, answer=answer, signature=sig)
     if run is None:
         return HTMLResponse(_verification_html(_VERIFY_REFUSED_TITLE, _VERIFY_REFUSED_BODY, ok=False), status_code=400)
 
-    _remember_resumed(run)
+    _remember_resumed(run, leg)
     return HTMLResponse(
         _verification_html(
             "Thanks — that's recorded",
