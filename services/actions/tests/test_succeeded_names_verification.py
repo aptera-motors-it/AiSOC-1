@@ -1,17 +1,9 @@
-"""A succeeded dispatch says whether the effect was verified.
-
-The case timeline renders ``summary``, and the HTTP body is what a caller
-reads. A probe that cannot tell still leaves ``status=succeeded``; that
-response has to carry ``verification=unverified`` rather than reading as a
-confirmed effect. The status stays ``succeeded`` — changing it is a separate
-decision.
-"""
-
 from __future__ import annotations
 
 import uuid
 
 from app.core.config import get_settings
+from app.live_actions.executor import LiveActionExecutor
 from app.live_actions.models import LiveActionRequest, LiveActionResult, LiveActionStatus
 from app.live_actions.registry import register_executor, reset_for_tests
 from app.main import app
@@ -23,9 +15,7 @@ from fastapi.testclient import TestClient
 _TOKEN = "test-actions-service-token"
 
 
-class _VendorAccepted:
-    """Reports that the vendor accepted the call. The read-back is separate."""
-
+class _VendorAccepted(LiveActionExecutor):
     vendor_id = "aws"
     capability = "block_address"
     _legacy_action_type = ActionType.BLOCK_IP

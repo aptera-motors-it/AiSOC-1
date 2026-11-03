@@ -399,23 +399,16 @@ def _override_decision(
 
 def _surface_verification(
     result: LiveActionResult,
-    outcome: str,
+    outcome: VerificationOutcome,
     reason: str,
     **updates: Any,
 ) -> LiveActionResult:
-    """Put the read-back on the result a caller actually reads.
-
-    ``details`` already held the outcome. The case timeline renders
-    ``summary``, and the response body is what a client deserialises, so a
-    ``succeeded`` result has to name the outcome in both. Status is left
-    alone unless the caller passes one.
-    """
     details = dict(result.details)
-    details["verification"] = outcome
+    details["verification"] = outcome.value
     details["verification_reason"] = reason
     summary = updates.pop("summary", None)
     if summary is None:
-        marker = f"verification={outcome}"
+        marker = f"verification={outcome.value}"
         summary = result.summary if marker in result.summary else f"{result.summary} ({marker})"
     return result.model_copy(
         update={
@@ -454,7 +447,7 @@ async def _verify_effect(
         outcome = await verifier.verify(action_type, request.target or "", dict(request.params))
     except Exception as exc:  # noqa: BLE001 — verification must not mask a completed action
         log.warning("live_action.verification_crashed", error=str(exc))
-        return _surface_verification(result, "unverified", f"verifier raised {type(exc).__name__}")
+        return _surface_verification(result, VerificationOutcome.UNVERIFIED, f"verifier raised {type(exc).__name__}")
 
     log.info(
         "live_action.verified",
@@ -468,14 +461,14 @@ async def _verify_effect(
         # when it is not.
         return _surface_verification(
             result,
-            outcome.outcome.value,
+            outcome.outcome,
             outcome.reason,
             status=LiveActionStatus.FAILED,
             error=result.error or f"action reported success but verification failed: {outcome.reason}",
             summary=f"{result.summary} — VERIFICATION FAILED: {outcome.reason}",
         )
 
-    return _surface_verification(result, outcome.outcome.value, outcome.reason)
+    return _surface_verification(result, outcome.outcome, outcome.reason)
 
 
 def _stopped_by_kill_switch(request: LiveActionRequest, state: KillSwitchState) -> LiveActionResult:
@@ -843,7 +836,7 @@ async def dispatch(request: LiveActionRequest) -> LiveActionResult:
             # nothing checked.
             result = _surface_verification(
                 result,
-                "unverified",
+                VerificationOutcome.UNVERIFIED,
                 f"no probe is registered for '{request.capability}'; it has no ActionType to key one on",
             )
 
