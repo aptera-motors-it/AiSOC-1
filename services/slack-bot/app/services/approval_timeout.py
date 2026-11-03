@@ -199,14 +199,17 @@ class ApprovalTimeoutScheduler:
         return True
 
     def suspend(self, action_id: str) -> TimerRecord | None:
-        """Stop the timer and return its record so a failed click can resume it.
+        """Stop the in-memory sleep and return its record.
 
-        Returns ``None`` when nothing is still waiting, including when the
-        fallback has already started.
+        The store row stays. ``cancel`` is what drops it, and that waits
+        until the decision has replaced the card.
         """
         record = self._records.get(action_id)
-        if record is None or not self.cancel(action_id):
+        task = self._timers.get(action_id)
+        if record is None or task is None or task.done():
             return None
+        self._timers.pop(action_id, None)
+        task.cancel()
         return record
 
     def resume(self, record: TimerRecord) -> asyncio.Task[None]:

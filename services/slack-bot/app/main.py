@@ -252,8 +252,11 @@ async def _route_action_decision(
             "response_type": "ephemeral",
             "text": f"⚠️ Internal error: {exc}",
         }
-    if suspended is not None and timeout_scheduler is not None and not payload.get("replace_original"):
-        timeout_scheduler.resume(suspended)
+    if suspended is not None and timeout_scheduler is not None:
+        if payload.get("replace_original"):
+            timeout_scheduler.cancel(suspended.action_id)
+        else:
+            timeout_scheduler.resume(suspended)
     await respond(payload)
 
 
