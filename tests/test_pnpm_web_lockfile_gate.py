@@ -96,7 +96,6 @@ def test_gate_cli_on_this_repository() -> None:
 
 def test_base_upstream_lockfile_fails_minimatch() -> None:
     base_lock = (REPO_ROOT / "pnpm-lock.yaml").read_text(encoding="utf-8")
-    # Simulate pre-fix tree: minimatch 3.x/5.x still present, deepmerge already 4.3.1.
     unfixed = base_lock
     if "/minimatch@3.1.5:" not in unfixed:
         unfixed = unfixed.replace(
