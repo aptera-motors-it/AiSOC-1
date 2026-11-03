@@ -123,6 +123,28 @@ jobs:
           ISOLATION_PLAYBOOK_DSN: ${{ env.PLAYBOOK_DSN }}
         run: python -m pytest ../../tests/isolation/test_playbook_pause_live.py -v --tb=short
 
+      - name: Start Redpanda (Kafka API)
+        run: |
+          set -euo pipefail
+          docker run -d --name pb-redpanda -p 9092:9092 \
+            redpandadata/redpanda:v24.2.7 \
+            redpanda start --mode dev-container --smp 1 \
+            --kafka-addr PLAINTEXT://0.0.0.0:9092 \
+            --advertise-kafka-addr PLAINTEXT://127.0.0.1:9092
+          for i in $(seq 1 45); do
+            docker exec pb-redpanda rpk cluster health 2>/dev/null | grep -q "Healthy:.*true" && { echo "redpanda ready (${i}s)"; exit 0; }
+            sleep 1
+          done
+          docker logs --tail=40 pb-redpanda
+          exit 1
+
+      - name: A redelivered alert continues its playbook run
+        working-directory: services/agents
+        env:
+          ISOLATION_PLAYBOOK_DSN: ${{ env.PLAYBOOK_DSN }}
+          ISOLATION_KAFKA_BROKERS: 127.0.0.1:9092
+        run: python -m pytest ../../tests/isolation/test_alert_playbook_redelivery_live.py -v --tb=short
+
       # The Investigation Ledger, the surface an auditor reads. Its
       # offline test drives a `_FakeConn` and opens no connection, so it
       # cannot prove the rows exist, that RLS applies, or that the
