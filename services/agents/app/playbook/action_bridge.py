@@ -49,8 +49,11 @@ _RETRYABLE_CLIENT_STATUSES = frozenset({408, 425, 429})
 #: rather than the module that added it.
 logger = logging.getLogger("aisoc.playbook.action_bridge")
 
-_API_URL = os.getenv("CORE_API_URL") or os.getenv(
-    "API_SERVICE_URL", os.getenv("API_URL", "http://api:8000")
+_API_URL: str = (
+    os.getenv("CORE_API_URL")
+    or os.getenv("API_SERVICE_URL")
+    or os.getenv("API_URL")
+    or "http://api:8000"
 )
 _TIMEOUT_S = float(os.getenv("AISOC_PLAYBOOK_ACTION_TIMEOUT_S", "45"))
 
