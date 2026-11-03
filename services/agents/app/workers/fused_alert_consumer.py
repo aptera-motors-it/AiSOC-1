@@ -378,7 +378,7 @@ def _is_terminal_request_error(exc: BaseException) -> bool:
 
 
 class _DlqUnavailable(Exception):
-    """The poison alert was not published, so its offset must not commit."""
+    pass
 
 
 class FusedAlertTriageWorker:
@@ -475,10 +475,6 @@ class FusedAlertTriageWorker:
                 # inference and persistence replays the alert instead of losing
                 # it, and offsets advance only on durable completion (issue #571).
                 #
-                # A poison alert is dead-lettered rather than raised, so one
-                # bad alert does not end the subscription. A DLQ publish that
-                # does not land raises ``_DlqUnavailable`` instead: committing
-                # after that drops the alert, and the next poll never sees it.
                 # Parity 6.9. Triage is an LLM call, so this stage spends
                 # almost all of its time waiting; it used to wait one alert
                 # at a time. Alerts about *different* entities now run
@@ -600,7 +596,7 @@ class FusedAlertTriageWorker:
             )
             await self._producer.start()
             return self._producer
-        except Exception as exc:  # noqa: BLE001 — caller holds the offset when this fails
+        except Exception as exc:  # noqa: BLE001
             logger.error("auto_triage_worker.dlq_producer_failed", error=str(exc))
             self._producer = None
             return None
@@ -625,13 +621,12 @@ class FusedAlertTriageWorker:
             raise _DlqUnavailable(alert_id)
         try:
             pending = await producer.send(self._dlq_topic, value=record)
-            # aiokafka schedules the produce and hands back a future. The
-            # record is not published until that future finishes.
+            # aiokafka's send returns a future that finishes when the record is published.
             if asyncio.isfuture(pending):
                 await pending
             _METRICS["dead_lettered"] += 1
             logger.error("auto_triage_worker.dead_lettered", alert_id=alert_id, stage=stage, attempts=attempts)
-        except Exception as exc:  # noqa: BLE001 — a failed publish is not a capture
+        except Exception as exc:  # noqa: BLE001
             logger.error("auto_triage_worker.dlq_send_failed", alert_id=alert_id, error=str(exc))
             raise _DlqUnavailable(alert_id) from exc
 

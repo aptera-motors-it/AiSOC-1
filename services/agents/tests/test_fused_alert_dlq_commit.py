@@ -1,12 +1,3 @@
-"""A committed fused alert was triaged, or the DLQ accepted it.
-
-The consume loop commits after ``_process_with_retry`` returns. That return
-value is False both when the DLQ accepted the poison alert and when the
-publish never happened. A broker that accepts the commit and refuses the
-DLQ then drops the alert: the offset moves, and the next poll does not
-see it again.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -59,12 +50,6 @@ async def _wait_until(predicate, timeout: float, detail: str) -> None:
 
 
 async def _release(worker: FusedAlertTriageWorker, task: asyncio.Task) -> None:
-    """Unblock ``start`` without letting ``stop`` clear the consumer first.
-
-    ``start`` stops the consumer in ``finally``. Clearing the attribute
-    from ``FusedAlertTriageWorker.stop`` before that runs makes the
-    finalizer call ``None.stop``.
-    """
     if task.done():
         task.exception()
         return
@@ -79,13 +64,6 @@ async def _release(worker: FusedAlertTriageWorker, task: asyncio.Task) -> None:
 
 
 async def test_dead_dlq_broker_does_not_commit_the_offset(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Poison alert, live source broker, dead DLQ broker: offset stays put.
-
-    The first alert is triaged and committed, so the group has a real
-    checkpoint. The second alert cannot be published to the DLQ. The
-    checkpoint must remain on that second alert, and the next poll of the
-    same group must read it again.
-    """
     if not _broker_up(_LIVE_BROKER):
         pytest.skip(f"no Kafka broker at {_LIVE_BROKER}")
 
@@ -114,17 +92,17 @@ async def test_dead_dlq_broker_does_not_commit_the_offset(monkeypatch: pytest.Mo
         max_attempts=1,
         entity_concurrency=1,
     )
-    worker.triage = triage
+    worker.triage = triage  # type: ignore[method-assign]
 
     original_start = AIOKafkaConsumer.start
 
-    async def start_and_isolate_dlq(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+    async def start_and_isolate_dlq(self, *args, **kwargs):
         await original_start(self, *args, **kwargs)
         if not isolate["on"]:
             return
         real_commit = self.commit
 
-        async def commit(offsets=None):  # noqa: ANN001
+        async def commit(offsets=None):
             commits.append(offsets)
             return await real_commit(offsets)
 
