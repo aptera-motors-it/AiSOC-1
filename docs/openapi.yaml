@@ -24924,6 +24924,15 @@ components:
         status:
           anyOf:
           - type: string
+            enum:
+            - new
+            - triaging
+            - triaged
+            - in_progress
+            - investigating
+            - resolved
+            - false_positive
+            - closed
           - type: 'null'
           title: Status
         priority:
