@@ -45,6 +45,12 @@ type partialPublishError interface {
 	AcceptedEvents() []*normalizer.NormalizedEvent
 }
 
+const graphProjectionTimeout = 30 * time.Second
+
+func graphProjectionContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), graphProjectionTimeout)
+}
+
 // SnapshotApplier mirrors *config_snapshot.Snapshotter.Apply. Defined as
 // an interface so the handler can be unit-tested without standing up a
 // real provider/cache pair, and so a nil applier is a clean "T1.2
@@ -239,6 +245,8 @@ func (h *Handler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if h.graph != nil {
+			projectionCtx, cancel := graphProjectionContext(r.Context())
+			defer cancel()
 			for _, ev := range published {
 				gev := graph.ExtractFromOCSF(ev.ID, ev.TenantID, req.ConnectorType, ev.OcsfEvent)
 				if gev == nil {
@@ -249,11 +257,11 @@ func (h *Handler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 				// logged + skipped; the rest of the projection still
 				// flushes through WriteEvent below.
 				if h.snapshot != nil {
-					h.snapshot.Apply(r.Context(), gev)
+					h.snapshot.Apply(projectionCtx, gev)
 				}
 				// WriteEvent is non-blocking; ctx is only used to honor
 				// shutdown. We deliberately don't wait on it.
-				_ = h.graph.WriteEvent(r.Context(), gev)
+				_ = h.graph.WriteEvent(projectionCtx, gev)
 			}
 		}
 		if publishErr != nil {
