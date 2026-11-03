@@ -640,9 +640,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     else:
         logger.info("report_scheduler disabled; a tenant's stored cron_schedule will not produce a report")
 
-    # Depth 5.2. Drains the outbound-webhook retry queue. Deliberately not
-    # under the scheduler lock: each attempt claims one row and commits it,
-    # so a second replica skips a row the first already holds.
     outbound_webhook_task: asyncio.Task | None = None
     if settings.OUTBOUND_WEBHOOK_WORKER_ENABLED:
         try:

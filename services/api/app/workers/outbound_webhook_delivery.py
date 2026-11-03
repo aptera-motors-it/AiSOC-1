@@ -5,19 +5,17 @@ pending row and nothing ever attempts it, which is the "mechanism exists,
 nothing calls it" shape that this plan keeps finding. The dead-letter view
 would read empty forever, which is the most reassuring possible way to be
 wrong about whether a tenant's SIEM has their alerts.
-
-Each pass claims one due row (``FOR UPDATE SKIP LOCKED``) and commits that
-attempt before taking the next, so a second replica skips a row this one
-already holds.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import uuid
 
 import structlog
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import AsyncSessionLocal
 from app.services.outbound_webhooks import attempt_delivery, due_deliveries
@@ -34,6 +32,13 @@ POLL_INTERVAL_SECONDS = float(os.getenv("OUTBOUND_WEBHOOK_POLL_INTERVAL_SECONDS"
 BATCH_SIZE = int(os.getenv("OUTBOUND_WEBHOOK_BATCH_SIZE", "25"))
 
 
+async def _bind_tenant(db: AsyncSession, tenant_id: uuid.UUID) -> None:
+    await db.execute(
+        text("SELECT set_config('app.current_tenant_id', :tenant_id, true)"),
+        {"tenant_id": str(tenant_id)},
+    )
+
+
 async def run_once() -> dict[str, int]:
     """Attempt every delivery that has come due. Returns a small tally."""
     attempted = delivered = dead = 0
@@ -43,13 +48,7 @@ async def run_once() -> dict[str, int]:
             if not claimed:
                 break
             delivery, webhook = claimed[0]
-            # The claim is unbound, so every tenant is visible. The write has
-            # to name the row's tenant: the runtime role's WITH CHECK rejects
-            # an unbound update, and the attempt would be sent and then lost.
-            await db.execute(
-                text("SELECT set_config('app.current_tenant_id', :tenant_id, true)"),
-                {"tenant_id": str(delivery.tenant_id)},
-            )
+            await _bind_tenant(db, delivery.tenant_id)
             await attempt_delivery(delivery, webhook)
             attempted += 1
             delivered += delivery.status == "delivered"

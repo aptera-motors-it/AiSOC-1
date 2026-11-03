@@ -1,13 +1,4 @@
-"""Two delivery workers attempt one due row once.
-
-The sweeper reads due rows and commits after the batch. Two replicas both
-see attempts = N, both POST, and both write attempts = N + 1. The column
-cannot tell those two writes apart, so the receiver's request count is the
-observation: one delivery, one request, attempts left at N + 1.
-
-Live because SKIP LOCKED and the runtime role's row security are properties
-of Postgres. Skips without a database rather than passing without one.
-"""
+"""Two delivery workers attempt one due row once."""
 
 from __future__ import annotations
 
@@ -18,9 +9,11 @@ import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import cast
 
 import pytest
 import pytest_asyncio
+from app.db.database import engine as app_engine
 from app.models.outbound_webhook import OutboundDelivery, OutboundWebhook
 from app.workers.outbound_webhook_delivery import run_once
 from sqlalchemy import text
@@ -30,8 +23,7 @@ DSN = os.environ.get("DATABASE_URL", "")
 OWNER_DSN = os.environ.get("DATABASE_MIGRATION_URL", "") or DSN
 REQUIRED = os.environ.get("MSSP_ISOLATION_REQUIRED", "").strip() not in ("", "0", "false")
 
-# A prior attempt count. Two overlapping workers must leave this at N + 1.
-N = 2
+PRIOR_ATTEMPTS = 2
 
 _PROXY_VARS = (
     "HTTP_PROXY",
@@ -55,7 +47,7 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)
-        server: _HoldingServer = self.server  # type: ignore[assignment]
+        server = cast(_HoldingServer, self.server)
         with server.lock:
             server.bodies.append(body)
         server.release.wait(timeout=15)
@@ -103,18 +95,17 @@ def _start_server() -> tuple[_HoldingServer, threading.Thread]:
     return server, thread
 
 
-async def _wait_for_race(server: _HoldingServer, tasks: list[asyncio.Task[dict[str, int]]]) -> int:
-    """Return how many POSTs arrived once the overlap is visible.
+def _overlap_observed(posts: int, finished: int) -> bool:
+    return posts >= 2 or (finished > 0 and posts >= 1)
 
-    Two claimants both block inside the receiver. One claimant returns
-    while the other is still inside it.
-    """
+
+async def _wait_for_race(server: _HoldingServer, tasks: list[asyncio.Task[dict[str, int]]]) -> int:
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         with server.lock:
             posts = len(server.bodies)
-        finished = [task for task in tasks if task.done()]
-        if posts >= 2 or (finished and posts >= 1):
+        finished = len([task for task in tasks if task.done()])
+        if _overlap_observed(posts, finished):
             return posts
         await asyncio.sleep(0.01)
     with server.lock:
@@ -122,7 +113,7 @@ async def _wait_for_race(server: _HoldingServer, tasks: list[asyncio.Task[dict[s
 
 
 @pytest.mark.asyncio
-async def test_two_workers_leave_attempts_at_n_plus_one(owner, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_two_workers_attempt_a_due_row_once(owner, monkeypatch: pytest.MonkeyPatch) -> None:
     tenant_id = uuid.uuid4()
     webhook_id = uuid.uuid4()
     delivery_id = uuid.uuid4()
@@ -155,9 +146,9 @@ async def test_two_workers_leave_attempts_at_n_plus_one(owner, monkeypatch: pyte
             tenant_id=tenant_id,
             webhook_id=webhook_id,
             event_type="alert.updated",
-            payload={"n": N},
+            payload={"n": PRIOR_ATTEMPTS},
             status="pending",
-            attempts=N,
+            attempts=PRIOR_ATTEMPTS,
             next_attempt_at=datetime.now(UTC) - timedelta(seconds=1),
         )
     )
@@ -179,7 +170,7 @@ async def test_two_workers_leave_attempts_at_n_plus_one(owner, monkeypatch: pyte
         tallies = [result for result in finished if isinstance(result, dict)]
         assert not errors, errors
         assert sum(result["attempted"] for result in tallies) == 1
-        assert row.attempts == N + 1
+        assert row.attempts == PRIOR_ATTEMPTS + 1
         assert row.status == "delivered"
         with server.lock:
             assert len(server.bodies) == 1
@@ -194,3 +185,126 @@ async def test_two_workers_leave_attempts_at_n_plus_one(owner, monkeypatch: pyte
         await owner.execute(text("DELETE FROM aisoc_outbound_webhooks WHERE tenant_id = :id"), {"id": tenant_id})
         await owner.execute(text("DELETE FROM tenants WHERE id = :id"), {"id": tenant_id})
         await owner.commit()
+        await app_engine.dispose()
+
+
+class _ReplyServer(ThreadingHTTPServer):
+    def __init__(self, status_code: int, body: bytes) -> None:
+        super().__init__(("127.0.0.1", 0), _Reply)
+        self.status_code = status_code
+        self.body = body
+        self.count = 0
+        self.lock = threading.Lock()
+
+
+class _Reply(BaseHTTPRequestHandler):
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(length)
+        server = cast(_ReplyServer, self.server)
+        with server.lock:
+            server.count += 1
+        payload = server.body
+        self.send_response(server.status_code)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, fmt: str, *args: object) -> None:
+        return
+
+
+def _serve(status_code: int, body: bytes) -> tuple[_ReplyServer, threading.Thread]:
+    server = _ReplyServer(status_code, body)
+    thread = threading.Thread(target=server.serve_forever, name="webhook-reply", daemon=True)
+    thread.start()
+    return server, thread
+
+
+async def _seed_due(owner, *, url: str, attempts: int, age_s: int) -> tuple[uuid.UUID, uuid.UUID]:
+    tenant_id = uuid.uuid4()
+    webhook_id = uuid.uuid4()
+    delivery_id = uuid.uuid4()
+    await owner.execute(
+        text("INSERT INTO tenants (id, name, slug) VALUES (:id, :name, :slug)"),
+        {"id": tenant_id, "name": "Webhook claim", "slug": f"wh-{tenant_id.hex[:12]}"},
+    )
+    owner.add(
+        OutboundWebhook(
+            id=webhook_id,
+            tenant_id=tenant_id,
+            name="siem",
+            url=url,
+            secret="",
+            enabled=True,
+        )
+    )
+    await owner.flush()
+    owner.add(
+        OutboundDelivery(
+            id=delivery_id,
+            tenant_id=tenant_id,
+            webhook_id=webhook_id,
+            event_type="alert.updated",
+            payload={},
+            status="pending",
+            attempts=attempts,
+            next_attempt_at=datetime.now(UTC) - timedelta(seconds=age_s),
+        )
+    )
+    await owner.commit()
+    return tenant_id, delivery_id
+
+
+async def _delete_tenant(owner, tenant_id: uuid.UUID) -> None:
+    await owner.rollback()
+    await owner.execute(text("DELETE FROM aisoc_outbound_deliveries WHERE tenant_id = :id"), {"id": tenant_id})
+    await owner.execute(text("DELETE FROM aisoc_outbound_webhooks WHERE tenant_id = :id"), {"id": tenant_id})
+    await owner.execute(text("DELETE FROM tenants WHERE id = :id"), {"id": tenant_id})
+    await owner.commit()
+
+
+@pytest.mark.asyncio
+async def test_a_nul_error_body_is_recorded_and_the_next_row_is_sent(owner, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AISOC_SSRF_ALLOW_HOSTS", "127.0.0.1")
+    for name in _PROXY_VARS:
+        monkeypatch.delenv(name, raising=False)
+    bad, bad_thread = _serve(500, b"upstream\x00error")
+    good, good_thread = _serve(200, b"ok")
+    bad_host, bad_port = bad.server_address[0], bad.server_address[1]
+    good_host, good_port = good.server_address[0], good.server_address[1]
+    bad_url_host = bad_host.decode() if isinstance(bad_host, bytes) else bad_host
+    good_url_host = good_host.decode() if isinstance(good_host, bytes) else good_host
+    poisoned_tenant, poisoned_id = await _seed_due(owner, url=f"http://{bad_url_host}:{bad_port}/bad", attempts=PRIOR_ATTEMPTS, age_s=10)
+    healthy_tenant, healthy_id = await _seed_due(owner, url=f"http://{good_url_host}:{good_port}/good", attempts=PRIOR_ATTEMPTS, age_s=5)
+    try:
+        tally = await run_once()
+        poisoned = (
+            await owner.execute(
+                text("SELECT attempts, status, last_error FROM aisoc_outbound_deliveries WHERE id = :id"),
+                {"id": poisoned_id},
+            )
+        ).one()
+        healthy = (
+            await owner.execute(
+                text("SELECT attempts, status FROM aisoc_outbound_deliveries WHERE id = :id"),
+                {"id": healthy_id},
+            )
+        ).one()
+        assert tally["attempted"] == 2
+        assert poisoned.attempts == PRIOR_ATTEMPTS + 1
+        assert poisoned.status == "pending"
+        assert "\x00" not in poisoned.last_error
+        assert healthy.attempts == PRIOR_ATTEMPTS + 1
+        assert healthy.status == "delivered"
+        assert bad.count == 1
+        assert good.count == 1
+    finally:
+        bad.shutdown()
+        good.shutdown()
+        bad_thread.join(timeout=2)
+        good_thread.join(timeout=2)
+        await _delete_tenant(owner, poisoned_tenant)
+        await _delete_tenant(owner, healthy_tenant)
+        await app_engine.dispose()

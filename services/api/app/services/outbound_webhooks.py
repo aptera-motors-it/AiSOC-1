@@ -252,7 +252,7 @@ async def attempt_delivery(
         delivery.last_error = ""
         return delivery
 
-    delivery.last_error = f"HTTP {response.status_code}: {response.text[:200]}"
+    delivery.last_error = f"HTTP {response.status_code}: {response.text[:200]}".replace("\x00", "")
     retryable = response.status_code >= 500 or response.status_code in _RETRYABLE_CLIENT_STATUSES
     if not retryable:
         # Understood and refused. Six identical refusals would be six
