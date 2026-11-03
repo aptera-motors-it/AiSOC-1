@@ -86,6 +86,24 @@ def test_checkov_iac_workflow_passes_eks_public_endpoint_cidr_check():
     assert "Failed checks: 0" in completed.stdout
 
 
+def _variable_declares_default_empty_list(variables_tf: str, name: str) -> bool:
+    needle = f'variable "{name}"'
+    start = variables_tf.find(needle)
+    assert start != -1, f"missing variable {name}"
+    block = variables_tf[start : variables_tf.find("\nvariable ", start + 1)]
+    if block.find("\nvariable ", start + 1) == -1:
+        block = variables_tf[start:]
+    return "default     = []" in block or "default = []" in block
+
+
+def test_public_access_cidr_variables_default_to_empty_list():
+    """Private-only deploys must not require a dummy CIDR list at plan time."""
+    root_vars = (TERRAFORM_ROOT / "variables.tf").read_text()
+    module_vars = (EKS_MODULE / "variables.tf").read_text()
+    assert _variable_declares_default_empty_list(root_vars, "eks_public_access_cidrs")
+    assert _variable_declares_default_empty_list(module_vars, "public_access_cidrs")
+
+
 def test_eks_module_wires_public_access_cidrs_and_rejects_open_internet():
     main_tf = (EKS_MODULE / "main.tf").read_text()
     variables_tf = (EKS_MODULE / "variables.tf").read_text()
