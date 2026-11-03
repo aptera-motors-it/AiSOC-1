@@ -1,5 +1,3 @@
-"""`make demo` runs `python -m app.scripts.seed_demo` and that command must commit rows."""
-
 from __future__ import annotations
 
 import asyncio
