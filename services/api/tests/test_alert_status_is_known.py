@@ -1,15 +1,3 @@
-"""An alert status is a known value, and ``resolved_at`` follows it.
-
-``PATCH /api/v1/alerts/{id}`` accepts any string as ``status``. A value no
-reader knows is stored. ``false_positive`` stamps ``resolved_at`` but is not
-one of ``RESOLVED_STATUSES``, so the list facet ``unresolved`` still counts
-the alert. A later patch back to an open status leaves ``resolved_at`` set.
-
-These drive the shipped ASGI app and a real PostgreSQL row. A validator
-called on its own would not show the facet, which is computed by the list
-route from the row the patch wrote.
-"""
-
 from __future__ import annotations
 
 import os
@@ -43,7 +31,7 @@ pytestmark = pytest.mark.skipif(
     reason="needs a live PostgreSQL with the migration chain applied",
 )
 
-_UNUSABLE_PASSWORD_HASH = "x"  # noqa: S105 - not a credential; no plaintext maps to it
+_UNUSABLE_PASSWORD_HASH = "x"  # noqa: S105
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -56,7 +44,6 @@ async def _release_the_app_pool():
 
 @pytest_asyncio.fixture
 async def world():
-    """One tenant, one analyst, one open alert. Yields maker, alert id, token."""
     from app.core.security import create_access_token
 
     engine = create_async_engine(_DSN)
