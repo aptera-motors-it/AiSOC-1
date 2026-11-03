@@ -112,4 +112,6 @@ EXPOSE 8084
 # Dual-stack entrypoint — see app/scripts/serve.py and the matching CMD in
 # services/api/Dockerfile for the full rationale (Python's asyncio forces
 # IPV6_V6ONLY=1 on `::` binds, which breaks Fly's IPv4 health checks).
+USER nobody
+
 CMD ["python", "-m", "app.scripts.serve"]
