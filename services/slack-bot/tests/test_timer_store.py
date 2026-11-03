@@ -88,6 +88,40 @@ async def test_recover_fires_overdue_timer_promptly():
     assert fired == ["act-5"]
 
 
+class _DeleteWaits(InMemoryTimerStore):
+    """A delete that pauses, the way a Postgres delete waits on the pool."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def delete(self, action_id: str) -> None:
+        self.started.set()
+        await self.release.wait()
+        await super().delete(action_id)
+
+
+async def test_a_delete_started_by_suspend_does_not_drop_the_resumed_row():
+    store = _DeleteWaits()
+    sched = _scheduler(store)
+    sched.schedule("act-9", timeout_seconds=60, safe_default="rejected", case_id="c9")
+    await asyncio.sleep(0)
+    try:
+        record = sched.suspend("act-9")
+        assert record is not None
+        await asyncio.sleep(0)
+        sched.resume(record)
+        await asyncio.sleep(0)
+        if store.started.is_set():
+            store.release.set()
+            await asyncio.sleep(0)
+        assert [row.action_id for row in await store.list_pending()] == ["act-9"]
+    finally:
+        store.release.set()
+        await sched.aclose()
+
+
 async def test_default_store_is_in_memory_non_durable():
     sched = ApprovalTimeoutScheduler(approve_fn=_noop, reject_fn=_noop)
     sched.schedule("act-6", timeout_seconds=60)

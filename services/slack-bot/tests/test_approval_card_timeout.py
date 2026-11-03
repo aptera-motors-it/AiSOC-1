@@ -38,13 +38,22 @@ class _Actions(BaseHTTPRequestHandler):
     received: list[tuple[str, bytes]] = []
     hold_approve_seconds: float = 0
     approve_status: int = 200
+    approve_entered: threading.Event | None = None
+    release_approve: threading.Event | None = None
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler method name
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else b""
         type(self).received.append((self.path, body))
-        if self.path.endswith("/approve") and type(self).hold_approve_seconds > 0:
-            time.sleep(type(self).hold_approve_seconds)
+        if self.path.endswith("/approve"):
+            entered = type(self).approve_entered
+            if entered is not None:
+                entered.set()
+            release = type(self).release_approve
+            if release is not None:
+                release.wait(5)
+            elif type(self).hold_approve_seconds > 0:
+                time.sleep(type(self).hold_approve_seconds)
         status_code = type(self).approve_status if self.path.endswith("/approve") else 200
         payload = json.dumps({"id": ACTION_ID, "status": "ok"}).encode()
         self.send_response(status_code)
@@ -62,6 +71,8 @@ def actions_url(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     _Actions.received = []
     _Actions.hold_approve_seconds = 0
     _Actions.approve_status = 200
+    _Actions.approve_entered = None
+    _Actions.release_approve = None
     _slack_posts.clear()
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Actions)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -231,6 +242,45 @@ async def test_need_info_leaves_the_deadline_armed() -> None:
 
     assert _paths() == [f"/api/v1/actions/{ACTION_ID}/reject"]
     assert _reject_bodies() == [b""]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("actions_url")
+async def test_the_timer_row_stays_until_the_approve_replaces_the_card() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    _Actions.approve_entered = entered
+    _Actions.release_approve = release
+    card = {**CARD, "timeout_seconds": 60}
+    try:
+        async with app.router.lifespan_context(app):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://bot") as client:
+                posted = await client.post(
+                    "/internal/approval-card",
+                    json=card,
+                    headers={"X-AiSOC-Internal-Token": TOKEN},
+                )
+                assert posted.status_code == 202
+                await asyncio.sleep(0)
+                store = app.state.timeout_scheduler._store
+                assert [row.action_id for row in await store.list_pending()] == [ACTION_ID]
+                click_task = asyncio.create_task(
+                    client.post(
+                        "/slack/events",
+                        content=_click("aisoc_action_approve"),
+                        headers={"content-type": "application/x-www-form-urlencoded"},
+                    )
+                )
+                assert await asyncio.to_thread(entered.wait, 5)
+                await asyncio.sleep(0)
+                assert [row.action_id for row in await store.list_pending()] == [ACTION_ID]
+                release.set()
+                click = await click_task
+                assert click.status_code == 200
+                await asyncio.sleep(0)
+                assert await store.list_pending() == []
+    finally:
+        release.set()
 
 
 @pytest.mark.asyncio
