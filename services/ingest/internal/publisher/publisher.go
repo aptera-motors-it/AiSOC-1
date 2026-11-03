@@ -27,6 +27,12 @@ type Publisher struct {
 	cfg         *config.Config
 }
 
+const detachedPublishTimeout = 30 * time.Second
+
+func detachedPublishContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), detachedPublishTimeout)
+}
+
 type PartialPublishError struct {
 	err      error
 	accepted []*normalizer.NormalizedEvent
@@ -320,7 +326,9 @@ func (p *Publisher) PublishBatch(ctx context.Context, events []*normalizer.Norma
 		})
 	}
 
-	if err := p.writer.WriteMessages(context.WithoutCancel(ctx), msgs...); err != nil {
+	publishCtx, cancel := detachedPublishContext(ctx)
+	defer cancel()
+	if err := p.writer.WriteMessages(publishCtx, msgs...); err != nil {
 		wrapped := fmt.Errorf("kafka batch publish failed: %w", err)
 		writeErrors, ok := err.(kafka.WriteErrors)
 		if !ok {
