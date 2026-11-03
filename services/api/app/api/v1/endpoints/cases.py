@@ -168,7 +168,7 @@ def _status_transition_ok(current: str, target: str) -> bool:
     """Upstream's canonical gate: every move must be a declared edge in
     `case_status.TRANSITIONS`. Backwards moves and undeclared skips are
     rejected; reopening goes through the explicit reopen action."""
-    return target in _TRANSITIONS.get(current, set())
+    return case_status.status_transition_ok(current, target)
 
 
 #: The canonical ladder, in order, for the forward-walk used by the

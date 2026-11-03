@@ -46,6 +46,8 @@ import httpx
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services import case_status
+
 logger = logging.getLogger("aisoc.war_room")
 
 PROVIDERS: tuple[str, ...] = ("slack", "teams")
@@ -395,6 +397,14 @@ async def apply_channel_decision(
         # and reporting consequences and belongs on an authenticated console
         # session; a chat button moves the case to the state a human then
         # confirms.
+        current = (
+            await db.execute(
+                text("SELECT status FROM aisoc_cases WHERE id = :id AND tenant_id = :tenant_id").bindparams(id=case_id, tenant_id=tenant_id)
+            )
+        ).scalar_one_or_none()
+        if current is not None and not case_status.status_transition_ok(current, case_status.RESOLVED):
+            allowed = sorted(case_status.TRANSITIONS.get(current, ()))
+            raise WarRoomError(f"Invalid status transition: {current} → {case_status.RESOLVED}. Allowed: {allowed or 'none'}")
         await db.execute(
             text(
                 "UPDATE aisoc_cases SET status = 'resolved', resolved_at = COALESCE(resolved_at, :now), "
