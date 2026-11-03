@@ -377,3 +377,58 @@ def test_a_poll_blocked_before_the_claim_does_not_fetch_after_stop() -> None:
     assert stopped_fetches == 0, stopped_fetches
     assert lease_live is False, lease_live
     assert survivor_fetches == 1, survivor_fetches
+
+
+async def _next_tick_while_the_holder_lease_is_live() -> tuple[int, int, int, int]:
+    from app.connectors import CONNECTOR_REGISTRY
+    from app.ingest_client import IngestClient
+    from app.scheduler import ConnectorScheduler
+    from app.security.credential_vault import get_vault
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    vendor = _stub_vendor()
+    vendor.fetches = []
+    CONNECTOR_REGISTRY["stub_vendor"] = vendor
+    os.environ["AISOC_SCHEDULER_LEADER_ELECTION"] = "false"
+
+    server, url = _ingest_url()
+    engine = create_async_engine(_dsn())
+    connector_id = _connector_id()
+    holder = ConnectorScheduler(engine=engine, ingest_client=IngestClient(url), vault=get_vault())
+    other = ConnectorScheduler(engine=engine, ingest_client=IngestClient(url), vault=get_vault())
+    try:
+        await _seed(engine, connector_id)
+        await holder.start()
+        await other.start()
+        await holder._poll_one(connector_id=connector_id)
+        first = len(vendor.fetches)
+        await other._poll_one(connector_id=connector_id)
+        during = len(vendor.fetches) - first
+        # The next interval tick claims before expires_at. The lease was
+        # stamped at the previous claim, one full interval later, and that
+        # claim itself was after the tick had started.
+        await holder._poll_one(connector_id=connector_id)
+        again = len(vendor.fetches) - first - during
+        await other._poll_one(connector_id=connector_id)
+        after = len(vendor.fetches) - first - during - again
+        return first, during, again, after
+    finally:
+        await holder.stop()
+        await other.stop()
+        await _drop(engine, connector_id)
+        await engine.dispose()
+        server.shutdown()
+        CONNECTOR_REGISTRY.pop("stub_vendor", None)
+
+
+def test_the_holder_polls_on_the_next_tick_while_its_lease_is_live() -> None:
+    """The replica that holds the row must fetch on its next tick.
+
+    Another replica must not. A lease that expired as soon as the poll
+    returned would let that other replica fetch in the gap.
+    """
+    first, during, again, after = asyncio.run(_next_tick_while_the_holder_lease_is_live())
+    assert first == 1, first
+    assert during == 0, during
+    assert again == 1, again
+    assert after == 0, after

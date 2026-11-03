@@ -319,6 +319,9 @@ class ConnectorScheduler:
         The lease is taken even when leader election is off. Election
         chooses who schedules; the lease chooses who fetches. A backfill
         from the replica that already holds the window may fetch again.
+        The row lasts one poll interval from the claim, which is after the
+        tick started, so the next tick is still inside it. The holder
+        renews that row. Another replica cannot.
         """
         if self._stopping:
             logger.info(
@@ -338,7 +341,7 @@ class ConnectorScheduler:
                 holder=self._holder,
                 lease=window_seconds,
             )
-            if not await lease.acquire():
+            if not await lease.acquire() and (key in self._fetches_in_flight or not await lease.renew()):
                 logger.info(
                     "connector.scheduler.poll_skipped id=%s reason=connector_lease_held",
                     connector_id,
