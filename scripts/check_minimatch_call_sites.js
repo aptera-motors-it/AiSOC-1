@@ -12,7 +12,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { PassThrough, Writable } = require('stream');
+const { Writable } = require('stream');
 
 const repoRoot = path.join(__dirname, '..');
 
@@ -29,6 +29,19 @@ const defaultModulePaths = {
       const name = readdirSync(base).find((entry) => entry.startsWith('eslint-plugin-react@'));
       if (!name) {
         throw new Error('eslint-plugin-react is not installed');
+      }
+      return [name, 'node_modules'];
+    })(),
+  ),
+  eslintImport: path.join(
+    repoRoot,
+    'node_modules/.pnpm',
+    ...(() => {
+      const base = path.join(repoRoot, 'node_modules/.pnpm');
+      const { readdirSync } = fs;
+      const name = readdirSync(base).find((entry) => entry.startsWith('eslint-plugin-import@'));
+      if (!name) {
+        throw new Error('eslint-plugin-import is not installed');
       }
       return [name, 'node_modules'];
     })(),
@@ -163,11 +176,23 @@ function checkEslintReactNoDangerRule() {
   });
 }
 
+function checkEslintImportNoInternalModulesMakeRe() {
+  const importPaths = [defaultModulePaths.eslintImport, defaultModulePaths.glob];
+  const minimatch = resolveFrom('minimatch', importPaths);
+  assert(typeof minimatch.makeRe === 'function', 'minimatch.makeRe must be a function');
+  const re = minimatch.makeRe('packages/**/internal/**');
+  assert(typeof re.test === 'function', 'makeRe result must provide test()');
+  assert(re.test('packages/foo/internal/bar'), 'makeRe pattern should match import paths');
+  const rule = resolveFrom('eslint-plugin-import/lib/rules/no-internal-modules', importPaths);
+  rule.create({ options: [{ allow: ['packages/**/public/**'] }] });
+}
+
 async function main() {
   checkGlobSyncWildcards();
   await checkRimrafWithGlobPattern();
   await checkServeHandlerHeaders();
   checkEslintReactNoDangerRule();
+  checkEslintImportNoInternalModulesMakeRe();
   console.log('check_minimatch_call_sites: OK');
 }
 

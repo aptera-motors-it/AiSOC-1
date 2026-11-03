@@ -46,6 +46,19 @@ class CompatMinimatch extends impl.Minimatch {
       this.set = globSet;
     }
   }
+
+  makeRe() {
+    return makeRe(this.pattern, this.options);
+  }
+}
+
+function makeRe(pattern, options) {
+  const mm = new CompatMinimatch(pattern, options || {});
+  return {
+    test(path) {
+      return mm.match(path);
+    },
+  };
 }
 
 function minimatch(target, pattern, options) {
@@ -55,6 +68,7 @@ function minimatch(target, pattern, options) {
 Object.assign(minimatch, impl);
 minimatch.minimatch = impl.minimatch;
 minimatch.Minimatch = CompatMinimatch;
+minimatch.makeRe = makeRe;
 minimatch.GLOBSTAR = impl.GLOBSTAR;
 minimatch.default = minimatch;
 

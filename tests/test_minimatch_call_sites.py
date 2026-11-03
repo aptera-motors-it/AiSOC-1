@@ -19,6 +19,27 @@ def _run_call_site_check(extra_args: list[str] | None = None) -> subprocess.Comp
     return subprocess.run(cmd, cwd=REPO_ROOT, check=False, capture_output=True, text=True)
 
 
+def test_minimatch_facade_exports_make_re() -> None:
+    script = """
+const mm = require('./packages/minimatch-cjs-compat');
+if (typeof mm.makeRe !== 'function') {
+  throw new Error('minimatch.makeRe missing');
+}
+const re = mm.makeRe('packages/**/internal/**');
+if (!re.test('packages/foo/internal/bar')) {
+  throw new Error('makeRe test() failed');
+}
+"""
+    proc = subprocess.run(
+        ["node", "-e", script],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
 def test_call_sites_at_head_lockfile() -> None:
     proc = _run_call_site_check()
     assert proc.returncode == 0, proc.stdout + proc.stderr
