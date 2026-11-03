@@ -358,7 +358,7 @@ async def test_failed_pin_does_not_commit_a_later_offset(monkeypatch: pytest.Mon
                 raise error
         assert consumer.stats()["processed"] == 0, consumer.stats()
         committed = await _committed(brokers, group, topic)
-        assert committed is None, f"committed offset {committed} moved past an event whose pin failed"
+        assert committed == 0, f"committed offset {committed} moved past an event whose pin failed"
     finally:
         await _stop(consumer, task)
 

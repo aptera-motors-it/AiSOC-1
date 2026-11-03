@@ -212,9 +212,23 @@ class UEBAKafkaConsumer:
                 return False
             return True
 
-        # One lookup per partition. A group with no commit resumes at the log
-        # end, so the first record is pinned before it is handled.
+        # A group with no commit resumes at the log end. Pin the fetched
+        # offset first. A rejected pin is stored on the next attempt and the
+        # loop stops, so a restart reads that record. If it still cannot be
+        # stored, this record is scored or dead-lettered before stopping.
         pinned: set[TopicPartition] = set()
+
+        async def handle(msg: Any, tp: TopicPartition) -> str:
+            try:
+                await self._process_message(msg.value, producer)
+            except Exception as exc:  # noqa: BLE001
+                if not await self._handler_failed(msg, exc):
+                    return "stop"
+            else:
+                self._stats["processed"] += 1
+            if not await commit_position(tp, msg.offset + 1):
+                return "retry"
+            return "ok"
 
         try:
             async for msg in consumer:
@@ -225,18 +239,17 @@ class UEBAKafkaConsumer:
                     try:
                         current = await consumer.committed(tp)
                     except lost:
-                        break
+                        current = None
                     pinned.add(tp)
                     if current is None and not await commit_position(tp, msg.offset):
+                        if await commit_position(tp, msg.offset):
+                            break
+                        await handle(msg, tp)
                         break
-                try:
-                    await self._process_message(msg.value, producer)
-                except Exception as exc:  # noqa: BLE001
-                    if not await self._handler_failed(msg, exc):
-                        break
-                else:
-                    self._stats["processed"] += 1
-                if not await commit_position(tp, msg.offset + 1):
+                outcome = await handle(msg, tp)
+                if outcome == "stop":
+                    break
+                if outcome == "retry":
                     continue
         finally:
             # Before the awaits below, not after: ``consumer.stop()`` can
