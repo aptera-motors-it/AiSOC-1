@@ -409,10 +409,15 @@ async def _resume_approval_in_background(approval_id: str, tenant_id: str, decis
     leg = next(_legs)
     decided_by = str(decision["decided_by_id"] or "")
     comment = decision["decision_comment"] or ""
+    run_id = str(decision["run_id"] or "")
     if decision["status"] == "approved":
-        run = await engine_module.resume_after_approval(
-            approval_id=approval_id, tenant_id=tenant_id, decided_by=decided_by, comment=comment
-        )
+        try:
+            run = await engine_module.resume_after_approval(
+                approval_id=approval_id, tenant_id=tenant_id, decided_by=decided_by, comment=comment
+            )
+        except engine_module.PlaybookDeleted:
+            _end_stored(tenant_id, run_id, RunStatus.FAILED, "the playbook was deleted while the run waited on its approval", leg)
+            return
         if run is not None:
             _remember(tenant_id, run, leg)
         return
@@ -420,16 +425,21 @@ async def _resume_approval_in_background(approval_id: str, tenant_id: str, decis
     # pause resumed; only a denial that stopped the pause may cancel the run.
     if not await engine_module.deny_approval(approval_id=approval_id, tenant_id=tenant_id, decided_by=decided_by, comment=comment):
         return
-    owned = _runs.get(str(decision["run_id"] or ""))
-    if owned is not None and owned.tenant_id == tenant_id:
-        # The stored record can be an earlier leg's in any status (a verification
-        # answered after its prompt failed to send leaves it failed), or a later
-        # leg's that _remember must keep, so cancel a copy.
-        cancelled = copy.copy(owned.run)
-        cancelled.status = RunStatus.CANCELLED
-        cancelled.error = "approval denied"
-        cancelled.finished_at = datetime.now(UTC).isoformat()
-        _remember(tenant_id, cancelled, leg)
+    _end_stored(tenant_id, run_id, RunStatus.CANCELLED, "approval denied", leg)
+
+
+def _end_stored(tenant_id: str, run_id: str, status: RunStatus, error: str, leg: int) -> None:
+    owned = _runs.get(run_id)
+    if owned is None or owned.tenant_id != tenant_id:
+        return
+    # The stored record can be an earlier leg's in any status (a verification
+    # answered after its prompt failed to send leaves it failed), or a later
+    # leg's that _remember must keep, so end a copy.
+    ended = copy.copy(owned.run)
+    ended.status = status
+    ended.error = error
+    ended.finished_at = datetime.now(UTC).isoformat()
+    _remember(tenant_id, ended, leg)
 
 
 # ---------------------------------------------------------------------------

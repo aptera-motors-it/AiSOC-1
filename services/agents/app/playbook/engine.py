@@ -946,6 +946,10 @@ async def deny_approval(*, approval_id: str, tenant_id: str, decided_by: str = "
     return denied
 
 
+class PlaybookDeleted(LookupError):
+    """An approved run cannot continue: its playbook was deleted while it waited."""
+
+
 async def resume_after_approval(
     *,
     approval_id: str,
@@ -959,19 +963,12 @@ async def resume_after_approval(
     pause is resolved **before** the run continues, so a decision that
     arrives twice (a double-tap, a retried webhook) resumes once: the
     second attempt matches no `waiting` row.
+
+    Raises :class:`PlaybookDeleted` when the run's playbook is gone. Its
+    pause is resolved ``cancelled``, because nothing continued.
     """
     pause = await playbook_pause.find_waiting(approval_id=approval_id, tenant_id=tenant_id)
     if pause is None:
-        return None
-
-    claimed = await playbook_pause.resolve(
-        pause_id=pause.id,
-        tenant_id=pause.tenant_id,
-        status="resumed",
-        resolution=f"approved by {decided_by or 'an analyst'}: {comment}"[:500],
-    )
-    if not claimed:
-        # Somebody else resumed it first. Not an error.
         return None
 
     from app.playbook.store import PlaybookStore
@@ -980,13 +977,25 @@ async def resume_after_approval(
     # tenant the run belongs to, so a resume cannot reach a playbook in
     # another one.
     playbook = PlaybookStore.default().get(pause.playbook_id, tenant_id=str(pause.tenant_id))
+    status, resolution = "resumed", f"approved by {decided_by or 'an analyst'}: {comment}"
+    if playbook is None:
+        status, resolution = "cancelled", f"playbook {pause.playbook_id} was deleted; {resolution}"
+    claimed = await playbook_pause.resolve(
+        pause_id=pause.id,
+        tenant_id=pause.tenant_id,
+        status=status,
+        resolution=resolution[:500],
+    )
+    if not claimed:
+        # Somebody else resolved it first. Not an error.
+        return None
     if playbook is None:
         logger.warning(
             "Cannot resume run %s: playbook %s is no longer in the store",
             pause.run_id,
             pause.playbook_id,
         )
-        return None
+        raise PlaybookDeleted(pause.playbook_id)
 
     return await PlaybookEngine().resume(playbook, pause)
 
