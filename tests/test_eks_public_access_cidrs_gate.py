@@ -87,12 +87,11 @@ def test_checkov_iac_workflow_passes_eks_public_endpoint_cidr_check():
 
 
 def _variable_declares_default_empty_list(variables_tf: str, name: str) -> bool:
-    needle = f'variable "{name}"'
-    start = variables_tf.find(needle)
-    assert start != -1, f"missing variable {name}"
-    block = variables_tf[start : variables_tf.find("\nvariable ", start + 1)]
-    if block.find("\nvariable ", start + 1) == -1:
-        block = variables_tf[start:]
+    marker = f'variable "{name}"'
+    start = variables_tf.index(marker)
+    rest = variables_tf[start + len(marker) :]
+    next_var = rest.find('\nvariable "')
+    block = rest if next_var == -1 else rest[:next_var]
     return "default     = []" in block or "default = []" in block
 
 
@@ -115,3 +114,4 @@ def test_eks_module_wires_public_access_cidrs_and_rejects_open_internet():
     assert "precondition" in main_tf
     assert "endpoint_public_access" in variables_tf
     assert 'default     = false' in variables_tf
+    assert "default     = []" in variables_tf

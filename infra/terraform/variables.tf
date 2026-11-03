@@ -57,6 +57,7 @@ variable "eks_endpoint_public_access" {
 variable "eks_public_access_cidrs" {
   description = "CIDR blocks allowed to reach the EKS public API when eks_endpoint_public_access is true."
   type        = list(string)
+  default     = []
   validation {
     condition = alltrue([
       for c in var.eks_public_access_cidrs : (
