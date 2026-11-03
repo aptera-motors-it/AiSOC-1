@@ -1257,6 +1257,10 @@ jobs:
         run: |
           python3 scripts/check_llm_optional_at_boot.py --self-test
           python3 scripts/check_llm_optional_at_boot.py
+      - name: Service container images declare a non-root runtime USER
+        run: |
+          python3 scripts/check_service_container_user.py --self-test
+          python3 scripts/check_service_container_user.py
       # The Project maturity table published a status for fifteen
       # capabilities and nothing checked any of them: no definition of
       # Stable existed anywhere, no gate parsed the table, and the labels
