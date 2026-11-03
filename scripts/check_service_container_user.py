@@ -35,7 +35,6 @@ Exit codes: 0 clean, 1 findings, 2 the scan could not run.
 from __future__ import annotations
 
 import argparse
-import re
 import shutil
 import subprocess
 import sys
@@ -158,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         findings = scan(root)
     except RuntimeError as exc:
-        print(f"check_service_container_user: FAILED to run: {exc}", file=stderr)
+        print(f"check_service_container_user: FAILED to run: {exc}", file=sys.stderr)
         return 2
 
     if findings:
@@ -207,15 +206,10 @@ def self_test() -> int:
     ok = effective_runtime_user("FROM python:3.11-slim\nUSER nobody\nCMD []\n")
     record("USER nobody is accepted", ok.user == "nobody")
 
-    multi = effective_runtime_user(
-        "FROM golang:1.26 AS builder\nRUN go build\n"
-        "FROM alpine:3.19\nUSER aisoc\nCMD []\n"
-    )
+    multi = effective_runtime_user("FROM golang:1.26 AS builder\nRUN go build\nFROM alpine:3.19\nUSER aisoc\nCMD []\n")
     record("the last stage's USER wins across stages", multi.user == "aisoc")
 
-    last = effective_runtime_user(
-        "FROM python:3.11-slim\nUSER nobody\nUSER aisoc\nCMD []\n"
-    )
+    last = effective_runtime_user("FROM python:3.11-slim\nUSER nobody\nUSER aisoc\nCMD []\n")
     record("the last USER in a stage wins", last.user == "aisoc")
 
     with scratch_tree() as tree:
