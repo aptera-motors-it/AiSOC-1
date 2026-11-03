@@ -7,14 +7,16 @@ This gate mirrors those paths so CKV_AWS_38 and AVD-AWS-0041 cannot regress.
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
+
+import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 TERRAFORM_ROOT = REPO / "infra" / "terraform"
 EKS_MODULE = TERRAFORM_ROOT / "modules" / "eks"
 TFSEC_VERSION = "1.28.13"
-CHECKOV_VERSION = "3.2.334"
 TFSEC_RULE = "AVD-AWS-0041"
 CHECKOV_CHECK = "CKV_AWS_38"
 
@@ -32,16 +34,8 @@ def _tfsec_bin() -> Path:
     return dest
 
 
-def _checkov_bin() -> Path:
-    dest = Path("/tmp") / f"checkov-{CHECKOV_VERSION}"
-    if dest.exists():
-        return dest
-    subprocess.run(
-        ["/home/ubuntu/.local/bin/checkov", "--version"],
-        capture_output=True,
-        check=False,
-    )
-    return Path("/home/ubuntu/.local/bin/checkov")
+def _checkov_bin() -> str | None:
+    return shutil.which("checkov")
 
 
 def _tfsec_report(target: Path) -> list[dict]:
@@ -72,9 +66,12 @@ def test_tfsec_iac_workflow_scans_infra_terraform_tree():
 
 
 def test_checkov_iac_workflow_passes_eks_public_endpoint_cidr_check():
+    checkov = _checkov_bin()
+    if checkov is None:
+        pytest.skip("checkov is not on PATH (the IaC workflow installs it; this Python job does not)")
     completed = subprocess.run(
         [
-            str(_checkov_bin()),
+            checkov,
             "-d",
             str(TERRAFORM_ROOT),
             "--check",
