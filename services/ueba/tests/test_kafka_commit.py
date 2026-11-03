@@ -6,11 +6,14 @@ import os
 import socket
 import time
 import uuid
+from typing import Any
 
 import pytest
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
 from aiokafka.admin import AIOKafkaAdminClient, NewTopic
+from aiokafka.errors import IllegalStateError
 from app.core.config import settings
+from app.services.dead_letters import DeadLetterSink
 from app.services.kafka_consumer import UEBAKafkaConsumer
 
 NOT_JSON = b"{"
@@ -130,3 +133,185 @@ async def test_postgres_down_does_not_commit_the_scoreable_offset(monkeypatch: p
             except asyncio.CancelledError:
                 pass
         await consumer._engine.dispose()
+
+
+async def _stop(consumer: UEBAKafkaConsumer, task: asyncio.Task[None]) -> None:
+    consumer.stop()
+    if not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    await consumer._engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_restart_redelivers_a_failed_first_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    brokers = _broker()
+    suffix = uuid.uuid4().hex[:8]
+    topic = f"ueba.commit.{suffix}"
+    group = f"ueba-commit-{suffix}"
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    monkeypatch.delenv("KAFKA_SECURITY_PROTOCOL", raising=False)
+    monkeypatch.setattr(settings, "database_url", "postgresql+asyncpg://aisoc:x@127.0.0.1:1/aisoc")
+    monkeypatch.setattr(settings, "kafka_bootstrap_servers", brokers)
+    monkeypatch.setattr(settings, "kafka_input_topic", topic)
+    monkeypatch.setattr(settings, "kafka_output_topic", f"{topic}.out")
+    monkeypatch.setattr(settings, "kafka_consumer_group", group)
+
+    await _create_topic(brokers, topic)
+    first = UEBAKafkaConsumer()
+    first_task = asyncio.create_task(first.run())
+    try:
+        await _until(lambda: first.attached, 20, "first consumer did not attach")
+        await _produce(brokers, topic, [json.dumps(SCOREABLE).encode()])
+        await _until(lambda: first_task.done(), 30, f"first consumer kept running: {first.stats()}")
+        if not first_task.cancelled():
+            error = first_task.exception()
+            if error is not None:
+                raise error
+        assert first.stats()["handler_failures"] == 1
+        assert first.stats()["dead_lettered"] == 0
+    finally:
+        await _stop(first, first_task)
+
+    second = UEBAKafkaConsumer()
+    second_task = asyncio.create_task(second.run())
+    try:
+        await _until(
+            lambda: second.stats()["handler_failures"] >= 1 or second_task.done(),
+            20,
+            f"restart skipped the failed first event: {second.stats()}",
+        )
+        if second_task.done() and not second_task.cancelled():
+            error = second_task.exception()
+            if error is not None:
+                raise error
+        assert second.stats()["handler_failures"] >= 1, second.stats()
+        committed = await _committed(brokers, group, topic)
+        assert committed == 0, f"committed offset {committed} moved past the failed first event"
+    finally:
+        await _stop(second, second_task)
+
+
+@pytest.mark.asyncio
+async def test_new_group_skips_events_produced_before_subscribe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    brokers = _broker()
+    suffix = uuid.uuid4().hex[:8]
+    topic = f"ueba.commit.{suffix}"
+    group = f"ueba-commit-{suffix}"
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    monkeypatch.delenv("KAFKA_SECURITY_PROTOCOL", raising=False)
+    monkeypatch.setattr(settings, "database_url", "postgresql+asyncpg://aisoc:x@127.0.0.1:1/aisoc")
+    monkeypatch.setattr(settings, "kafka_bootstrap_servers", brokers)
+    monkeypatch.setattr(settings, "kafka_input_topic", topic)
+    monkeypatch.setattr(settings, "kafka_output_topic", f"{topic}.out")
+    monkeypatch.setattr(settings, "kafka_consumer_group", group)
+
+    await _create_topic(brokers, topic)
+    await _produce(brokers, topic, [json.dumps(SCOREABLE).encode()])
+    consumer = UEBAKafkaConsumer()
+    task = asyncio.create_task(consumer.run())
+    try:
+        await _until(lambda: consumer.attached, 20, "consumer did not attach")
+        await asyncio.sleep(2)
+        assert consumer.stats()["handler_failures"] == 0
+        assert consumer.stats()["processed"] == 0
+        await _produce(brokers, topic, [json.dumps(SCOREABLE).encode()])
+        await _until(
+            lambda: consumer.stats()["handler_failures"] >= 1 or task.done(),
+            20,
+            f"event produced after subscribe was not handled: {consumer.stats()}",
+        )
+        assert consumer.stats()["handler_failures"] == 1
+    finally:
+        await _stop(consumer, task)
+
+
+@pytest.mark.asyncio
+async def test_deeply_nested_json_reaches_the_dead_letter_sink(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    brokers = _broker()
+    suffix = uuid.uuid4().hex[:8]
+    topic = f"ueba.commit.{suffix}"
+    group = f"ueba-commit-{suffix}"
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    monkeypatch.delenv("KAFKA_SECURITY_PROTOCOL", raising=False)
+    monkeypatch.setattr(settings, "database_url", "postgresql+asyncpg://aisoc:x@127.0.0.1:1/aisoc")
+    monkeypatch.setattr(settings, "kafka_bootstrap_servers", brokers)
+    monkeypatch.setattr(settings, "kafka_input_topic", topic)
+    monkeypatch.setattr(settings, "kafka_output_topic", f"{topic}.out")
+    monkeypatch.setattr(settings, "kafka_consumer_group", group)
+
+    calls = 0
+    real_record = DeadLetterSink.record
+
+    async def spy(self: DeadLetterSink, **kwargs: Any) -> bool:
+        nonlocal calls
+        calls += 1
+        return await real_record(self, **kwargs)
+
+    monkeypatch.setattr(DeadLetterSink, "record", spy)
+    await _create_topic(brokers, topic)
+    consumer = UEBAKafkaConsumer()
+    task = asyncio.create_task(consumer.run())
+    try:
+        await _until(lambda: consumer.attached, 20, "consumer did not attach")
+        nested = b"[" * 50000 + b"]" * 50000
+        await _produce(brokers, topic, [NOT_JSON, nested])
+        await _until(lambda: task.done(), 20, f"nested event did not finish: {consumer.stats()}")
+        error = task.exception() if not task.cancelled() else None
+        assert error is None, error
+        assert calls == 1
+        committed = await _committed(brokers, group, topic)
+        assert committed == 1, f"committed offset {committed} moved past an undelivered dead letter"
+    finally:
+        await _stop(consumer, task)
+
+
+@pytest.mark.asyncio
+async def test_lost_partition_on_commit_keeps_the_subscription(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    brokers = _broker()
+    real_commit = AIOKafkaConsumer.commit
+
+    async def commit(self: AIOKafkaConsumer, offsets: Any = None) -> None:
+        if offsets and any(isinstance(offset, int) and offset > 0 for offset in offsets.values()):
+            raise IllegalStateError("Partition is not assigned")
+        await real_commit(self, offsets)
+
+    monkeypatch.setattr(AIOKafkaConsumer, "commit", commit)
+    suffix = uuid.uuid4().hex[:8]
+    topic = f"ueba.commit.{suffix}"
+    group = f"ueba-commit-{suffix}"
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    monkeypatch.delenv("KAFKA_SECURITY_PROTOCOL", raising=False)
+    monkeypatch.setattr(settings, "database_url", "postgresql+asyncpg://aisoc:x@127.0.0.1:1/aisoc")
+    monkeypatch.setattr(settings, "kafka_bootstrap_servers", brokers)
+    monkeypatch.setattr(settings, "kafka_input_topic", topic)
+    monkeypatch.setattr(settings, "kafka_output_topic", f"{topic}.out")
+    monkeypatch.setattr(settings, "kafka_consumer_group", group)
+    await _create_topic(brokers, topic)
+    consumer = UEBAKafkaConsumer()
+    task = asyncio.create_task(consumer.run())
+    try:
+        await _until(lambda: consumer.attached, 20, "consumer did not attach")
+        await _produce(brokers, topic, [NOT_JSON, NOT_JSON])
+        await _until(
+            lambda: consumer.stats()["processed"] >= 2 or task.done(),
+            20,
+            f"subscription stopped after a lost partition: {consumer.stats()}",
+        )
+        if task.done() and not task.cancelled():
+            error = task.exception()
+            raise AssertionError(f"subscription ended: {error!r}")
+        assert consumer.stats()["processed"] >= 2
+        committed = await _committed(brokers, group, topic)
+        assert committed == 0, f"committed offset {committed} advanced after a lost partition"
+    finally:
+        await _stop(consumer, task)
