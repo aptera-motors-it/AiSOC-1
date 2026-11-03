@@ -71,7 +71,7 @@ def test_tfsec_iac_workflow_scans_infra_terraform_tree():
         capture_output=True,
         text=True,
     )
-    assert completed.returncode == 0, completed.stderr
+    assert completed.returncode == 0, completed.stdout + completed.stderr
     payload = json.loads(report.read_text())
     assert isinstance(payload.get("results"), list)
 
