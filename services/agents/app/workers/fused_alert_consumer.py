@@ -377,6 +377,10 @@ def _is_terminal_request_error(exc: BaseException) -> bool:
     return False
 
 
+class _DlqUnavailable(Exception):
+    """The poison alert was not published, so its offset must not commit."""
+
+
 class FusedAlertTriageWorker:
     """Consumes ``aisoc.alerts.fused`` and auto-triages each alert (copilot)."""
 
@@ -471,12 +475,10 @@ class FusedAlertTriageWorker:
                 # inference and persistence replays the alert instead of losing
                 # it, and offsets advance only on durable completion (issue #571).
                 #
-                # ``_process_with_retry`` catches and dead-letters rather than
-                # raising, which is the reason this loop survives a poison
-                # alert. The guard is here as well because that is a property
-                # of another method: the loop must not depend on a callee
-                # staying total, which is exactly how the ueba consumer came
-                # to have no ``except`` on its only handler.
+                # A poison alert is dead-lettered rather than raised, so one
+                # bad alert does not end the subscription. A DLQ publish that
+                # does not land raises ``_DlqUnavailable`` instead: committing
+                # after that drops the alert, and the next poll never sees it.
                 # Parity 6.9. Triage is an LLM call, so this stage spends
                 # almost all of its time waiting; it used to wait one alert
                 # at a time. Alerts about *different* entities now run
@@ -489,10 +491,14 @@ class FusedAlertTriageWorker:
                 payload = msg.value if isinstance(msg.value, dict) else {}
                 partition = getattr(msg, "partition", None)
                 offset = getattr(msg, "offset", None)
+                hold_commit = False
 
                 async def _handle(value=msg.value, partition=partition, offset=offset) -> None:
+                    nonlocal hold_commit
                     try:
                         await self._process_with_retry(value)
+                    except _DlqUnavailable:
+                        hold_commit = True
                     except Exception as exc:  # noqa: BLE001 — one alert must not end the subscription
                         _METRICS["errors"] += 1
                         logger.error(
@@ -520,16 +526,16 @@ class FusedAlertTriageWorker:
                 # done — correct, and wasteful every single time.
                 window_full = self._lanes.in_flight >= self._lanes.limit
                 window_old = (time.monotonic() - last_commit) >= _COMMIT_WINDOW_SECONDS
-                if window_full or window_old:
-                    await self._lanes.drain()
-                    last_commit = time.monotonic()
-                    try:
-                        await self._consumer.commit()
-                    except Exception as commit_exc:  # noqa: BLE001 — reprocess on restart
-                        logger.warning("auto_triage_worker.commit_failed", error=str(commit_exc))
-                    continue
-
                 await self._lanes.drain()
+                if window_full or window_old:
+                    last_commit = time.monotonic()
+                if hold_commit:
+                    logger.error(
+                        "auto_triage_worker.offset_held",
+                        partition=partition,
+                        offset=offset,
+                    )
+                    raise _DlqUnavailable(f"dlq publish failed at offset {offset}")
                 try:
                     await self._consumer.commit()
                 except Exception as commit_exc:  # noqa: BLE001 — reprocess on restart
@@ -543,8 +549,9 @@ class FusedAlertTriageWorker:
     async def _process_with_retry(self, message: Any) -> bool:
         """Triage one alert with bounded retries; dead-letter on exhaustion.
 
-        Returns True on durable success, False if the message was dead-lettered.
-        Either way the caller commits (a poison alert must not wedge the loop).
+        Returns True when triage finished and False when the DLQ accepted
+        the alert. ``_DlqUnavailable`` means the publish did not happen,
+        and the caller must not commit.
         """
         last_error: str = ""
         stage = "triage"
@@ -593,7 +600,7 @@ class FusedAlertTriageWorker:
             )
             await self._producer.start()
             return self._producer
-        except Exception as exc:  # noqa: BLE001 — DLQ is best-effort
+        except Exception as exc:  # noqa: BLE001 — caller holds the offset when this fails
             logger.error("auto_triage_worker.dlq_producer_failed", error=str(exc))
             self._producer = None
             return None
@@ -615,13 +622,18 @@ class FusedAlertTriageWorker:
         producer = await self._ensure_producer()
         if producer is None:
             logger.error("auto_triage_worker.dlq_unavailable", alert_id=alert_id, stage=stage)
-            return
+            raise _DlqUnavailable(alert_id)
         try:
-            await producer.send(self._dlq_topic, value=record)
+            pending = await producer.send(self._dlq_topic, value=record)
+            # aiokafka schedules the produce and hands back a future. The
+            # record is not published until that future finishes.
+            if asyncio.isfuture(pending):
+                await pending
             _METRICS["dead_lettered"] += 1
             logger.error("auto_triage_worker.dead_lettered", alert_id=alert_id, stage=stage, attempts=attempts)
-        except Exception as exc:  # noqa: BLE001 — never wedge the loop on a DLQ failure
+        except Exception as exc:  # noqa: BLE001 — a failed publish is not a capture
             logger.error("auto_triage_worker.dlq_send_failed", alert_id=alert_id, error=str(exc))
+            raise _DlqUnavailable(alert_id) from exc
 
     @property
     def topic(self) -> str:
