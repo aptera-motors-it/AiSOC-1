@@ -35,6 +35,7 @@ Exit codes: 0 clean, 1 findings, 2 the scan could not run.
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import subprocess
 import sys
@@ -61,30 +62,64 @@ def _strip_comment(line: str) -> str:
     return line.strip()
 
 
+_HEREDOC_START = re.compile(r"<<-?\s*(\w+)")
+
+
+def _logical_instruction_lines(text: str) -> list[str]:
+    """Dockerfile lines merged for ``\\`` continuations; heredoc bodies omitted."""
+    logical: list[str] = []
+    pending = ""
+    in_heredoc = False
+    heredoc_delim = ""
+    for raw in text.splitlines():
+        stripped = _strip_comment(raw)
+        if in_heredoc:
+            if stripped == heredoc_delim:
+                in_heredoc = False
+            continue
+        if pending:
+            stripped = pending + stripped
+            pending = ""
+        while stripped.endswith("\\"):
+            pending = stripped[:-1].rstrip() + " "
+            stripped = ""
+            break
+        if not stripped:
+            continue
+        match = _HEREDOC_START.search(stripped)
+        if match:
+            in_heredoc = True
+            heredoc_delim = match.group(1)
+        logical.append(stripped)
+    return logical
+
+
 def _runs_as_root(user_spec: str | None) -> bool:
     if not user_spec:
         return True
-    uid_part = user_spec.split(":", 1)[0].strip().lower()
-    return uid_part in {"root", "0"}
+    uid_part = user_spec.split(":", 1)[0].strip()
+    if uid_part.lower() == "root":
+        return True
+    try:
+        return int(uid_part, 10) == 0
+    except ValueError:
+        return False
 
 
 def effective_runtime_user(text: str) -> StageUser:
     """Return the user the last stage runs as; ``None`` means root."""
-    lines = text.splitlines()
-    stage_indices = [i for i, line in enumerate(lines) if _strip_comment(line).upper().startswith("FROM ")]
+    logical = _logical_instruction_lines(text)
+    stage_indices = [i for i, line in enumerate(logical) if line.upper().startswith("FROM ")]
     if not stage_indices:
         return StageUser("", "missing FROM", None)
     start = stage_indices[-1]
-    stage = _strip_comment(lines[start])
+    stage = logical[start]
     declared: str | None = None
-    for line in lines[start + 1 :]:
-        stripped = _strip_comment(line)
-        if not stripped:
-            continue
-        if stripped.upper().startswith("FROM "):
+    for line in logical[start + 1 :]:
+        if line.upper().startswith("FROM "):
             break
-        if stripped.upper().startswith("USER "):
-            declared = stripped[4:].strip()
+        if line.upper().startswith("USER "):
+            declared = line[4:].strip()
     if _runs_as_root(declared):
         return StageUser("", stage, None)
     return StageUser("", stage, declared)
@@ -209,6 +244,12 @@ def self_test() -> int:
 
     uid_zero_group = effective_runtime_user("FROM alpine:3.19\nUSER 0:65534\nCMD []\n")
     record("USER with uid 0 is treated as root", uid_zero_group.user is None)
+
+    uid_00 = effective_runtime_user("FROM alpine:3.19\nUSER 00\nCMD []\n")
+    record("USER 00 is treated as root", uid_00.user is None)
+
+    run_not_user = effective_runtime_user("FROM alpine:3.19\nRUN echo start \\\nUSER nobody\nCMD []\n")
+    record("USER in a continued RUN is not a USER instruction", run_not_user.user is None)
 
     ok = effective_runtime_user("FROM python:3.11-slim\nUSER nobody\nCMD []\n")
     record("USER nobody is accepted", ok.user == "nobody")

@@ -93,6 +93,7 @@ EXPOSE 8000
 # (aisoc-demo-api.internal from the web app) AND IPv4 for fly-proxy's public
 # /health checks against api.tryaisoc.com (which speak IPv4 to 127.0.0.1).
 # Pre-binding lets us turn IPV6_V6ONLY off so a single socket serves both.
+RUN chown -R nobody:nogroup /app
 USER nobody
 
 CMD ["python", "-m", "app.scripts.serve"]

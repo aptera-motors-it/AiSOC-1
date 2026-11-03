@@ -65,6 +65,7 @@ COPY app ./app
 
 EXPOSE 8005
 
+RUN chown -R nobody:nogroup /app
 USER nobody
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8005"]
