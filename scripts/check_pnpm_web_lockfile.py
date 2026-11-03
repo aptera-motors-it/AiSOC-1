@@ -12,8 +12,10 @@ can actually move without breaking the tree:
 
 * **minimatch** — refuse GHSA-g3hv-75wg-m249 on **every** resolved copy below
   11.0.1 (including legacy 3.x on the ``apps/docs`` → ``serve-handler`` path and
-  5.x under OpenAPI tooling). Scoped pnpm overrides replace a blunt
-  ``minimatch@3`` → 11 bump that breaks ``test-exclude@6`` / ``nyc``.
+  5.x under OpenAPI tooling). A workspace CommonJS facade
+  (``packages/minimatch-cjs-compat``, wired with ``pnpm.overrides.minimatch``)
+  delegates to registry ``minimatch@11.0.4`` while keeping ``require('minimatch')``
+  callable for glob@7, serve-handler, and eslint-plugin-react.
 * **deepmerge** — refuse versions below 4.2.0 (no ``__proto__`` merge guard).
   Do **not** pin 4.1.2 to silence GHSA-gcqx-w48m-w2h4: that downgrade removes
   the guard added in 4.2.0. Keep 4.3.1 (or newer when upstream ships). The
@@ -81,8 +83,7 @@ def _minimatch_problems(versions: set[str]) -> list[str]:
         if _lt(parsed, _MINIMATCH_FLOOR):
             problems.append(
                 f"minimatch@{version} is below 11.0.1 (GHSA-g3hv-75wg-m249); "
-                "use scoped pnpm overrides (serve-handler, glob@7, eslint, "
-                "@redocly/openapi-core, nyc/test-exclude) and refresh the lockfile"
+                "use the minimatch CJS compat workspace package and refresh the lockfile"
             )
     return problems
 

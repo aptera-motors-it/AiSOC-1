@@ -1,0 +1,11 @@
+{
+  "name": "@aisoc/minimatch-cjs-compat",
+  "version": "11.0.4",
+  "private": true,
+  "description": "Callable CommonJS facade over minimatch 11 for legacy require('minimatch') consumers",
+  "main": "index.cjs",
+  "license": "BlueOak-1.0.0",
+  "dependencies": {
+    "minimatch-native": "npm:minimatch@11.0.4"
+  }
+}

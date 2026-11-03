@@ -55,6 +55,9 @@ jobs:
       - name: Gate root pnpm lockfile (web workspace)
         run: python3 scripts/check_pnpm_web_lockfile.py
 
+      - name: Gate minimatch legacy call sites
+        run: python3 scripts/check_minimatch_call_sites.py
+
       - name: Audit pnpm dependencies
         id: audit-pnpm
         continue-on-error: true
