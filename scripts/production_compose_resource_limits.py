@@ -9,8 +9,8 @@ process cannot consume the whole VM: limits follow `docker-compose.yml`
 ``resources.limits.memory`` for application services on a single host, and the
 architecture page's ollama note (~3 GiB while answering → 4 GiB cap).
 
-``pids_limit`` is set per workload class so fork bombs inside one container
-stay inside that container.
+``pids_limit`` is expressed as ``deploy.resources.limits.pids`` so Compose v2.29+
+does not reject the project for conflicting pid keys.
 """
 
 from __future__ import annotations

@@ -608,8 +608,9 @@ def _service_bounds(service: dict) -> tuple[int | None, int | None]:
     deploy = (service or {}).get("deploy") or {}
     limits = (deploy.get("resources") or {}).get("limits") or {}
     memory = _memory_to_bytes(limits.get("memory"))
-    pids = (service or {}).get("pids_limit")
-    return memory, int(pids) if pids is not None else None
+    pids_raw = limits.get("pids")
+    pids = int(pids_raw) if pids_raw is not None else None
+    return memory, pids
 
 
 class TestProductionOverlayBoundsMemoryAndPids:
@@ -629,7 +630,7 @@ class TestProductionOverlayBoundsMemoryAndPids:
             memory, pids = _service_bounds(prod[name] or {})
             if memory is None or pids is None:
                 missing.append(name)
-        assert not missing, f"these services lack deploy.resources.limits.memory and/or pids_limit: {missing}"
+        assert not missing, f"these services lack deploy.resources.limits.memory and/or pids: {missing}"
 
     def test_bounds_match_the_published_table(self, prod: dict) -> None:
         wrong: list[str] = []
@@ -666,6 +667,20 @@ class TestProductionOverlayBoundsMemoryAndPids:
         env.setdefault("NEO4J_PASSWORD", "9b20969c058203d8a725c09800645f4666f913d80590c094")  # gitleaks:allow
         env.setdefault("CLICKHOUSE_PASSWORD", "9b20969c058203d8a725c09800645f4666f913d80590c094")  # gitleaks:allow
         env.setdefault("GRAFANA_ADMIN_PASSWORD", "9b20969c058203d8a725c09800645f4666f913d80590c094")  # gitleaks:allow
+        env["COMPOSE_PROFILES"] = ",".join(
+            (
+                "full",
+                "monitoring",
+                "chatops",
+                "extras",
+                "osquery",
+                "connectors",
+                "slack",
+                "mcp",
+                "escalations",
+                "debug-ui",
+            )
+        )
         result = subprocess.run(  # noqa: S603
             [
                 "docker",
@@ -692,7 +707,7 @@ class TestProductionOverlayBoundsMemoryAndPids:
             deploy = svc.get("deploy") or {}
             limits = (deploy.get("resources") or {}).get("limits") or {}
             memory = _memory_to_bytes(limits.get("memory"))
-            pids = svc.get("pids_limit")
+            pids_raw = limits.get("pids")
             assert _memory_to_bytes(expected.memory) == memory, f"{name} config memory mismatch"
-            assert pids is not None, f"{name} missing pids_limit in compose config"
-            assert expected.pids_limit == int(pids), f"{name} config pids mismatch"
+            assert pids_raw is not None, f"{name} missing deploy.resources.limits.pids in compose config"
+            assert expected.pids_limit == int(pids_raw), f"{name} config pids mismatch"
