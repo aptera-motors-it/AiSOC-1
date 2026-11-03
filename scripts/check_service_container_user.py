@@ -115,10 +115,10 @@ def _logical_instruction_lines(text: str) -> list[str]:
 
 
 def _uid_part(user_spec: str) -> str:
-    part = user_spec.split(":", 1)[0].strip()
-    if len(part) >= 2 and part[0] == part[-1] and part[0] in "\"'":
-        part = part[1:-1].strip()
-    return part
+    spec = user_spec.strip()
+    if len(spec) >= 2 and spec[0] == spec[-1] and spec[0] in "\"'":
+        spec = spec[1:-1].strip()
+    return spec.split(":", 1)[0].strip()
 
 
 def _runs_as_root(user_spec: str | None) -> bool:
@@ -301,6 +301,15 @@ def self_test() -> int:
 
     quoted_root = effective_runtime_user('FROM alpine:3.19\nUSER "root"\nCMD []\n')
     record('USER "root" is treated as root', quoted_root.user is None)
+
+    quoted_root_group = effective_runtime_user('FROM alpine:3.19\nUSER "root:root"\nCMD []\n')
+    record('USER "root:root" is treated as root', quoted_root_group.user is None)
+
+    quoted_zero_group = effective_runtime_user('FROM alpine:3.19\nUSER "0:0"\nCMD []\n')
+    record('USER "0:0" is treated as root', quoted_zero_group.user is None)
+
+    sq_zero_group = effective_runtime_user("FROM alpine:3.19\nUSER '0:0'\nCMD []\n")
+    record("USER '0:0' is treated as root", sq_zero_group.user is None)
 
     tab_user = effective_runtime_user("FROM alpine:3.19\nUSER nobody\nUSER\t0\nCMD []\n")
     record("USER with tab before uid 0 is treated as root", tab_user.user is None)
