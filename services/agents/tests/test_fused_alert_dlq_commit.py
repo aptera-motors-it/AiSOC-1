@@ -165,3 +165,110 @@ async def test_dead_dlq_broker_does_not_commit_the_offset(monkeypatch: pytest.Mo
 
     assert record.value["id"] == poison_id
     assert record.offset == poison.offset
+
+
+class _CancelledAck:
+    async def send(self, topic: str, value: dict) -> asyncio.Future:
+        pending = asyncio.get_running_loop().create_future()
+        pending.cancel()
+        return pending
+
+
+async def test_cancelled_dlq_ack_does_not_commit_the_offset(monkeypatch: pytest.MonkeyPatch) -> None:
+    if not _broker_up(_LIVE_BROKER):
+        pytest.skip(f"no Kafka broker at {_LIVE_BROKER}")
+
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    monkeypatch.setenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
+
+    topic = f"p06-cancel-{uuid.uuid4().hex[:12]}"
+    group = f"p06-cancel-{uuid.uuid4().hex[:12]}"
+    ok_id = f"ok-{uuid.uuid4().hex[:8]}"
+    poison_id = f"poison-{uuid.uuid4().hex[:8]}"
+    triaged: list[str] = []
+    commits: list[object] = []
+
+    async def triage(message: dict) -> dict:
+        triaged.append(str(message["id"]))
+        if message["id"] == poison_id:
+            raise RuntimeError("triage unavailable")
+        return {"verdict": "needs_review"}
+
+    async def cancelled_producer() -> _CancelledAck:
+        return _CancelledAck()
+
+    worker = FusedAlertTriageWorker(
+        bootstrap_servers=_LIVE_BROKER,
+        topic=topic,
+        group_id=group,
+        max_attempts=1,
+        entity_concurrency=1,
+    )
+    worker.triage = triage  # type: ignore[method-assign]
+    worker._ensure_producer = cancelled_producer  # type: ignore[method-assign]
+
+    original_start = AIOKafkaConsumer.start
+
+    async def start_and_count_commits(self, *args, **kwargs):
+        await original_start(self, *args, **kwargs)
+        real_commit = self.commit
+
+        async def commit(offsets=None):
+            commits.append(offsets)
+            return await real_commit(offsets)
+
+        self.commit = commit
+
+    monkeypatch.setattr(AIOKafkaConsumer, "start", start_and_count_commits)
+
+    task = asyncio.create_task(worker.start())
+    try:
+        await _wait_until(
+            lambda: worker._consumer is not None and bool(worker._consumer.assignment()),
+            30,
+            "consumer was not assigned a partition",
+        )
+        producer = AIOKafkaProducer(
+            bootstrap_servers=_LIVE_BROKER,
+            value_serializer=lambda value: json.dumps(value).encode("utf-8"),
+        )
+        await producer.start()
+        try:
+            await producer.send_and_wait(topic, _alert(ok_id))
+            await _wait_until(
+                lambda: ok_id in triaged and len(commits) >= 1,
+                20,
+                f"first alert was not triaged and committed: triaged={triaged} commits={len(commits)}",
+            )
+            poison = await producer.send_and_wait(topic, _alert(poison_id))
+        finally:
+            await producer.stop()
+        await _wait_until(
+            lambda: task.done() or (poison_id in triaged and len(commits) >= 2),
+            20,
+            f"poison alert was neither held nor committed: triaged={triaged} commits={len(commits)}",
+        )
+    finally:
+        await _release(worker, task)
+
+    reader = AIOKafkaConsumer(
+        topic,
+        bootstrap_servers=_LIVE_BROKER,
+        group_id=group,
+        auto_offset_reset="latest",
+        enable_auto_commit=False,
+        value_deserializer=lambda raw: json.loads(raw.decode("utf-8")),
+    )
+    await reader.start()
+    try:
+        tp = TopicPartition(topic, poison.partition)
+        committed = await reader.committed(tp)
+        assert committed == poison.offset, (
+            f"committed offset {committed} moved past poison offset {poison.offset}; a cancelled DLQ ack must leave the offset uncommitted"
+        )
+        record = await asyncio.wait_for(reader.getone(), timeout=15)
+    finally:
+        await reader.stop()
+
+    assert record.value["id"] == poison_id
+    assert record.offset == poison.offset

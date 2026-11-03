@@ -626,6 +626,12 @@ class FusedAlertTriageWorker:
                 await pending
             _METRICS["dead_lettered"] += 1
             logger.error("auto_triage_worker.dead_lettered", alert_id=alert_id, stage=stage, attempts=attempts)
+        except asyncio.CancelledError:
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise
+            logger.error("auto_triage_worker.dlq_send_failed", alert_id=alert_id, error="cancelled")
+            raise _DlqUnavailable(alert_id) from None
         except Exception as exc:  # noqa: BLE001
             logger.error("auto_triage_worker.dlq_send_failed", alert_id=alert_id, error=str(exc))
             raise _DlqUnavailable(alert_id) from exc
