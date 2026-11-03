@@ -33,6 +33,7 @@ import asyncio
 import contextlib
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any, Literal
 
 import structlog
@@ -47,6 +48,14 @@ from app.services.timer_store import InMemoryTimerStore, TimerRecord, TimerStore
 log = structlog.get_logger(__name__)
 
 SafeDefault = Literal["rejected", "approved"]
+
+
+@dataclass(frozen=True)
+class SuspendedDeadline:
+    """One click's hold on a deadline. ``epoch`` is the generation it suspended."""
+
+    record: TimerRecord
+    epoch: int
 
 
 class ApprovalTimeoutScheduler:
@@ -113,6 +122,7 @@ class ApprovalTimeoutScheduler:
         if existing is not None and not existing.done():
             existing.cancel()
         self._epoch[action_id] = self._epoch.get(action_id, 0) + 1
+        self._open_epoch.pop(action_id, None)
 
         # Phase B3 — persist the pending timer so a restart can recover it.
         # Best-effort: a store failure never blocks arming the in-memory timer.
@@ -203,22 +213,27 @@ class ApprovalTimeoutScheduler:
         existing.cancel()
         return True
 
-    def suspend(self, action_id: str) -> TimerRecord | None:
+    def suspend(self, action_id: str) -> SuspendedDeadline | None:
         """Stop the in-memory sleep and return its record. The store row stays."""
         record = self._records.get(action_id)
         task = self._timers.get(action_id)
         if record is None or task is None or task.done():
             return None
-        self._open_epoch[action_id] = self._epoch.get(action_id, 0)
+        epoch = self._epoch.get(action_id, 0)
+        self._open_epoch[action_id] = epoch
         self._timers.pop(action_id, None)
         task.cancel()
-        return record
+        return SuspendedDeadline(record, epoch)
 
-    def resume(self, record: TimerRecord) -> asyncio.Task[None] | None:
-        """Arm the time left unless a decision already dropped this deadline."""
-        seen = self._open_epoch.pop(record.action_id, None)
-        if seen is None or seen != self._epoch.get(record.action_id):
+    def resume(self, suspended: SuspendedDeadline) -> asyncio.Task[None] | None:
+        """Arm the time left unless this click's suspend is no longer current."""
+        action_id = suspended.record.action_id
+        if self._open_epoch.get(action_id) != suspended.epoch:
             return None
+        if suspended.epoch != self._epoch.get(action_id):
+            return None
+        self._open_epoch.pop(action_id, None)
+        record = suspended.record
         remaining = max(0.0, record.fire_at_epoch - time.time())
         safe_default: SafeDefault = "approved" if record.safe_default == "approved" else "rejected"
         return self.schedule(

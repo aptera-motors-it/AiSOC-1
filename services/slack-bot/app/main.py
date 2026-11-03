@@ -64,8 +64,7 @@ from app.interactions import (
 from app.notify import router as notify_router
 from app.services.aisoc_clients import AisocActionsClient, AisocApiClient
 from app.services.approval_audit import StructlogAuditSink
-from app.services.approval_timeout import ApprovalTimeoutScheduler
-from app.services.timer_store import TimerRecord
+from app.services.approval_timeout import ApprovalTimeoutScheduler, SuspendedDeadline
 from app.war_room import router as war_room_router
 
 # Configure structlog before anything else so module-level loggers
@@ -233,7 +232,7 @@ async def _route_action_decision(
         button_value = first.get("value") or ""
 
     action_id = button_value.split("|", 1)[0].strip()
-    suspended: TimerRecord | None = None
+    suspended: SuspendedDeadline | None = None
     if timeout_scheduler is not None and event_action_id in {APPROVE_ACTION_ID, DENY_ACTION_ID} and action_id:
         suspended = timeout_scheduler.suspend(action_id)
 
