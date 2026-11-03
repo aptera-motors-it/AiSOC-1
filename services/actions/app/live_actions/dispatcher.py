@@ -824,8 +824,9 @@ async def dispatch(request: LiveActionRequest) -> LiveActionResult:
     #
     # Verification runs only for a real execution that actually succeeded. A
     # dry run and a SIMULATED result have nothing to verify, and a failed
-    # execution is already an honest negative. Anything short of that read-back
-    # drops an executor's verification claim, including one buried in details.
+    # execution is already an honest negative. A path that does not read back
+    # drops an executor's verification claim. Only a dry run or a simulation
+    # replaces the summary. A real result keeps the summary the executor wrote.
     if decision is not None and decision.requires_verification and not request.dry_run and result.status is LiveActionStatus.SUCCEEDED:
         if action_type is not None:
             result = await _verify_effect(request, result, action_type, log)
@@ -842,7 +843,10 @@ async def dispatch(request: LiveActionRequest) -> LiveActionResult:
             )
     else:
         details = {key: value for key, value in result.details.items() if key not in {"verification", "verification_reason"}}
-        result = result.model_copy(update={"verification": None, "details": details, "summary": "preview only"})
+        update: dict[str, Any] = {"verification": None, "details": details}
+        if request.dry_run or result.status is LiveActionStatus.SIMULATED:
+            update["summary"] = "preview only"
+        result = result.model_copy(update=update)
 
     log.info(
         "live_action.completed",

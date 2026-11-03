@@ -116,7 +116,6 @@ def test_dry_run_drops_executor_verification(monkeypatch) -> None:
     [
         ("block_ip", ActionType.BLOCK_IP, LiveActionStatus.SUCCEEDED, True),
         ("block_address", ActionType.BLOCK_IP, LiveActionStatus.SIMULATED, False),
-        ("quarantine_path", ActionType.QUARANTINE_FILE, LiveActionStatus.SUCCEEDED, False),
     ],
 )
 def test_skipped_readback_strips_nested_verification(monkeypatch, capability, legacy, status, dry_run) -> None:
@@ -166,5 +165,57 @@ def test_skipped_readback_strips_nested_verification(monkeypatch, capability, le
     assert "verification_reason" not in result["details"], result
     assert result["details"]["kept"] is True, result
     assert result["summary"] == "preview only", result
+    reset_for_tests()
+    get_settings.cache_clear()
+
+
+def test_real_success_without_verification_keeps_executor_summary(monkeypatch) -> None:
+    monkeypatch.setenv("AISOC_ACTIONS_SERVICE_TOKEN", _TOKEN)
+    monkeypatch.setenv("AISOC_MATURITY_TIER", "L3")
+    monkeypatch.setenv("AISOC_ACTIONS_DEFAULT_DRY_RUN", "0")
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("DATABASE_DSN", raising=False)
+    get_settings.cache_clear()
+    reset_kill_switch_cache()
+    clear_policy_cache()
+
+    class _LowBlast(LiveActionExecutor):
+        vendor_id = "repro"
+        capability = "quarantine_path"
+        _legacy_action_type = ActionType.QUARANTINE_FILE
+
+        async def execute(self, request: LiveActionRequest) -> LiveActionResult:
+            return LiveActionResult(
+                request_id=request.request_id,
+                status=LiveActionStatus.SUCCEEDED,
+                capability=request.capability,
+                vendor_id=request.vendor_id,
+                summary="quarantined the file",
+                verification=VerificationOutcome.VERIFIED,
+                details={"verification": "verified", "verification_reason": "executor said so", "kept": True},
+            )
+
+    body = {
+        "capability": "quarantine_path",
+        "vendor_id": "repro",
+        "target": "203.0.113.10",
+        "dry_run": False,
+        "confidence": 0.99,
+        "tenant_id": str(uuid.uuid4()),
+        "requested_by": "analyst@example.com",
+    }
+    with TestClient(app, headers={"Authorization": f"Bearer {_TOKEN}"}) as client:
+        reset_for_tests()
+        register_executor(_LowBlast())
+        response = client.post("/api/v1/live-actions/dispatch", json=body)
+
+    assert response.status_code == 200, response.text
+    result = response.json()["result"]
+    assert result["status"] == "succeeded", result
+    assert result["verification"] is None, result
+    assert "verification" not in result["details"], result
+    assert "verification_reason" not in result["details"], result
+    assert result["details"]["kept"] is True, result
+    assert result["summary"] == "quarantined the file", result
     reset_for_tests()
     get_settings.cache_clear()
