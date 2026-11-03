@@ -272,3 +272,85 @@ async def test_cancelled_dlq_ack_does_not_commit_the_offset(monkeypatch: pytest.
 
     assert record.value["id"] == poison_id
     assert record.offset == poison.offset
+
+
+async def test_first_alert_with_a_dead_dlq_is_read_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    if not _broker_up(_LIVE_BROKER):
+        pytest.skip(f"no Kafka broker at {_LIVE_BROKER}")
+
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    monkeypatch.setenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
+
+    topic = f"p06-first-{uuid.uuid4().hex[:12]}"
+    group = f"p06-first-{uuid.uuid4().hex[:12]}"
+    poison_id = f"poison-{uuid.uuid4().hex[:8]}"
+    dead_broker = _closed_port()
+    triaged: list[str] = []
+    isolate = {"on": True}
+
+    async def triage(message: dict) -> dict:
+        triaged.append(str(message["id"]))
+        raise RuntimeError("triage unavailable")
+
+    worker = FusedAlertTriageWorker(
+        bootstrap_servers=_LIVE_BROKER,
+        topic=topic,
+        group_id=group,
+        max_attempts=1,
+        entity_concurrency=1,
+    )
+    worker.triage = triage  # type: ignore[method-assign]
+
+    original_start = AIOKafkaConsumer.start
+
+    async def start_and_isolate_dlq(self, *args, **kwargs):
+        await original_start(self, *args, **kwargs)
+        if isolate["on"]:
+            worker._bootstrap = dead_broker
+
+    monkeypatch.setattr(AIOKafkaConsumer, "start", start_and_isolate_dlq)
+
+    task = asyncio.create_task(worker.start())
+    try:
+        await _wait_until(
+            lambda: worker._consumer is not None and bool(worker._consumer.assignment()),
+            30,
+            "consumer was not assigned a partition",
+        )
+        producer = AIOKafkaProducer(
+            bootstrap_servers=_LIVE_BROKER,
+            value_serializer=lambda value: json.dumps(value).encode("utf-8"),
+        )
+        await producer.start()
+        try:
+            poison = await producer.send_and_wait(topic, _alert(poison_id))
+        finally:
+            await producer.stop()
+        await _wait_until(
+            lambda: task.done() or poison_id in triaged,
+            20,
+            f"poison alert was not handled: triaged={triaged}",
+        )
+    finally:
+        isolate["on"] = False
+        await _release(worker, task)
+
+    reader = AIOKafkaConsumer(
+        topic,
+        bootstrap_servers=_LIVE_BROKER,
+        group_id=group,
+        auto_offset_reset="latest",
+        enable_auto_commit=False,
+        value_deserializer=lambda raw: json.loads(raw.decode("utf-8")),
+    )
+    await reader.start()
+    try:
+        tp = TopicPartition(topic, poison.partition)
+        committed = await reader.committed(tp)
+        assert committed == poison.offset, f"committed offset {committed} did not stay on poison offset {poison.offset}"
+        record = await asyncio.wait_for(reader.getone(), timeout=15)
+    finally:
+        await reader.stop()
+
+    assert record.value["id"] == poison_id
+    assert record.offset == poison.offset

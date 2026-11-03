@@ -443,7 +443,7 @@ class FusedAlertTriageWorker:
         self._lanes = EntityLanes(entity_concurrency)
 
     async def start(self) -> None:
-        from aiokafka import AIOKafkaConsumer  # noqa: PLC0415 — optional dep, only at runtime
+        from aiokafka import AIOKafkaConsumer, TopicPartition  # noqa: PLC0415 — optional dep, only at runtime
 
         self._consumer = AIOKafkaConsumer(
             self._topic,
@@ -531,6 +531,15 @@ class FusedAlertTriageWorker:
                         partition=partition,
                         offset=offset,
                     )
+                    # A group with no commit restarts at the log end. Pin this
+                    # offset so the next poll reads the same alert.
+                    if partition is not None and offset is not None and self._consumer is not None:
+                        tp = TopicPartition(msg.topic, partition)
+                        try:
+                            if await self._consumer.committed(tp) is None:
+                                await self._consumer.commit({tp: offset})
+                        except Exception as pin_exc:  # noqa: BLE001 — reprocess on restart
+                            logger.warning("auto_triage_worker.offset_pin_failed", error=str(pin_exc))
                     raise _DlqUnavailable(f"dlq publish failed at offset {offset}")
                 try:
                     await self._consumer.commit()
