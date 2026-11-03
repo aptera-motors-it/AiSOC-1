@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""Escalation paging docs must name the only writer of ``aisoc_cases.acknowledged_at``.
+
+The ack-clock bridge stops paging when that column is set. For a time the
+README and ``bridge.py`` module docstring said the console's acknowledge
+action (and joining a war room) stopped the clock, but no console route writes
+the column — only the war-room channel **acknowledge** decision in
+``services/api/app/services/war_room.py`` does. Operators who believe console
+work stops Teams nagging will leave CRITICAL cases paging until someone clicks
+acknowledge in chat.
+
+This gate keeps the two operator-facing documents aligned with the code path
+and refuses a second runtime writer of the case ack clock.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import shutil
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from gate_toolkit import SELF_TEST_FLAG, repo_root  # noqa: E402
+
+README = Path("services/escalations/README.md")
+BRIDGE = Path("services/escalations/app/bridge.py")
+WAR_ROOM = Path("services/api/app/services/war_room.py")
+
+# Doc must not resurrect these claims (the defect that shipped).
+FORBIDDEN_DOC_PHRASES = (
+    "that is the console",
+    "the console's",
+    "console acknowledge action",
+    "joining the case's war room",
+    "war-room join write",
+)
+
+CASE_ACK_SET = re.compile(
+    r"UPDATE\s+aisoc_cases\s+SET[^;]*acknowledged_at",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+@dataclass(frozen=True)
+class Finding:
+    where: str
+    detail: str
+
+    def render(self) -> str:
+        return f"{self.where}: {self.detail}"
+
+
+def _read(root: Path, rel: Path) -> str:
+    path = root / rel
+    if not path.is_file():
+        return ""
+    return path.read_text(encoding="utf-8")
+
+
+def _normalize_doc(text: str) -> str:
+    return re.sub(r"\*+", "", text.lower())
+
+
+def _doc_section(text: str, heading: str) -> str:
+    """Return the bullet block under a markdown heading, or the whole file."""
+    marker = heading.lower()
+    lines: list[str] = []
+    in_section = False
+    for line in text.splitlines():
+        lower = line.lower()
+        if line.startswith("#") and marker in lower:
+            in_section = True
+            continue
+        if in_section and line.startswith("#"):
+            break
+        if in_section:
+            lines.append(line)
+    return "\n".join(lines) if lines else text
+
+
+def gate_escalation_ack_docs(root: Path) -> list[Finding]:
+    findings: list[Finding] = []
+    readme = _read(root, README)
+    bridge_path = root / BRIDGE
+    bridge_doc = ""
+    if bridge_path.is_file():
+        bridge_doc = bridge_path.read_text(encoding="utf-8").split('"""', 2)[1]
+
+    if not readme:
+        findings.append(Finding(str(README), "missing; operators cannot read what stops paging"))
+    if not bridge_doc:
+        findings.append(Finding(str(BRIDGE), "module docstring missing"))
+
+    for rel, text in ((README, readme), (BRIDGE, bridge_doc)):
+        if not text:
+            continue
+        scope = _doc_section(text, "what stops") if rel == README else text
+        lowered = _normalize_doc(scope)
+        plain = _normalize_doc(text)
+        for phrase in FORBIDDEN_DOC_PHRASES:
+            if phrase in lowered or phrase in plain:
+                findings.append(
+                    Finding(
+                        str(rel),
+                        f"still claims {phrase!r}; only the war-room acknowledge decision writes the ack clock",
+                    )
+                )
+        if "war-room acknowledge" not in lowered and "war-room acknowledge" not in plain:
+            findings.append(
+                Finding(
+                    str(rel),
+                    "does not name the war-room acknowledge decision as the ack-clock writer",
+                )
+            )
+        if "war_room.py" not in text:
+            findings.append(
+                Finding(
+                    str(rel),
+                    "does not point at services/api/app/services/war_room.py as the writer",
+                )
+            )
+
+    writers: list[str] = []
+    for path in (root / "services").rglob("*.py"):
+        rel = path.relative_to(root).as_posix()
+        if "/migrations/" in rel or rel.startswith("services/api/migrations/"):
+            continue
+        body = path.read_text(encoding="utf-8", errors="replace")
+        if CASE_ACK_SET.search(body):
+            writers.append(rel)
+
+    expected = WAR_ROOM.as_posix()
+    if writers != [expected]:
+        findings.append(
+            Finding(
+                "runtime writers",
+                f"expected only {expected}, found {sorted(writers) or 'none'}",
+            )
+        )
+
+    if not (root / WAR_ROOM).is_file():
+        findings.append(Finding(str(WAR_ROOM), "missing; cannot verify the ack-clock writer"))
+
+    channel_block = _read(root, WAR_ROOM)
+    if channel_block and 'decision == "acknowledge"' not in channel_block:
+        findings.append(
+            Finding(
+                str(WAR_ROOM),
+                'no acknowledge decision branch; console-ack must stay a channel decision row',
+            )
+        )
+
+    return findings
+
+
+GOOD_README = """# escalations
+
+- **What stops the clock:** only `aisoc_cases.acknowledged_at` being written —
+  today that is the war-room **acknowledge** decision in
+  `services/api/app/services/war_room.py`.
+"""
+
+GOOD_BRIDGE_DOC = '''"""Ack bridge.
+
+* **"Acknowledged" means `acknowledged_at` was written** — today only the
+  war-room **acknowledge** decision writes it (`war_room.py` stamps it with
+  COALESCE).
+"""
+'''
+
+
+def _write_minimal_tree(dest: Path, *, readme: str, bridge_doc: str, war_room: str) -> None:
+    (dest / README).parent.mkdir(parents=True, exist_ok=True)
+    (dest / README).write_text(readme, encoding="utf-8")
+    bridge = dest / BRIDGE
+    bridge.parent.mkdir(parents=True, exist_ok=True)
+    bridge.write_text(f"{bridge_doc}\nfrom __future__ import annotations\n", encoding="utf-8")
+    war = dest / WAR_ROOM
+    war.parent.mkdir(parents=True, exist_ok=True)
+    war.write_text(war_room, encoding="utf-8")
+
+
+def _self_test() -> int:
+    print(f"{Path(__file__).name} {SELF_TEST_FLAG}\n")
+    ok = True
+
+    good = Path(tempfile.mkdtemp(prefix="esc-ack-good-"))
+    try:
+        _write_minimal_tree(
+            good,
+            readme=GOOD_README,
+            bridge_doc=GOOD_BRIDGE_DOC,
+            war_room='if decision == "acknowledge":\n    "UPDATE aisoc_cases SET acknowledged_at = COALESCE(acknowledged_at, :now)"\n',
+        )
+        passed = not gate_escalation_ack_docs(good)
+        ok &= passed
+        print(f"  {'PASS' if passed else 'FAIL'}  accurate docs pass")
+    finally:
+        shutil.rmtree(good, ignore_errors=True)
+
+    bad = Path(tempfile.mkdtemp(prefix="esc-ack-bad-"))
+    try:
+        stale = GOOD_README.replace(
+            "war-room **acknowledge**",
+            "console's acknowledge action and joining the case's war room",
+        )
+        _write_minimal_tree(
+            bad,
+            readme=stale,
+            bridge_doc=GOOD_BRIDGE_DOC,
+            war_room='if decision == "acknowledge":\n    "UPDATE aisoc_cases SET acknowledged_at = COALESCE(acknowledged_at, :now)"\n',
+        )
+        caught = bool(gate_escalation_ack_docs(bad))
+        ok &= caught
+        print(f"  {'PASS' if caught else 'FAIL'}  stale console-ack claim is refused")
+    finally:
+        shutil.rmtree(bad, ignore_errors=True)
+
+    empty = Path(tempfile.mkdtemp(prefix="esc-ack-empty-"))
+    try:
+        refused = bool(gate_escalation_ack_docs(empty))
+        ok &= refused
+        print(f"  {'PASS' if refused else 'FAIL'}  empty tree is not reported clean")
+    finally:
+        shutil.rmtree(empty, ignore_errors=True)
+
+    print()
+    if not ok:
+        print(f"{Path(__file__).name}: self-test FAILED")
+        return 1
+    print(f"{Path(__file__).name}: self-test OK")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(SELF_TEST_FLAG, action="store_true")
+    args = parser.parse_args()
+    if args.self_test:
+        return _self_test()
+
+    root = repo_root()
+    if not (root / "services" / "escalations").is_dir():
+        print(f"{Path(__file__).name}: escalations service absent — nothing to check.", file=sys.stderr)
+        return 2
+
+    findings = gate_escalation_ack_docs(root)
+    if findings:
+        print("Escalation ack-clock documentation disagrees with the code:\n", file=sys.stderr)
+        for finding in findings:
+            print(f"  - {finding.render()}", file=sys.stderr)
+        return 1
+
+    print("OK — escalation docs name the war-room acknowledge decision as the only case ack-clock writer.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

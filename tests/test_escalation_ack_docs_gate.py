@@ -1,0 +1,67 @@
+"""The escalation ack-clock docs gate must catch the drift that shipped.
+
+F60: README and ``bridge.py`` said console acknowledge stops Teams paging, but
+only the war-room channel acknowledge decision writes ``aisoc_cases.acknowledged_at``.
+A gate that only passes on the real tree after the fix is indistinguishable from
+no gate — these tests pin the comparison on scratch trees too.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+GATE = REPO_ROOT / "scripts" / "check_escalation_ack_docs.py"
+
+
+def _import_gate():
+    spec = importlib.util.spec_from_file_location("_escalation_ack_docs_gate", GATE)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_gate_refuses_the_pinned_sha_claims() -> None:
+    """At base, operator docs still name a console ack path that does not exist."""
+    module = _import_gate()
+    findings = module.gate_escalation_ack_docs(REPO_ROOT)
+    assert findings, "expected stale paging docs at the pinned base"
+    joined = " ".join(f.render() for f in findings)
+    assert "console" in joined.lower() or "joining" in joined.lower()
+
+
+def test_the_live_tree_matches_the_ack_clock_writer() -> None:
+    """After the fix, production docs and code must agree."""
+    module = _import_gate()
+    assert module.gate_escalation_ack_docs(REPO_ROOT) == []
+
+
+def test_self_test_proves_the_gate_is_not_vacuous() -> None:
+    result = subprocess.run(
+        [sys.executable, str(GATE), "--self-test"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_only_war_room_writes_the_case_ack_column() -> None:
+    module = _import_gate()
+    writers: list[str] = []
+    for path in (REPO_ROOT / "services").rglob("*.py"):
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        if "/migrations/" in rel:
+            continue
+        body = path.read_text(encoding="utf-8")
+        if module.CASE_ACK_SET.search(body):
+            writers.append(rel)
+    assert writers == ["services/api/app/services/war_room.py"]
