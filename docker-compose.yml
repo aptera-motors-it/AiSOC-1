@@ -115,7 +115,7 @@ services:
   # ─── Infrastructure ─────────────────────────────────────────────────────────
 
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16.15-alpine
     container_name: aisoc-postgres
     environment:
       # The OWNER / migration role. Superuser, because that is what the
@@ -151,7 +151,7 @@ services:
       retries: 5
 
   redis:
-    image: redis:7-alpine
+    image: redis:7.4.12-alpine
     container_name: aisoc-redis
     command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redis_dev_secret}
     ports:
@@ -231,7 +231,7 @@ services:
   kafka-ui:
     # full profile — Kafka topic browser. A debugging convenience, not a pipeline component.
     profiles: ["full"]
-    image: provectuslabs/kafka-ui:latest
+    image: provectuslabs/kafka-ui:v0.7.2
     container_name: aisoc-kafka-ui
     depends_on:
       kafka:

@@ -5,7 +5,7 @@ Floating tags such as ``postgres:16-alpine``, ``redis:7-alpine``, and
 that pins only the major/minor line (or ``latest``) is not reproducible and
 cannot be reviewed for a known CVE level. The datastore services named in
 ``docker-compose.yml`` are third-party images every operator pulls; they need
-explicit patch pins like the Confluent and ClickHouse lines already use.
+explicit patch pins like the Confluent lines already use.
 """
 
 from __future__ import annotations
