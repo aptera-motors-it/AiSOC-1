@@ -1539,7 +1539,7 @@ def _make_alert(tenant_id: uuid.UUID, when: datetime) -> Alert:
 def _make_case(tenant_id: uuid.UUID, idx: int, when: datetime, alert_ids: list[uuid.UUID]) -> Case:
     severity = _rng.choices(_SEVERITIES, weights=[20, 35, 30, 15])[0]
     status = _rng.choices(
-        ["open", "in_progress", "pending", "resolved", "closed"],
+        ["new", "investigating", "triaged", "resolved", "closed"],
         weights=[30, 35, 10, 15, 10],
     )[0]
     techniques = _pick_techniques(2)
@@ -1612,6 +1612,7 @@ async def _ensure_tenant(session) -> Tenant:
         is_active=True,
         settings={"demo": True, "branding": "AiSOC"},
         limits={"alerts_per_day": 1_000_000},
+        mssp_role="standalone",
     )
     session.add(tenant)
     await session.flush()
@@ -1683,7 +1684,7 @@ def _make_synthetic_case(tenant_id: uuid.UUID, idx: int, when: datetime, alert_i
 
     severity = _rng.choices(_SEVERITIES, weights=[25, 40, 25, 10])[0]
     status = _rng.choices(
-        ["open", "in_progress", "pending", "resolved", "closed"],
+        ["new", "investigating", "triaged", "resolved", "closed"],
         weights=[30, 35, 10, 15, 10],
     )[0]
 
