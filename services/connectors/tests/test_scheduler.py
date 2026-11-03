@@ -961,10 +961,8 @@ class _FakeConnection:
         self.engine = engine
 
     async def execute(self, statement: Any, _params: Any = None) -> _LeaseRow:
-        # One replica in these tests. A per-connector lease acquire wins.
-        # Anything else the scheduler asks the connection is not a lease.
         if "INSERT INTO scheduler_leases" in str(statement):
-            return _LeaseRow((1, datetime.now(UTC)))
+            return _LeaseRow((1, datetime.now(UTC) + timedelta(seconds=300)))
         return _LeaseRow(None)
 
 

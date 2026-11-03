@@ -2,13 +2,6 @@
 
 Why it is needed
 ----------------
-``ConnectorScheduler`` adds one APScheduler job per enabled connector
-instance, in process. Each poll takes a lease scoped to that connector
-for the poll window, so a second replica does not fetch. This election
-is the outer one: when it is on, only one replica schedules at all.
-It stays off by default, because a single replica has nothing to elect
-and a failed election must not stop that replica from polling.
-
 On a rate-limited vendor API a second fetch is worse than duplication,
 because the second replica's poll is what gets throttled and a throttled
 connector looks identical to one whose credentials have expired.
@@ -45,6 +38,7 @@ import contextlib
 import logging
 import os
 import socket
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -110,6 +104,10 @@ def lease_seconds() -> float:
 
 def renew_interval(lease: float) -> float:
     return lease * RENEW_FRACTION
+
+
+def unique_holder_identity() -> str:
+    return f"{holder_identity()}:{uuid.uuid4().hex[:12]}"
 
 
 def holder_identity() -> str:
@@ -226,6 +224,19 @@ class LeaderLease:
         if row is None:
             self._held = False
             return False
+        expires = row[1]
+        if isinstance(expires, datetime):
+            if expires.tzinfo is None:
+                expires = expires.replace(tzinfo=UTC)
+            if expires <= datetime.now(UTC):
+                self._held = False
+                logger.info(
+                    "scheduler.lease.expired_on_acquire scope=%s holder=%s expires=%s",
+                    self._scope,
+                    self._holder,
+                    expires,
+                )
+                return False
         self._term = int(row[0])
         self._held = True
         logger.info(

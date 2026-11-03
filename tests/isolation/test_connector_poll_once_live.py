@@ -1,14 +1,3 @@
-"""One replica fetches a connector per window, against real Postgres.
-
-Election is off, which is the default. Both schedulers still load the
-poll job. A local stub vendor counts ``fetch_alerts``. The second
-scheduler's poll in the same window must not reach the vendor. Once
-the holder has stopped, that second poll must reach the vendor.
-
-Skips when neither ``ISOLATION_CONNECTOR_DSN`` nor ``ISOLATION_LEASE_DSN``
-is set. The workflow that owns this suite sets one of them.
-"""
-
 from __future__ import annotations
 
 import asyncio

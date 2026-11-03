@@ -72,7 +72,7 @@ from app.db.connector_repo import (
 )
 from app.db.engine import get_engine
 from app.ingest_client import IngestClient, IngestClientError
-from app.leader_lease import LeaderLease, election_enabled, holder_identity
+from app.leader_lease import LeaderLease, election_enabled, unique_holder_identity
 from app.pipeline import (
     apply_filter_rules,
     compute_fingerprint,
@@ -177,9 +177,7 @@ class ConnectorScheduler:
         # None when leader election is off, which is the default and
         # means this replica always schedules.
         self._lease: LeaderLease | None = None
-        # release() matches this string. Two schedulers in one process share
-        # a hostname, and one stop must not expire the other's row.
-        self._holder = f"{holder_identity()}:{uuid.uuid4().hex[:12]}"
+        self._holder = unique_holder_identity()
         self._poll_claims: dict[str, datetime] = {}
         self._connector_leases: dict[str, LeaderLease] = {}
         # Cache of {connector_id_str: last_seen_config_signature} so reloads
@@ -221,10 +219,6 @@ class ConnectorScheduler:
                 logger.error("connector.scheduler.vault_unavailable: %s", exc)
                 raise
 
-        # Election chooses which replica schedules. Off by default: a
-        # single replica has nothing to elect, and a failed election must
-        # not stop it from polling. Overlap is stopped per connector in
-        # the poll, whether or not this flag is on.
         if election_enabled():
             self._lease = LeaderLease(self._engine)
             if not await self._lease.acquire():
@@ -316,12 +310,6 @@ class ConnectorScheduler:
         return self._lease is None or self._lease.held
 
     async def _claim_connector_poll(self, connector_id: uuid.UUID, window_seconds: float, *, backfill: bool) -> bool:
-        """Whether this replica may fetch the connector during this window.
-
-        The lease is taken even when leader election is off. Election
-        chooses who schedules; the lease chooses who fetches. A backfill
-        from the replica that already holds the window may fetch again.
-        """
         key = str(connector_id)
         now = datetime.now(UTC)
         held_until = self._poll_claims.get(key)
@@ -384,12 +372,6 @@ class ConnectorScheduler:
         logger.info("connector.scheduler.stopped")
 
     async def _release_connector_leases(self) -> None:
-        """Expire the connector leases this scheduler holds.
-
-        A stopped process does not poll. Leaving the row until the window
-        ends keeps the survivor from fetching, including the single replica
-        that just restarted.
-        """
         leases = list(self._connector_leases.values())
         self._connector_leases.clear()
         self._poll_claims.clear()
