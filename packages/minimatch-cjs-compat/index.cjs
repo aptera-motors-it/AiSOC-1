@@ -30,21 +30,23 @@ function transformSetRow(row) {
   });
 }
 
-function CompatMinimatch(pattern, options) {
-  if (!(this instanceof CompatMinimatch)) {
-    return new CompatMinimatch(pattern, options);
+class CompatMinimatch extends impl.Minimatch {
+  constructor(pattern, options) {
+    super(pattern, options);
+    this._nativeSet = this.set;
+    this.set = this._nativeSet.map(transformSetRow);
   }
-  const inner = new impl.Minimatch(pattern, options);
-  this._inner = inner;
-  this.options = inner.options;
-  this.negate = inner.negate;
-  this.globSet = inner.globSet;
-  this.set = inner.set.map(transformSetRow);
-}
 
-CompatMinimatch.prototype.match = function match(target, partial) {
-  return this._inner.match(target, partial);
-};
+  match(target, partial) {
+    const globSet = this.set;
+    this.set = this._nativeSet;
+    try {
+      return super.match(target, partial);
+    } finally {
+      this.set = globSet;
+    }
+  }
+}
 
 function minimatch(target, pattern, options) {
   return impl.minimatch(target, pattern, options);
