@@ -1715,6 +1715,15 @@ jobs:
       # exclusion of a directory another workflow runs, not a list of files —
       # and check_test_discovery.py fails the build if isolation.yml ever
       # stops reaching it, so the exclusion cannot quietly become a hole.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26'
+      - name: Install Go supply-chain scanners for gate tests
+        run: |
+          set -euo pipefail
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install github.com/google/osv-scanner/v2/cmd/osv-scanner@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: Run the repository's own gate suites (tests/ + scripts/tests/)
         run: python3 -m pytest tests/ scripts/tests/ --ignore=tests/isolation -v --tb=short -rs
 
