@@ -95,10 +95,6 @@ func (h *Handler) RegisterSubscription(name string, probe func() SubscriptionSta
 
 // SetGraphWriter wires in the graph projection writer. nil disables graph
 // fan-out — the rest of the pipeline behaves identically.
-//
-// The fan-out is intentional: the graph writer runs concurrently with the
-// fusion publish, and a failure / queue-full in the graph writer must NOT
-// block the fusion path (T1.1 acceptance criterion).
 func (h *Handler) SetGraphWriter(g GraphWriter) {
 	h.graph = g
 }
@@ -228,10 +224,12 @@ func (h *Handler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(normalized) > 0 {
-		// Fan-out graph writer (T1.1, v8.0). Runs concurrently with fusion
-		// publish. A failure in WriteEvent never propagates here — the
-		// writer drops the event onto an internal queue with backpressure
-		// handled by drop-and-metric, so this loop is non-blocking.
+		if err := h.pub.PublishBatch(r.Context(), normalized); err != nil {
+			log.Error().Err(err).Str("tenant_id", tenantID).Msg("Failed to publish batch")
+			writeError(w, http.StatusInternalServerError, "failed to publish events")
+			return
+		}
+
 		if h.graph != nil {
 			for _, ev := range normalized {
 				gev := graph.ExtractFromOCSF(ev.ID, ev.TenantID, req.ConnectorType, ev.OcsfEvent)
@@ -249,12 +247,6 @@ func (h *Handler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 				// shutdown. We deliberately don't wait on it.
 				_ = h.graph.WriteEvent(r.Context(), gev)
 			}
-		}
-
-		if err := h.pub.PublishBatch(r.Context(), normalized); err != nil {
-			log.Error().Err(err).Str("tenant_id", tenantID).Msg("Failed to publish batch")
-			writeError(w, http.StatusInternalServerError, "failed to publish events")
-			return
 		}
 	}
 
