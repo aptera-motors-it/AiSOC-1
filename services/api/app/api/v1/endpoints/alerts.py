@@ -13,7 +13,7 @@ from sqlalchemy import and_, func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.api.v1.deps import AuthUser, DBSession, require_permission
-from app.db.rls import TenantDBSession
+from app.db.rls import TenantDBSession, set_rls_context
 from app.models.alert import Alert
 from app.services.alert_bulk_close import (
     DEFAULT_MAX_COUNT,
@@ -44,6 +44,7 @@ from app.services.event_sanitiser import (
 )
 from app.services.narrative_loader import build_narrative
 from app.services.narrative_projection import project_alert_to_narrative_inputs
+from app.services.outbound_webhooks import enqueue_event
 from app.services.timestamp_bounds import coerce_with_bounds, now_utc
 
 logger = logging.getLogger(__name__)
@@ -1109,6 +1110,7 @@ async def update_alert(
     if alert is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Alert not found")
 
+    previous_status = alert.status
     updates: dict = {}
     if request.status is not None:
         updates["status"] = request.status
@@ -1166,6 +1168,18 @@ async def update_alert(
             changes=changes,
             request=http_request,
         )
+        if request.status is not None and request.status != previous_status:
+            await set_rls_context(db, current_user.tenant_id)
+            await enqueue_event(
+                db,
+                tenant_id=current_user.tenant_id,
+                event_type="alert.status_changed",
+                payload={
+                    "alert_id": str(alert_id),
+                    "from_status": previous_status,
+                    "to_status": request.status,
+                },
+            )
         await db.commit()
         await db.refresh(alert)
 

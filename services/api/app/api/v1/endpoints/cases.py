@@ -50,6 +50,7 @@ from sqlalchemy import select, text
 
 from app.api.v1.deps import AuthUser, DBSession, require_permission
 from app.core.logging import safe_log_value
+from app.db.rls import set_rls_context
 from app.models.investigation import (
     InvestigationArtifact,
     InvestigationEvent,
@@ -67,6 +68,7 @@ from app.services.case_postmortem import build_case_postmortem
 from app.services.case_postmortem_html import render_case_postmortem_html
 from app.services.case_summary import build_case_summary
 from app.services.case_summary_html import render_case_summary_html
+from app.services.outbound_webhooks import enqueue_event
 from app.services.semantic_memory import remember_closed_case
 
 logger = logging.getLogger(__name__)
@@ -849,6 +851,18 @@ async def update_case(
                 action="case_closed" if body.status == "closed" else "status_changed",
                 item=body.status,
                 detail={"to": body.status},
+            )
+        if body.status and body.status != existing.status:
+            await set_rls_context(db, user.tenant_id)
+            await enqueue_event(
+                db,
+                tenant_id=user.tenant_id,
+                event_type="case.status_changed",
+                payload={
+                    "case_id": str(cid),
+                    "from_status": existing.status,
+                    "to_status": body.status,
+                },
             )
         await db.commit()
     except Exception as exc:
