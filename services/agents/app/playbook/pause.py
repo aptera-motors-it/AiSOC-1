@@ -414,6 +414,35 @@ async def due_waits(*, now: datetime | None = None, limit: int = 50) -> list[Pau
     return [_row_to_pause(row) for row in rows]
 
 
+async def find_due_wait(*, run_id: str, tenant_id: str) -> Pause | None:
+    """This run's timer wait, if it is waiting and has come due."""
+    pool = await _pool()
+    if pool is None:
+        return None
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"""
+                SELECT {_PAUSE_COLUMNS}
+                  FROM aisoc_playbook_pauses
+                 WHERE run_id = $1
+                   AND tenant_id = $2::uuid
+                   AND status = 'waiting'
+                   AND kind = 'wait'
+                   AND resume_at IS NOT NULL
+                   AND resume_at <= $3
+                 LIMIT 1
+                """,
+                run_id,
+                tenant_id,
+                datetime.now(UTC),
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("playbook_pause: due-wait lookup failed for run %s: %s", run_id, exc)
+        return None
+    return _row_to_pause(row) if row is not None else None
+
+
 async def find_verification_by_token(*, resume_token: str) -> Pause | None:
     """The verification waiting on this token, if any.
 

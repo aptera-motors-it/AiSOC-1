@@ -151,7 +151,7 @@ async def run_for_alert(state: Any) -> TriggerOutcome:
 
     try:
         from app.playbook import pause as playbook_pause
-        from app.playbook.engine import PlaybookEngine
+        from app.playbook.engine import PlaybookEngine, resume_due_wait
         from app.playbook.store import PlaybookStore
 
         store = PlaybookStore.default()
@@ -172,7 +172,20 @@ async def run_for_alert(state: Any) -> TriggerOutcome:
         live = is_live(tenant_id=tenant_id, playbook_id=playbook.id)
         run_id = str(uuid.uuid5(_RUN_NAMESPACE, f"{tenant_id}:{alert_row_id}:{playbook.id}")) if live and alert_row_id else None
         pause_status = await playbook_pause.run_status(run_id=run_id, tenant_id=tenant_id) if run_id else None
-        if pause_status is not None:
+        try:
+            if run_id and pause_status == "waiting":
+                run = await resume_due_wait(run_id=run_id, tenant_id=tenant_id)
+            elif pause_status is not None:
+                run = None
+            elif run_id:
+                run = await engine.run(playbook, context, dry_run=False, resume_run_id=run_id)
+            else:
+                run = await engine.run(playbook, context, dry_run=not live)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("alert_playbooks.run_failed", playbook_id=playbook.id, error=str(exc))
+            outcome.previewed.append({"playbook_id": playbook.id, "error": str(exc)})
+            continue
+        if run is None:
             outcome.executed.append(
                 {
                     "playbook_id": playbook.id,
@@ -183,15 +196,6 @@ async def run_for_alert(state: Any) -> TriggerOutcome:
                 }
             )
             logger.info("alert_playbooks.already_started", playbook_id=playbook.id, run_id=run_id, pause_status=pause_status)
-            continue
-        try:
-            if run_id:
-                run = await engine.run(playbook, context, dry_run=False, resume_run_id=run_id)
-            else:
-                run = await engine.run(playbook, context, dry_run=not live)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("alert_playbooks.run_failed", playbook_id=playbook.id, error=str(exc))
-            outcome.previewed.append({"playbook_id": playbook.id, "error": str(exc)})
             continue
 
         record = {

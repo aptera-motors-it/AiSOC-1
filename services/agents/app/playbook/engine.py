@@ -1247,6 +1247,19 @@ async def resume_due_waits(*, now: Any = None, limit: int = 50) -> list[str]:
     return resumed
 
 
+async def resume_due_wait(*, run_id: str, tenant_id: str) -> PlaybookRun | None:
+    """Continue this run if it is waiting on a timer that has come due.
+
+    Only a due wait. A run resumes one past the step it paused on, so
+    resuming an approval or a verification here would run the gated step
+    with no decision; those keep waiting for the resumer that has one.
+    """
+    pause = await playbook_pause.find_due_wait(run_id=run_id, tenant_id=tenant_id)
+    if pause is None:
+        return None
+    return await _resume_pause(pause, resolution="resumed on a redelivery of its alert")
+
+
 async def _resume_pause(pause: Any, *, resolution: str, extra_context: dict[str, Any] | None = None) -> PlaybookRun | None:
     """Claim a pause and continue its run. Shared by every resumer.
 

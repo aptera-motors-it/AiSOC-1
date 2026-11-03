@@ -145,6 +145,78 @@ jobs:
           ISOLATION_KAFKA_BROKERS: 127.0.0.1:9092
         run: python -m pytest ../../tests/isolation/test_alert_playbook_redelivery_live.py -v --tb=short
 
+      # The negative control, and it re-injects each part of the fix.
+      #
+      # Each edit puts one line back the way it shipped and requires the
+      # exact tests that guard it to fail, and no others. An exit code alone
+      # would also accept a broker that went away or a suite that no longer
+      # collects. A missing needle fails the step rather than editing nothing.
+      - name: The gate fails when a redelivered alert starts its run again
+        working-directory: services/agents
+        env:
+          ISOLATION_PLAYBOOK_DSN: ${{ env.PLAYBOOK_DSN }}
+          ISOLATION_KAFKA_BROKERS: 127.0.0.1:9092
+        run: |
+          set -euo pipefail
+          SUITE=../../tests/isolation/test_alert_playbook_redelivery_live.py
+          python - "$SUITE" <<'PY'
+          import pathlib, re, subprocess, sys
+
+          suite = sys.argv[1]
+          approval = "test_a_redelivered_alert_does_not_start_its_playbook_again"
+          wait = "test_a_redelivered_alert_resumes_its_run_once_the_wait_is_due"
+          reverts = [
+              (
+                  "a fresh run id on every delivery",
+                  "app/playbook/alert_trigger.py",
+                  'run_id = str(uuid.uuid5(_RUN_NAMESPACE, f"{tenant_id}:{alert_row_id}:{playbook.id}")) if live and alert_row_id else None',
+                  "run_id = None",
+                  {approval, wait},
+              ),
+              (
+                  "a run id set after the trigger context is built",
+                  "app/playbook/engine.py",
+                  "pr = PlaybookRun(playbook, trigger_context, run_id=resume_run_id)",
+                  "pr = PlaybookRun(playbook, trigger_context)\n        if resume_run_id:\n            pr.run_id = resume_run_id",
+                  {approval},
+              ),
+              (
+                  "no lookup of the run the alert already started",
+                  "app/playbook/alert_trigger.py",
+                  "pause_status = await playbook_pause.run_status(run_id=run_id, tenant_id=tenant_id) if run_id else None",
+                  "pause_status = None",
+                  {approval, wait},
+              ),
+              (
+                  "a waiting run skipped instead of resumed",
+                  "app/playbook/alert_trigger.py",
+                  "run = await resume_due_wait(run_id=run_id, tenant_id=tenant_id)",
+                  "run = None",
+                  {wait},
+              ),
+          ]
+          for name, path, needle, replacement, expected in reverts:
+              target = pathlib.Path(path)
+              original = target.read_text()
+              if original.count(needle) != 1:
+                  sys.exit(f"FAIL: {name}: the line this control reverts is not in {path}, so it proves nothing.")
+              target.write_text(original.replace(needle, replacement, 1))
+              try:
+                  result = subprocess.run(
+                      [sys.executable, "-m", "pytest", suite, "-q", "-rf", "-p", "no:cacheprovider"],
+                      capture_output=True,
+                      text=True,
+                  )
+              finally:
+                  target.write_text(original)
+              failed = set(re.findall(r"^FAILED \S+::(\w+)", result.stdout, re.MULTILINE))
+              if result.returncode != 1 or failed != expected:
+                  print(result.stdout[-4000:])
+                  sys.exit(f"FAIL: {name}: exit {result.returncode}, failed {sorted(failed)}, expected {sorted(expected)}.")
+              print(f"OK: {name} fails {sorted(failed)}, as it must.")
+          PY
+          python -m pytest "$SUITE" -q
+
       # The Investigation Ledger, the surface an auditor reads. Its
       # offline test drives a `_FakeConn` and opens no connection, so it
       # cannot prove the rows exist, that RLS applies, or that the

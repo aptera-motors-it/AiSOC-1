@@ -4,13 +4,15 @@ The triage worker commits a fused alert's offset only after triage, so a
 replica that dies before committing hands the record to the next replica,
 whose dedup cache is empty. That delivery reaches the playbook trigger
 again, and must not enrich again or put a second approval in front of the
-analyst for one alert.
+analyst for one alert. A run waiting on an approval keeps waiting for its
+decision; a run whose timer wait has come due continues at the next step.
 
 The real worker reads a real topic and triages through its production sinks
 on Postgres. The stand-ins are an HTTP receiver at the enrichment, realtime
 and API addresses, which answers and counts what reached it; deterministic
-triage in place of a model, with graph escalation off; and a playbook store
-in a temporary directory that holds the test playbook.
+triage in place of a model, with graph escalation off; a playbook store in a
+temporary directory that holds the test playbooks; and a `resume_at` moved
+into the past in place of waiting out the timer.
 """
 
 from __future__ import annotations
@@ -41,12 +43,17 @@ pytestmark = [
 # offline job collects this module without the agents service on its path.
 
 _WAIT_SECONDS = 60.0
+_SOURCE_IP = "203.0.113.45"
+#: What the step after each playbook's pause enriches, so a request from that
+#: step cannot be mistaken for the first step's.
+_BEHIND_THE_PAUSE = "198.51.100.7"
 
 
 class _Receiver(ThreadingHTTPServer):
     def __init__(self) -> None:
         super().__init__(("127.0.0.1", 0), _Handler)
         self.calls: list[str] = []
+        self.enriched: list[str] = []
 
     @property
     def url(self) -> str:
@@ -57,8 +64,10 @@ class _Handler(BaseHTTPRequestHandler):
     server: _Receiver
 
     def do_POST(self) -> None:  # noqa: N802 - http.server's name
-        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        request = self.rfile.read(int(self.headers.get("Content-Length") or 0))
         self.server.calls.append(self.path)
+        if self.path == "/enrich":
+            self.server.enriched.append(json.loads(request)["value"])
         body = {"id": str(uuid.uuid4())} if self.path == "/api/v1/approvals" else {}
         payload = json.dumps(body).encode()
         self.send_response(200)
@@ -125,20 +134,34 @@ async def live_service(monkeypatch, tmp_path, receiver, tenant):  # noqa: ANN001
 
     (tmp_path / "pack").mkdir()
     store = PlaybookStore(store_dir=tmp_path / "store", pack_root=tmp_path / "pack")
-    playbook = store.create(
+    after_pause = PlaybookStep(id="recheck", name="Enrich the next hop", type=StepType.ENRICH, params={"ioc": _BEHIND_THE_PAUSE})
+    approval = store.create(
         Playbook(
             name="Enrich, then contain with sign-off",
             trigger={"on": "alert", "severity": ["high"]},
             steps=[
                 PlaybookStep(id="enrich", name="Enrich the source address", type=StepType.ENRICH),
                 PlaybookStep(id="gate", name="Analyst approves containment", type=StepType.APPROVAL),
+                after_pause,
+            ],
+        ),
+        tenant_id=tenant,
+    )
+    wait = store.create(
+        Playbook(
+            name="Enrich, then check again in ten minutes",
+            trigger={"on": "alert", "severity": ["critical"]},
+            steps=[
+                PlaybookStep(id="enrich", name="Enrich the source address", type=StepType.ENRICH),
+                PlaybookStep(id="hold", name="Give the beacon time to recur", type=StepType.WAIT, params={"seconds": 600}),
+                after_pause,
             ],
         ),
         tenant_id=tenant,
     )
     monkeypatch.setattr(PlaybookStore, "_instance", store)
     monkeypatch.setenv("AISOC_ALERT_PLAYBOOKS_ENABLED", "1")
-    monkeypatch.setenv("AISOC_ALERT_PLAYBOOKS_LIVE", f"{tenant}:{playbook.id}")
+    monkeypatch.setenv("AISOC_ALERT_PLAYBOOKS_LIVE", f"{tenant}:{approval.id},{tenant}:{wait.id}")
 
     cost_governor.reset_governor()
     yield
@@ -147,7 +170,7 @@ async def live_service(monkeypatch, tmp_path, receiver, tenant):  # noqa: ANN001
     await institutional.close_pool()
 
 
-def _fused_alert(tenant: str) -> dict:
+def _fused_alert(tenant: str, severity: str) -> dict:
     alert_id = str(uuid.uuid4())
     return {
         "id": alert_id,
@@ -161,8 +184,8 @@ def _fused_alert(tenant: str) -> dict:
             "tenant_id": tenant,
             "title": "Outbound beacon to a known C2 address",
             "rule_id": "redelivery-live",
-            "severity": "high",
-            "src_ip": "203.0.113.45",
+            "severity": severity,
+            "src_ip": _SOURCE_IP,
             "hostname": "WIN-FIN-02",
         },
     }
@@ -220,24 +243,22 @@ async def _consume_once(brokers: str, group: str, topic: str, partition: int, of
         await worker.stop()
 
 
-async def _pauses(tenant: str) -> list[tuple[str, str | None]]:
+async def _pauses(tenant: str) -> list[dict]:
     import asyncpg
 
     conn = await asyncpg.connect(os.environ["ISOLATION_PLAYBOOK_DSN"].strip())
     try:
         rows = await conn.fetch(
-            "SELECT run_id, run_context->>'_run_id' AS context_run_id FROM aisoc_playbook_pauses WHERE tenant_id = $1::uuid",
+            "SELECT run_id, run_context->>'_run_id' AS context_run_id, kind, status FROM aisoc_playbook_pauses WHERE tenant_id = $1::uuid",
             tenant,
         )
     finally:
         await conn.close()
-    return [(row["run_id"], row["context_run_id"]) for row in rows]
+    return [dict(row) for row in rows]
 
 
-async def test_a_redelivered_alert_does_not_start_its_playbook_again(live_service, receiver, tenant) -> None:  # noqa: ANN001
+async def _deliver(tenant: str, severity: str) -> tuple[str, str, str, int, int]:
     from aiokafka import AIOKafkaProducer
-    from app.core import cost_governor
-    from app.workers.fused_alert_consumer import FusedAlertTriageWorker
 
     brokers = os.environ["ISOLATION_KAFKA_BROKERS"].strip()
     topic = f"aisoc.alerts.fused.redelivery.{uuid.uuid4().hex[:8]}"
@@ -246,29 +267,24 @@ async def test_a_redelivered_alert_does_not_start_its_playbook_again(live_servic
     producer = AIOKafkaProducer(bootstrap_servers=brokers)
     await producer.start()
     try:
-        record = await producer.send_and_wait(topic, json.dumps(_fused_alert(tenant)).encode())
+        record = await producer.send_and_wait(topic, json.dumps(_fused_alert(tenant, severity)).encode())
     finally:
         await producer.stop()
     await _set_committed(brokers, group, topic, record.partition, record.offset)
-
     await _consume_once(brokers, group, topic, record.partition, record.offset)
+    return brokers, group, topic, record.partition, record.offset
 
-    # The first delivery has to have run the playbook to its approval, or
-    # the assertions after the redelivery hold for a run that never started.
-    assert receiver.calls.count("/enrich") == 1, receiver.calls
-    assert receiver.calls.count("/api/v1/approvals") == 1, receiver.calls
-    pauses = await _pauses(tenant)
-    assert len(pauses) == 1
-    ((run_id, context_run_id),) = pauses
-    assert context_run_id == run_id, "the run's context names a different run than the one that paused"
 
-    # The crash: the commit never reached the broker, and the replica that
-    # picks the partition up is a new process with nothing cached.
-    await _set_committed(brokers, group, topic, record.partition, record.offset)
+async def _crash_and_redeliver(brokers: str, group: str, topic: str, partition: int, offset: int) -> None:
+    """The commit never reached the broker, and the next replica has nothing cached."""
+    from app.core import cost_governor
+    from app.workers.fused_alert_consumer import FusedAlertTriageWorker
+
+    await _set_committed(brokers, group, topic, partition, offset)
     cost_governor.reset_governor()
     before = FusedAlertTriageWorker.get_metrics()
 
-    await _consume_once(brokers, group, topic, record.partition, record.offset)
+    await _consume_once(brokers, group, topic, partition, offset)
 
     after = FusedAlertTriageWorker.get_metrics()
     delta = {key: after[key] - before[key] for key in ("triaged", "deduplicated", "outcome_suppressed", "shadow_triaged")}
@@ -276,6 +292,59 @@ async def test_a_redelivered_alert_does_not_start_its_playbook_again(live_servic
         f"the redelivered alert did not reach the playbook trigger, so this test proves nothing: {delta}"
     )
 
-    assert receiver.calls.count("/enrich") == 1, f"the redelivery enriched the indicator again: {receiver.calls}"
+
+async def test_a_redelivered_alert_does_not_start_its_playbook_again(live_service, receiver, tenant) -> None:  # noqa: ANN001
+    delivery = await _deliver(tenant, "high")
+
+    # The first delivery has to have run the playbook to its approval, or
+    # the assertions after the redelivery hold for a run that never started.
+    assert receiver.enriched == [_SOURCE_IP], receiver.calls
+    assert receiver.calls.count("/api/v1/approvals") == 1, receiver.calls
+    pauses = await _pauses(tenant)
+    assert len(pauses) == 1
+    (pause,) = pauses
+    assert pause["context_run_id"] == pause["run_id"], "the run's context names a different run than the one that paused"
+
+    await _crash_and_redeliver(*delivery)
+
+    assert _BEHIND_THE_PAUSE not in receiver.enriched, "the redelivery ran the step behind the approval with no decision"
+    assert receiver.enriched == [_SOURCE_IP], f"the redelivery enriched the indicator again: {receiver.calls}"
     assert receiver.calls.count("/api/v1/approvals") == 1, f"the redelivery asked for a second approval: {receiver.calls}"
-    assert len(await _pauses(tenant)) == 1, "the redelivery started a second run of the same playbook for the same alert"
+    pauses = await _pauses(tenant)
+    assert len(pauses) == 1, "the redelivery started a second run of the same playbook for the same alert"
+    assert pauses[0]["status"] == "waiting", "the approval stopped waiting for its decision"
+
+
+async def test_a_redelivered_alert_resumes_its_run_once_the_wait_is_due(live_service, receiver, tenant) -> None:  # noqa: ANN001
+    import asyncpg
+
+    delivery = await _deliver(tenant, "critical")
+
+    assert receiver.enriched == [_SOURCE_IP], receiver.calls
+    (pause,) = await _pauses(tenant)
+    assert (pause["kind"], pause["status"]) == ("wait", "waiting")
+
+    # Nothing sweeps due waits in this process, so the redelivery is the only
+    # thing that can resume the run.
+    conn = await asyncpg.connect(os.environ["ISOLATION_PLAYBOOK_DSN"].strip())
+    try:
+        await conn.execute(
+            "UPDATE aisoc_playbook_pauses SET resume_at = NOW() - interval '1 second' WHERE run_id = $1",
+            pause["run_id"],
+        )
+    finally:
+        await conn.close()
+
+    await _crash_and_redeliver(*delivery)
+
+    assert receiver.enriched == [_SOURCE_IP, _BEHIND_THE_PAUSE], (
+        f"the redelivery did not resume the run at the step after its due wait: {receiver.enriched}"
+    )
+    pauses = await _pauses(tenant)
+    assert len(pauses) == 1, "the redelivery started a second run instead of resuming the first"
+    assert pauses[0]["status"] == "resumed"
+
+    await _crash_and_redeliver(*delivery)
+
+    assert receiver.enriched == [_SOURCE_IP, _BEHIND_THE_PAUSE], f"a delivery after the resume ran the playbook again: {receiver.enriched}"
+    assert len(await _pauses(tenant)) == 1
