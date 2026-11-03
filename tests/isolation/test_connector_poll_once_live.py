@@ -2,7 +2,8 @@
 
 Election is off, which is the default. Both schedulers still load the
 poll job. A local stub vendor counts ``fetch_alerts``. The second
-scheduler's poll in the same window must not reach the vendor.
+scheduler's poll in the same window must not reach the vendor. Once
+the holder has stopped, that second poll must reach the vendor.
 
 Skips when neither ``ISOLATION_CONNECTOR_DSN`` nor ``ISOLATION_LEASE_DSN``
 is set. The workflow that owns this suite sets one of them.
@@ -60,7 +61,7 @@ def _ingest_url() -> tuple[HTTPServer, str]:
     return server, f"http://127.0.0.1:{server.server_port}"
 
 
-def _stub_vendor() -> type:
+def _stub_vendor():
     from app.connectors.base import BaseConnector, ConnectorSchema
 
     class StubVendor(BaseConnector):
@@ -122,7 +123,7 @@ async def _drop(engine: Any, connector_id: uuid.UUID) -> None:
         )
 
 
-async def _run() -> tuple[list[bool], int, int]:
+async def _run() -> tuple[list[bool], int, int, int]:
     from app.connectors import CONNECTOR_REGISTRY
     from app.ingest_client import IngestClient
     from app.scheduler import ConnectorScheduler, _job_id
@@ -160,7 +161,10 @@ async def _run() -> tuple[list[bool], int, int]:
                 {"s": f"connector-poll:{connector_id}"},
             )
         await schedulers[0]._poll_one(connector_id=connector_id)
-        return jobs, in_window, len(vendor.fetches) - in_window
+        fetched_before_stop = len(vendor.fetches)
+        await schedulers[0].stop()
+        await schedulers[1]._poll_one(connector_id=connector_id)
+        return jobs, in_window, fetched_before_stop - in_window, len(vendor.fetches) - fetched_before_stop
     finally:
         for scheduler in schedulers:
             await scheduler.stop()
@@ -171,7 +175,8 @@ async def _run() -> tuple[list[bool], int, int]:
 
 
 def test_two_schedulers_fetch_the_stub_vendor_once_per_window() -> None:
-    jobs, in_window, after_expiry = asyncio.run(_run())
+    jobs, in_window, after_expiry, after_stop = asyncio.run(_run())
     assert jobs == [True, True], jobs
     assert in_window == 1, in_window
     assert after_expiry == 1, after_expiry
+    assert after_stop == 1, after_stop
