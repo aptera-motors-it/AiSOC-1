@@ -225,11 +225,10 @@ class UEBAKafkaConsumer:
                     try:
                         current = await consumer.committed(tp)
                     except lost:
-                        continue
+                        break
                     pinned.add(tp)
                     if current is None and not await commit_position(tp, msg.offset):
-                        pinned.discard(tp)
-                        continue
+                        break
                 try:
                     await self._process_message(msg.value, producer)
                 except Exception as exc:  # noqa: BLE001
