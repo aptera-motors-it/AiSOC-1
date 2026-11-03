@@ -53,6 +53,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from app.services.builtin_rules import uuid_for
 from app.services.rule_tuning import (
     ACTIONABLE_SUGGESTIONS,
     TUNING_FP_RATE_BUMPABLE,
@@ -73,6 +74,7 @@ from app.services.rule_tuning import (
     set_auto_tune,
 )
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -582,6 +584,33 @@ class TestApplyTuning:
         )
 
         assert rule.threshold_config["event_threshold"] == 2
+
+    @pytest.mark.asyncio
+    async def test_raise_threshold_uses_the_compiled_severity(self) -> None:
+        actor = _auth_user()
+        rule = _StubRule(
+            rule_id=uuid_for("det-application-001", actor.tenant_id),
+            tenant_id=actor.tenant_id,
+            severity="medium",
+            threshold_config={},
+        )
+        db = _setup_mutator_db(rule)
+
+        await apply_tuning(
+            db,
+            rule_id=rule.id,
+            actor=actor,
+            body=ApplyTuningRequest(action="raise_threshold"),
+        )
+
+        assert rule.threshold_config["min_severity"] == "critical"
+        assert rule.threshold_config["event_threshold"] == 2
+
+    def test_apply_request_rejects_a_nul(self) -> None:
+        with pytest.raises(ValidationError):
+            ApplyTuningRequest(action="add_suppression", suppression_reason="nightly\x00rename")
+        with pytest.raises(ValidationError):
+            ApplyTuningRequest(action="add_suppression", suppress_when={"host": ["WIN\x00FS01"]})
 
     @pytest.mark.asyncio
     async def test_add_suppression_appends_placeholder(self) -> None:

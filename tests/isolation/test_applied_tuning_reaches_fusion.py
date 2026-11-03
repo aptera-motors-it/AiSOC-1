@@ -302,3 +302,18 @@ async def test_concurrent_suppressions_both_reach_fusion(app_client: httpx.Async
     assert decision["hits"] == 0, {"decision": decision, "stored": stored}
     assert decision["second_hits"] == 0, {"decision": decision, "stored": stored}
     assert decision["other_hits"] == 1, {"decision": decision, "stored": stored}
+
+
+async def test_nul_in_the_apply_body_is_rejected(app_client: httpx.AsyncClient, db: AsyncSession) -> None:
+    tenant_id, rule_id, source, user = await _tenant_and_rule(db)
+    before = _fusion(str(tenant_id), source)
+    headers = await _bearer(app_client, user["email"])
+    response = await app_client.post(
+        f"/api/v1/detection/tuning/{rule_id}/apply",
+        json={"action": "add_suppression", "suppression_reason": "nightly\u0000rename"},
+        headers=headers,
+    )
+    assert response.status_code == 422, response.text
+    after = _fusion(str(tenant_id), source)
+    assert before["hits"] == 1, before
+    assert after["hits"] == 1, after
