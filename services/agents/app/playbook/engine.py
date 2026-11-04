@@ -997,7 +997,11 @@ async def resume_after_approval(
         )
         raise PlaybookDeleted(pause.playbook_id)
 
-    return await PlaybookEngine().resume(playbook, pause)
+    # What the shipped packs gate the approved action on:
+    # `steps.<approval>.outcome == 'approved'`.
+    earlier = pause.run_context.get("steps")
+    steps = {**(earlier if isinstance(earlier, dict) else {}), pause.step_id: {"outcome": "approved"}}
+    return await PlaybookEngine().resume(playbook, pause, extra_context={"steps": steps})
 
 
 async def resume_wait(*, resume_token: str) -> PlaybookRun | None:
@@ -1215,8 +1219,8 @@ async def _resume_pause(pause: Any, *, resolution: str, extra_context: dict[str,
 
     ``extra_context`` is merged into the stored run context before the run
     restarts, which is how a verification answer reaches the ``condition``
-    step that branches on it. A wait and an approval pass nothing: they
-    resume a run, they do not tell it anything it did not already know.
+    step that branches on it. A wait passes nothing: it resumes a run, it
+    does not tell it anything it did not already know.
     """
     claimed = await playbook_pause.resolve(
         pause_id=pause.id,
