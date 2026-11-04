@@ -183,6 +183,17 @@ async def _enrol(client: httpx.AsyncClient, user: dict, headers: dict[str, str])
 
 
 class TestTheConsoleHasASecondFactor:
+    async def test_a_refresh_token_can_be_exchanged_only_once(self, app_client: httpx.AsyncClient, db: AsyncSession) -> None:
+        user = await _user(db)
+        signed_in = await _password_login(app_client, user)
+        assert signed_in.status_code == 200, signed_in.text
+        refresh_token = signed_in.json()["refresh_token"]
+
+        first = await app_client.post("/api/v1/auth/refresh", json={"refresh_token": refresh_token})
+        assert first.status_code == 200, first.text
+        replay = await app_client.post("/api/v1/auth/refresh", json={"refresh_token": refresh_token})
+        assert replay.status_code == 401, replay.text
+
     async def test_a_user_can_enrol_one(self, app_client: httpx.AsyncClient, db: AsyncSession) -> None:
         user = await _user(db)
         headers = await _bearer(app_client, user)

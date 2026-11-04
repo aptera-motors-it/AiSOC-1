@@ -9,7 +9,12 @@ import pino from 'pino';
 import rateLimit from 'express-rate-limit';
 
 import { PushManager } from './push';
-import { resolveTicketSecret, tenantForEvent, verifyRealtimeTicket } from './auth';
+import {
+  resolveTicketSecret,
+  revokeRealtimeSessions,
+  tenantForEvent,
+  verifyRealtimeTicket,
+} from './auth';
 import { setupTelemetry, type Shutdown } from './telemetry';
 import { resolveKafkaTransport } from './kafkaTransport.js';
 
@@ -207,6 +212,10 @@ server.on('upgrade', (req, socket, head) => {
     // Tenant is derived from the verified ticket claim, NOT the URL query, so a
     // client can never subscribe to another tenant's fan-out.
     (ws as any)._aisocTenant = verifiedTenant;
+    (ws as any)._aisocUserId = verifyRealtimeTicket(
+      url.searchParams.get('token') || '',
+      REALTIME_TICKET_SECRET,
+    )?.sub;
     wss.emit('connection', ws, req);
   });
 });
@@ -242,6 +251,7 @@ wss.on('connection', (ws, req) => {
   // Tenant comes from the verified ticket claim stashed during the upgrade
   // (see server.on('upgrade')), never from a client-supplied query parameter.
   const tenantId = (ws as any)._aisocTenant || 'default';
+  const userId = (ws as any)._aisocUserId;
   const channel: Channel = (ws as any)._aisocChannel ?? 'all';
 
   if (!clients.has(tenantId)) {
@@ -249,7 +259,7 @@ wss.on('connection', (ws, req) => {
   }
   clients.get(tenantId)!.add(ws);
   log.info(
-    { tenantId, channel, totalClients: clients.get(tenantId)!.size },
+    { tenantId, userId, channel, totalClients: clients.get(tenantId)!.size },
     'WebSocket client connected',
   );
 
@@ -838,6 +848,22 @@ app.post('/internal/agent-event', internalEventRateLimit, (req, res) => {
   }
 
   res.status(202).json({ broadcast: true, tenantId });
+});
+
+app.post('/internal/session-revoked', internalEventRateLimit, (req, res) => {
+  if (!requireInternal(req, res)) return;
+  const { user_id, revoked_at } = req.body as { user_id?: unknown; revoked_at?: unknown };
+  if (typeof user_id !== 'string' || typeof revoked_at !== 'number') {
+    res.status(400).json({ error: 'user_id and revoked_at are required' });
+    return;
+  }
+  revokeRealtimeSessions(user_id, revoked_at);
+  for (const tenantClients of clients.values()) {
+    for (const client of tenantClients) {
+      if (client._aisocUserId === user_id) client.close(1008, 'Session revoked');
+    }
+  }
+  res.status(202).json({ revoked: true });
 });
 
 // --- Health endpoint ---

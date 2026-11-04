@@ -31,6 +31,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text, update
@@ -38,6 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.deps import AuthUser, require_permission
 from app.core import role_grants
+from app.core.config import settings
 from app.core.permission_cache import bump_version
 from app.db.rls import TenantDBSession
 from app.models.rbac import Permission, Role, RolePermission, UserRole
@@ -629,6 +631,20 @@ def _mirror_role(roles: list[Role]) -> str:
 
 async def _end_sessions(db: AsyncSession, user_id: uuid.UUID, now: datetime) -> None:
     await db.execute(update(User).where(User.id == user_id).values(sessions_revoked_at=now))
+    if not settings.REALTIME_INTERNAL_TOKEN:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            response = await client.post(
+                f"{settings.REALTIME_BASE_URL}/internal/session-revoked",
+                headers={"X-Internal-Token": settings.REALTIME_INTERNAL_TOKEN},
+                json={"user_id": str(user_id), "revoked_at": now.timestamp()},
+            )
+            response.raise_for_status()
+    except httpx.HTTPError:
+        # The API database revocation remains authoritative; this only makes
+        # already-open realtime sockets end immediately.
+        pass
 
 
 async def _read_out(db: AsyncSession, target: User, tenant_id: uuid.UUID) -> AdminUserOut:

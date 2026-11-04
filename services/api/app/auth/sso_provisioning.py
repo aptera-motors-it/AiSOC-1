@@ -648,9 +648,12 @@ async def complete_sso_login(
         "role": role,
         "email": user["email"],
     }
+    refresh_jti = uuid.uuid4()
+    await db.execute(text("UPDATE users SET refresh_token_jti = :j WHERE id = :u").bindparams(j=refresh_jti, u=user["id"]))
+    await db.commit()
     return {
         "access_token": create_access_token(claims),
-        "refresh_token": create_refresh_token(claims),
+        "refresh_token": create_refresh_token({**claims, "jti": str(refresh_jti)}),
         "role": role,
         "user_id": str(user["id"]),
         "tenant_id": str(connection["tenant_id"]),

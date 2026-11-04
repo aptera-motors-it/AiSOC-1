@@ -152,8 +152,10 @@ async def login(request: LoginRequest, http_request: Request, db: DBSession) -> 
         "role": user.role,
         "email": user.email,
     }
+    refresh_jti = uuid.uuid4()
+    user.refresh_token_jti = refresh_jti
     access_token = create_access_token(token_data)
-    refresh_token = create_refresh_token(token_data)
+    refresh_token = create_refresh_token({**token_data, "jti": str(refresh_jti)})
 
     return TokenResponse(
         access_token=access_token,
@@ -261,6 +263,20 @@ async def refresh_token(request: RefreshRequest, db: DBSession) -> TokenResponse
     if token_is_revoked(payload.get("iat"), user.sessions_revoked_at):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session revoked")
 
+    presented_jti = payload.get("jti")
+    if not isinstance(presented_jti, str):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
+    try:
+        presented_jti_uuid = uuid.UUID(presented_jti)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token") from exc
+    next_jti = uuid.uuid4()
+    rotated = await db.execute(
+        update(User).where(User.id == user.id, User.refresh_token_jti == presented_jti_uuid).values(refresh_token_jti=next_jti)
+    )
+    if rotated.rowcount != 1:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token already used")
+
     token_data = {
         "sub": str(user.id),
         "tenant_id": str(user.tenant_id),
@@ -269,7 +285,7 @@ async def refresh_token(request: RefreshRequest, db: DBSession) -> TokenResponse
     }
     return TokenResponse(
         access_token=create_access_token(token_data),
-        refresh_token=create_refresh_token(token_data),
+        refresh_token=create_refresh_token({**token_data, "jti": str(next_jti)}),
     )
 
 

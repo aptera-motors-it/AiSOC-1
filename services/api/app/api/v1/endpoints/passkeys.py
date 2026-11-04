@@ -615,6 +615,8 @@ async def passkey_authenticate_finish(
     cred_row.sign_count = int(verified.new_sign_count)
     cred_row.last_used_at = _now()
     await db.execute(update(User).where(User.id == user_row.id).values(last_login=_now()))
+    refresh_jti = uuid.uuid4()
+    user_row.refresh_token_jti = refresh_jti
     await db.commit()
 
     token_data = {
@@ -625,7 +627,7 @@ async def passkey_authenticate_finish(
     }
     return AuthenticateFinishResponse(
         access_token=create_access_token(token_data),
-        refresh_token=create_refresh_token(token_data),
+        refresh_token=create_refresh_token({**token_data, "jti": str(refresh_jti)}),
     )
 
 

@@ -732,9 +732,17 @@ async def _issue_session(db: Any, user_id: uuid.UUID, tenant_id: uuid.UUID) -> d
     if row is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
     claims = {"sub": str(row["id"]), "tenant_id": str(row["tenant_id"]), "role": row["role"], "email": row["email"]}
-    await db.execute(text("UPDATE users SET last_login = now() WHERE id = :u AND tenant_id = :t").bindparams(u=user_id, t=tenant_id))
+    refresh_jti = uuid.uuid4()
+    await db.execute(
+        text("UPDATE users SET last_login = now(), refresh_token_jti = :j WHERE id = :u AND tenant_id = :t").bindparams(
+            u=user_id, t=tenant_id, j=refresh_jti
+        )
+    )
     await db.commit()
-    return {"access_token": create_access_token(claims), "refresh_token": create_refresh_token(claims)}
+    return {
+        "access_token": create_access_token(claims),
+        "refresh_token": create_refresh_token({**claims, "jti": str(refresh_jti)}),
+    }
 
 
 @router.delete("", status_code=status.HTTP_204_NO_CONTENT)

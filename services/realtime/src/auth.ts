@@ -33,6 +33,7 @@ const INSECURE_SECRET_DEFAULTS = new Set<string>([
   // working deployment keyed on a value anyone can read.
   'aisoc-dev-realtime-ticket-secret-not-for-production',
 ]);
+const sessionRevocations = new Map<string, number>();
 
 /**
  * Resolve the effective HS256 secret used to verify realtime tickets.
@@ -87,6 +88,12 @@ export function tenantForEvent(event: { tenant_id?: unknown }): string | null {
     : null;
 }
 
+/** Record a revocation received from the API service. */
+export function revokeRealtimeSessions(userId: string, revokedAt: number): void {
+  const previous = sessionRevocations.get(userId) ?? 0;
+  sessionRevocations.set(userId, Math.max(previous, revokedAt));
+}
+
 /**
  * Verify an HS256 realtime ticket. Returns the decoded claims on success, or
  * `null` if the token is malformed, has a bad signature, wrong audience, wrong
@@ -132,10 +139,13 @@ export function verifyRealtimeTicket(token: string, secret: string): RealtimeCla
   if (claims.aud !== REALTIME_TICKET_AUDIENCE) return null;
   if (claims.type && claims.type !== 'realtime_ticket') return null;
   if (typeof claims.exp !== 'number') return null;
+  if (typeof claims.iat !== 'number') return null;
   // 30s clock-skew leeway, matching common JWT verifier defaults.
   const now = Math.floor(Date.now() / 1000);
   if (claims.exp + 30 < now) return null;
   if (!claims.tenant_id) return null;
+  const revokedAt = sessionRevocations.get(claims.sub);
+  if (revokedAt !== undefined && claims.iat <= revokedAt) return null;
 
   return claims;
 }

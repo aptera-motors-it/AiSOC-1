@@ -54,6 +54,10 @@ class User(Base):
     # survive a later re-activation, when tokens minted before it are still
     # inside their expiry window.
     sessions_revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # The only refresh-token identifier currently allowed to mint a successor.
+    # Rotation replaces this value with a fresh UUID, making a presented token
+    # single-use without retaining bearer tokens in the database.
+    refresh_token_jti: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     preferences: Mapped[dict] = mapped_column(JSONB, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     updated_at: Mapped[datetime] = mapped_column(

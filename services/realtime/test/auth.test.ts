@@ -12,6 +12,7 @@ import crypto from 'node:crypto';
 
 import {
   REALTIME_TICKET_AUDIENCE,
+  revokeRealtimeSessions,
   resolveTicketSecret,
   tenantForEvent,
   verifyRealtimeTicket,
@@ -138,6 +139,14 @@ test('rejects a ticket missing tenant_id', () => {
   const claims = validClaims();
   delete claims.tenant_id;
   assert.equal(verifyRealtimeTicket(mintTicket(claims), SECRET), null);
+});
+
+test('rejects a ticket after its user sessions are revoked', () => {
+  const now = Math.floor(Date.now() / 1000);
+  const token = mintTicket(validClaims({ sub: 'revoked-user', iat: now }));
+  assert.ok(verifyRealtimeTicket(token, SECRET));
+  revokeRealtimeSessions('revoked-user', now);
+  assert.equal(verifyRealtimeTicket(token, SECRET), null);
 });
 
 test('rejects a non-numeric exp', () => {
