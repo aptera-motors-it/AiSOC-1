@@ -165,6 +165,23 @@ SELECT id
  LIMIT 1
 """
 
+#: A new matching detection makes a terminal alert actionable again.
+#:
+#: The fingerprint remains the durable identity of the finding, so recurrence
+#: does not create another alert row. Terminal queue states are different:
+#: leaving the row closed would make a fresh detection invisible. Restricting
+#: this to terminal statuses keeps an open alert's assignment and workflow
+#: untouched on an ordinary duplicate or a Kafka redelivery.
+_REOPEN_RECURRING_ALERT_SQL = """
+UPDATE alerts
+   SET status = 'new',
+       resolved_at = NULL,
+       updated_at = NOW()
+ WHERE tenant_id = $1
+   AND dedup_hash = $2::text
+   AND status IN ('resolved', 'false_positive', 'closed')
+"""
+
 #: Record a raw event that deduplicated onto an alert that already exists.
 #:
 #: Issue #1244. `source_event_ids` is "the raw events that produced this
@@ -679,6 +696,7 @@ class AlertSink:
         if is_duplicate:
             existing_id = await self._surviving_alert_id(conn, alert)
             if existing_id is not None:
+                await self._reopen_recurring_alert(conn, alert)
                 await self._record_deduplicated_event(conn, alert)
                 return PersistResult(PersistOutcome.DUPLICATE, str(existing_id))
 
@@ -719,6 +737,7 @@ class AlertSink:
                     tenant_id=str(alert.tenant_id),
                     fingerprint=alert.fingerprint(),
                 )
+                await self._reopen_recurring_alert(conn, alert)
                 await self._record_deduplicated_event(conn, alert)
                 return PersistResult(PersistOutcome.DUPLICATE, str(existing_id))
             # The winner's row is not visible: it was rolled back, deleted, or
@@ -738,6 +757,7 @@ class AlertSink:
             existing_id = await self._surviving_alert_id(conn, alert)
             if existing_id is not None:
                 logger.debug("alert_sink.dedup_skip", fingerprint=alert.fingerprint())
+                await self._reopen_recurring_alert(conn, alert)
                 await self._record_deduplicated_event(conn, alert)
                 return PersistResult(PersistOutcome.DUPLICATE, str(existing_id))
             if is_duplicate:
@@ -764,6 +784,9 @@ class AlertSink:
     async def _surviving_alert_id(self, conn: Any, alert: Any) -> Any | None:
         row = await conn.fetchrow(_SURVIVING_ALERT_SQL, alert.tenant_id, alert.fingerprint())
         return row["id"] if row is not None else None
+
+    async def _reopen_recurring_alert(self, conn: Any, alert: Any) -> None:
+        await conn.execute(_REOPEN_RECURRING_ALERT_SQL, alert.tenant_id, alert.fingerprint())
 
     async def _link_source_finding_safely(self, fused: FusedAlert, *, alert_id: Any) -> None:
         # getattr rather than direct access: the batch-path tests construct the

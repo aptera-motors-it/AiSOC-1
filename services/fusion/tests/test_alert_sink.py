@@ -77,6 +77,10 @@ class _StubConn:
             return self._surviving
         return self._row
 
+    async def execute(self, sql, *args):
+        self.calls.append((sql, args))
+        return "UPDATE 1"
+
 
 class _StubPool:
     def __init__(self, row, surviving=_UNSET):
@@ -178,6 +182,21 @@ async def test_dedup_hit_returns_duplicate():
     assert result.alert_id == str(fused.id)
     assert result.durable is True
     assert result.verified is True
+
+
+@pytest.mark.asyncio
+async def test_a_recurrence_reopens_a_closed_alert():
+    """A new matching detection must return a closed alert to the queue."""
+    fused = _fused(FusionDecision.DUPLICATE)
+    pool = _StubPool(row=None, surviving={"id": fused.id})
+    sink = AlertSink("postgresql://x")
+    sink._pool = pool
+
+    result = await sink.persist(fused)
+
+    assert result.outcome is PersistOutcome.DUPLICATE
+    reopen_calls = [sql for sql, _ in pool.conn.calls if "SET status = 'new'" in sql]
+    assert reopen_calls, "a recurrence must reopen a previously closed alert"
 
 
 @pytest.mark.asyncio
