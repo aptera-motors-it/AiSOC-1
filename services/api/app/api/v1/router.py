@@ -46,6 +46,7 @@ from app.api.v1.endpoints import (
     graph,
     graph_ws,
     health,
+    honeytoken_alerts,
     hunt_reports,
     hunts,
     identity_graph,
@@ -406,6 +407,7 @@ api_router.include_router(agents.router)
 # URLs the wizard's "Push (any vendor)" card hands out. Vendor traffic
 # itself terminates at services/ingest, which resolves the token to a
 # tenant + template_id and reuses the existing OCSF normalizer.
+api_router.include_router(honeytoken_alerts.router)
 api_router.include_router(inbox.router)
 
 # Bidirectional ITSM webhook receiver (Workstream 8 of AI Stack plan).

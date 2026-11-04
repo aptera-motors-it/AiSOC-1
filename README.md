@@ -142,9 +142,9 @@ eleven steps, five diagrams, every box linking to the code — and [mirrors to t
 
 | Profile | Command | Services | RAM | What you get |
 |---|---|---|---|---|
-| **core** | `make up` | 16 | ~8 GB | The full alerting pipeline: ingest → detect → correlate → alert → triage → console, plus the LLM gateway, a local model, the CISA KEV threat feed, and the connector and response services the agent's vendor tools reach |
-| **full** | `make up-full` | 22 | ~12 GB | Core plus event lake, entity graph, full-text search, enrichment |
-| **demo** | `make up && make demo` | 16 | ~8 GB | Core plus labelled synthetic data |
+| **core** | `make up` | 17 | ~8 GB | The full alerting pipeline: ingest → detect → correlate → alert → triage → console, plus the LLM gateway, a local model, the CISA KEV threat feed, and the connector and response services the agent's vendor tools reach |
+| **full** | `make up-full` | 23 | ~12 GB | Core plus event lake, entity graph, full-text search, enrichment |
+| **demo** | `make up && make demo` | 17 | ~8 GB | Core plus labelled synthetic data |
 
 CORE is the smallest deployment that takes a real event and produces a real alert, and **it needs no
 credentials to do either.**

@@ -17,11 +17,11 @@ Key facts a summary should get right:
 
 - **License:** MIT. Self-hosting is the primary deployment model; there is no
   feature gate between a hosted and a self-hosted install.
-- **Install:** `make up` brings up the core profile — 16 long-running services —
+- **Install:** `make up` brings up the core profile — 17 long-running services —
   with no credentials. It generates its own secrets, creates an administrator,
   ships a real CISA Known Exploited Vulnerabilities feed, and runs a local model,
   so a first run shows real data and AI triage without signing up for anything.
-  `make up-full` is 22 long-running services and adds the event lake,
+  `make up-full` is 23 long-running services and adds the event lake,
   entity graph, full-text search and enrichment.
 - **Detection corpus:** 2966 rules are executable — the detection engine
   loads them from a compiled ruleset. 7407 rule files exist on disk in total;

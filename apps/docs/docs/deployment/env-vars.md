@@ -434,7 +434,7 @@ All variables use the `HONEYTOKEN_` prefix.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `HONEYTOKEN_DATABASE_URL` | `postgresql+asyncpg://aisoc:aisoc@localhost:5432/aisoc` | Postgres DSN for token metadata and triggers |
-| `HONEYTOKEN_ALERT_WEBHOOK_URL` | — | Webhook called when a token is triggered |
+| `HONEYTOKEN_ALERT_WEBHOOK_URL` | `http://api:8000/api/v1/internal/honeytoken-alerts` | Webhook called when a token is triggered. The default is the API route that publishes the trip for fusion |
 | `HONEYTOKEN_ALERT_WEBHOOK_SECRET` | `changeme` | **Rotate before going live.** HMAC-SHA256 secret for webhook signing |
 | `HONEYTOKEN_TOKEN_TTL_DAYS` | `365` | Default token expiry |
 | `HONEYTOKEN_OTEL_ENDPOINT` | `http://localhost:4317` | OTLP collector endpoint |

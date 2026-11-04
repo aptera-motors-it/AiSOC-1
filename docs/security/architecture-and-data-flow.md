@@ -65,10 +65,11 @@ flowchart TB
     WEB --> RT
 ```
 
-Six of these are optional: `clickhouse`, `neo4j`, `opensearch`, `ueba`,
-`honeytokens` and `purple-team` carry a compose `profiles:` key and do not
-start under `make up`. The lake, the graph and the vector store are therefore
-absent on a default install, and so is any data in them.
+Five of these are optional: `clickhouse`, `neo4j`, `opensearch`, `ueba`
+and `purple-team` carry a compose `profiles:` key and do not start under
+`make up`. `honeytokens` starts with the default stack, because a trip that
+never starts cannot become an alert. The lake, the graph and the vector store
+are therefore absent on a default install, and so is any data in them.
 
 ## Trust boundaries, and what crosses each
 

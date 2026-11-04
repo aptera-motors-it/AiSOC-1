@@ -234,7 +234,7 @@ CI all mean.
 ## Path B — the full stack
 
 Use this when you want to hack on AiSOC itself, run the eval harness, or
-exercise UEBA / Honeytokens / Purple Team / MCP.
+exercise UEBA / Purple Team / MCP. Honeytokens starts with CORE.
 
 ```bash
 make up-full
@@ -247,24 +247,25 @@ exist in this profile), and waits for every container to report healthy.
 ### What is in which profile
 
 Most non-CORE services sit behind a compose profile, so a bare
-`docker compose up -d` starts neither UEBA nor Honeytokens nor Purple Team.
+`docker compose up -d` starts neither UEBA nor Purple Team. Honeytokens
+starts with CORE.
 `make up` and `make up-full` are the supported spellings for the first two
 rows, and additionally wait for health, which a bare `docker compose up -d`
 does not.
 
 | Profile | Services |
 | --- | --- |
-| *(default — CORE)* | **postgres** (5432) · **redis** (6379) · **zookeeper** · **kafka** (9092) · **qdrant** (6333) · **litellm** (4000, LLM gateway) · **ollama** (11434, local model) · **ollama-pull** (one-shot model fetch) · **ingest-worker** (8081, Go) · **fusion** (8003) · **api** (8000) · **agents** (8001) · **threatintel** (8005) · **realtime** (8086) · **web** (3000) · **connectors** (8088) · **actions** (8002) |
+| *(default — CORE)* | **postgres** (5432) · **redis** (6379) · **zookeeper** · **kafka** (9092) · **qdrant** (6333) · **litellm** (4000, LLM gateway) · **ollama** (11434, local model) · **ollama-pull** (one-shot model fetch) · **ingest-worker** (8081, Go) · **fusion** (8003) · **api** (8000) · **agents** (8001) · **threatintel** (8005) · **realtime** (8086) · **web** (3000) · **connectors** (8088) · **actions** (8002) · **honeytokens** (8008) |
 | `full` | **clickhouse** (8123/9000) · **neo4j** (7474/7687) · **opensearch** (9200) · **ueba** (8007) · **enrichment** (8080, Go) · **kafka-ui** (8090) |
-| `extras` | **honeytokens** (8008) · **purple-team** (8006) |
+| `extras` | **purple-team** (8006) |
 | `chatops` | **slack-bot** (8009) · **teams-bot** (8010) |
 | `monitoring` | **prometheus** (9091) · **grafana** (3001) · **alertmanager** (9094) · **tempo** (3200) · **otel-collector** (4317/4318) |
 | `osquery` | **osquery-tls** (8091) |
 | `mcp` | **mcp** (8096, streamable-HTTP MCP server, off by default) |
 | `escalations` | **escalations** (ack-clock bridge: Teams cards for unacknowledged CRITICAL/HIGH cases; off by default, needs `AISOC_ESCALATION_TEAMS_URL`) |
 
-CORE is 16 long-running services, or 17 counting `ollama-pull`, which fetches
-the model once and exits, and `full` is 22. `connectors` and `actions` moved
+CORE is 17 long-running services, or 18 counting `ollama-pull`, which fetches
+the model once and exits, and `full` is 23. `connectors` and `actions` moved
 into CORE because the API service in CORE already pointed at both and
 federated search defaults on, so the capability was enabled and aimed at a
 hostname that does not resolve; the measured cost of moving them is 124.8 MiB

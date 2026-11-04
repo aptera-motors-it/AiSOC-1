@@ -13,14 +13,14 @@ tree disagree, **the tree is right and this file is a bug**.
 ## Get it running
 
 ```bash
-make up        # CORE profile: 16 long-running services, ~8 GB memory, ~20 GB disk
+make up        # CORE profile: 17 long-running services, ~8 GB memory, ~20 GB disk
 make doctor    # what is up, what is not, and what to do about it
 make smoke     # the golden pipeline, eight stages, end to end
 ```
 
 `make up` generates real secrets into `.env`, creates an administrator and
 prints its password once. There is no step where you hand-edit a compose file.
-`make up-full` adds the rest (21 services, ~12 GB) and switches on the lake
+`make up-full` adds the rest (22 services, ~12 GB) and switches on the lake
 writer and the entity graph.
 
 A first run shows real data with no credentials configured: the CISA Known

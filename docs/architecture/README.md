@@ -455,14 +455,14 @@ One architecture, three profiles of it — not three architectures.
 
 | Profile | Command | Services | RAM | What you get |
 |---|---|---|---|---|
-| **core** | `make up` | 16 | ~8 GB | Ingest → detect → correlate → alert → triage → console, plus the LLM gateway, the local model behind it, the CISA KEV threat feed with its vector store, and the connector and response services the agent's vendor tools reach. |
-| **full** | `make up-full` | 22 | ~12 GB | Core plus event lake, entity graph, full-text search, enrichment, scheduled connectors. |
-| **demo** | `make up && make demo` | 16 | ~8 GB | Core plus clearly-labelled synthetic data. |
+| **core** | `make up` | 17 | ~8 GB | Ingest → detect → correlate → alert → triage → console, plus the LLM gateway, the local model behind it, the CISA KEV threat feed with its vector store, and the connector and response services the agent's vendor tools reach. |
+| **full** | `make up-full` | 23 | ~12 GB | Core plus event lake, entity graph, full-text search, enrichment, scheduled connectors. |
+| **demo** | `make up && make demo` | 17 | ~8 GB | Core plus clearly-labelled synthetic data. |
 
-`full` is 22 services, not the 30 published here previously: 30 is `full` plus
+`full` is 23 services, not the 30 published here previously: 30 is `full` plus
 the `monitoring`, `chatops`, `extras` and `osquery` profiles, which
-`make up-full` does not start. The CORE count is **16 long-running
-containers**; `ollama-pull` is a seventeenth that runs once and exits, and is
+`make up-full` does not start. The CORE count is **17 long-running
+containers**; `ollama-pull` is an eighteenth that runs once and exits, and is
 excluded because "long-running services" is the figure these documents
 publish.
 

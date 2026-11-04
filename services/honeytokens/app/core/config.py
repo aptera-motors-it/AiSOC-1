@@ -31,10 +31,19 @@ class Settings(BaseSettings):
     # literal string ``"changeme"`` — anyone running this service with the
     # defaults would sign every outbound honeytoken alert with a public secret,
     # so a downstream verifier couldn't distinguish a real trigger from a
-    # forged one. We now default to empty and require operators to wire a
-    # real HMAC secret before alerts will be signed.
-    alert_webhook_url: str = ""
+    # forged one. The secret still defaults to empty, and a delivery is refused
+    # until a real HMAC secret is set.
+    #
+    # The URL does not. An empty URL used to make ``send_alert`` return false
+    # and log that it was skipping, so a trip on the default stack produced no
+    # alert and nothing retried it. The default is the API route that publishes
+    # the trip onto ``raw_events``. Compose sets the same value explicitly.
+    alert_webhook_url: str = "http://api:8000/api/v1/internal/honeytoken-alerts"
     alert_webhook_secret: str = ""
+    # Seconds between passes over trips whose alert has not been accepted.
+    # A pass that still has undelivered rows waits longer, up to a cap, so a
+    # dead receiver is not polled at this interval forever.
+    alert_retry_seconds: float = 5.0
 
     # Token defaults
     token_ttl_days: int = 365

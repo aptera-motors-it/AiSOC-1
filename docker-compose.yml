@@ -1424,13 +1424,10 @@ services:
     restart: unless-stopped
 
   honeytokens:
-    # Gated behind the `extras` profile: image isn't published to GHCR yet, so
-    # `aisoc serve` skips it by default. Opt in with `--profile extras`.
-    # `pull_policy: build` used to be the only thing that worked here,
-    # because the image this names had never been published; it is in the
-    # publish matrix now, so `--profile extras` pulls like every other
-    # service instead of spending ten minutes building one.
-    profiles: ["extras"]
+    # A trip is a high-confidence signal. This service used to start only
+    # under `--profile extras`, and the core stack set no webhook, so a trip
+    # never became an alert. It starts with the default stack and posts each
+    # trip to the API, which publishes a finding that fusion promotes.
     build:
       context: ./services/honeytokens
       dockerfile: Dockerfile
@@ -1444,6 +1441,8 @@ services:
         condition: service_healthy
       kafka:
         condition: service_healthy
+      api:
+        condition: service_healthy
     ports:
       - "${AISOC_BIND_ADDR:-127.0.0.1}:8008:8005"
     environment:
@@ -1452,6 +1451,9 @@ services:
       # must not serve requests as it. The marker on the second line below is
       # what tells scripts/check_runtime_db_role.py the owner is deliberate.
       DATABASE_URL: postgresql+asyncpg://aisoc_app:${AISOC_APP_DB_PASSWORD:-aisoc_app_dev_secret}@postgres:5432/aisoc
+      # The receiver checks this bearer and the HMAC with the same value.
+      HONEYTOKEN_ALERT_WEBHOOK_URL: http://api:8000/api/v1/internal/honeytoken-alerts
+      HONEYTOKEN_ALERT_WEBHOOK_SECRET: ${AISOC_SERVICE_TOKEN:-}
       # aisoc-db-role: owner — alembic applies this service's chain; the runtime role holds no DDL
       DATABASE_MIGRATION_URL: postgresql+asyncpg://aisoc:${POSTGRES_PASSWORD:-aisoc_dev_secret}@postgres:5432/aisoc
       # Read by the postgres init hook on a fresh volume and by the api

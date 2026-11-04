@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 
 from fastapi import FastAPI
@@ -43,7 +45,8 @@ LOG = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Application
 # ---------------------------------------------------------------------------
-from app.api.routes import router  # noqa: E402
+from app.api.routes import _session_factory, router  # noqa: E402
+from app.services.alert_retry import run_alert_retry  # noqa: E402
 
 app = FastAPI(
     title="AiSOC Honeytokens Service",
@@ -74,8 +77,9 @@ if _otel_enabled:
 @app.on_event("startup")
 async def _startup() -> None:
     LOG.info("Honeytokens service started (OTel=%s)", _otel_enabled)
-    # Phase 2.6 — no async dependencies to warm up; the router is
-    # immediately serviceable.
+    stop = asyncio.Event()
+    app.state.alert_retry_stop = stop
+    app.state.alert_retry_task = asyncio.create_task(run_alert_retry(_session_factory, stop))
     app.state.mark_ready()
 
 
@@ -84,6 +88,14 @@ async def _shutdown() -> None:
     # Phase 2.6 — drain readiness so the orchestrator stops
     # routing traffic to a draining pod.
     app.state.mark_not_ready()
+    stop = getattr(app.state, "alert_retry_stop", None)
+    task = getattr(app.state, "alert_retry_task", None)
+    if stop is not None:
+        stop.set()
+    if task is not None:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 @app.get("/health")

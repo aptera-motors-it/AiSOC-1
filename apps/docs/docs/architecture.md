@@ -395,12 +395,12 @@ policy for that specific verb. That is the honest boundary of the word
 
 | Profile | Command | Long-running services | Memory | What you get |
 |---|---|---|---|---|
-| **core** | `make up` | 16 | ~8 GB | Steps 1–10, plus the LLM gateway, the local model behind it, the CISA KEV feed with its vector store, and the connector and response services the investigation agent's vendor tools reach |
-| **full** | `make up-full` | 22 | ~12 GB | Core plus the event lake, entity graph, full-text search and enrichment |
-| **demo** | `make up && make demo` | 16 | ~8 GB | Core plus clearly-labelled synthetic data |
+| **core** | `make up` | 17 | ~8 GB | Steps 1–10, plus the LLM gateway, the local model behind it, the CISA KEV feed with its vector store, and the connector and response services the investigation agent's vendor tools reach |
+| **full** | `make up-full` | 23 | ~12 GB | Core plus the event lake, entity graph, full-text search and enrichment |
+| **demo** | `make up && make demo` | 17 | ~8 GB | Core plus clearly-labelled synthetic data |
 
-CORE is 16 long-running containers; `ollama-pull` is a seventeenth that fetches
-the model once and exits. `full` is 22 long-running containers — not 30, which
+CORE is 17 long-running containers; `ollama-pull` is an eighteenth that fetches
+the model once and exits. `full` is 23 long-running containers — not 30, which
 is every profile including `monitoring`, `chatops`, `extras` and `osquery`,
 none of which `make up-full` starts.
 
