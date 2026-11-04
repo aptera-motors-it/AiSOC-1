@@ -68,7 +68,9 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
+import respx
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -136,7 +138,22 @@ def _env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
     monkeypatch.delenv("AISOC_DEV_MODE", raising=False)
     monkeypatch.delenv("AISOC_DEV_AUTH_BYPASS", raising=False)
     monkeypatch.delenv("AISOC_PLAYBOOK_HTTP_EXECUTE", raising=False)
+    monkeypatch.setenv("AISOC_API_URL", "http://api.test")
     yield
+
+
+@pytest.fixture(autouse=True)
+def _api_session(respx_mock: respx.MockRouter) -> None:
+    def valid_session(request: httpx.Request) -> httpx.Response:
+        token = request.headers["Authorization"].removeprefix("Bearer ").strip()
+        payload = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        return httpx.Response(
+            200,
+            json={"tenant_id": claims["tenant_id"], "permissions": ["actions:execute"]},
+        )
+
+    respx_mock.get("http://api.test/api/v1/auth/me").mock(side_effect=valid_session)
 
 
 @pytest.fixture()
@@ -419,3 +436,52 @@ def test_an_unauthenticated_caller_is_refused_before_any_lookup(client: TestClie
     assert client.get("/api/v1/playbooks").status_code == 401
     assert client.get("/api/v1/playbooks/runs").status_code == 401
     assert client.post(f"/api/v1/playbooks/{playbook_id}/run", json={"context": {}}).status_code == 401
+
+
+def test_a_viewer_cannot_create_or_run_a_response_playbook(client: TestClient, respx_mock: respx.MockRouter) -> None:
+    """A viewer must not gain action authority by entering through agents."""
+    owner_playbook = create_playbook(client, TENANT_A, "operator-response")
+    respx_mock.reset()
+    respx_mock.get("http://api.test/api/v1/auth/me").mock(
+        return_value=httpx.Response(200, json={"tenant_id": str(TENANT_A), "permissions": []})
+    )
+    viewer_headers = {"Authorization": f"Bearer {console_token(TENANT_A, role='viewer')}"}
+
+    created = client.post(
+        "/api/v1/playbooks",
+        json={"name": "viewer-response", "steps": []},
+        headers=viewer_headers,
+    )
+    assert created.status_code == 403, created.text
+
+    started = client.post(
+        f"/api/v1/playbooks/{owner_playbook}/run",
+        json={"context": {}, "dry_run": False},
+        headers=viewer_headers,
+    )
+    assert started.status_code == 403, started.text
+
+
+def test_a_revoked_console_session_cannot_create_or_run_a_response_playbook(
+    client: TestClient,
+    respx_mock: respx.MockRouter,
+) -> None:
+    """The agents route must defer session revocation to the API session check."""
+    owner_playbook = create_playbook(client, TENANT_A, "operator-response")
+    respx_mock.reset()
+    respx_mock.get("http://api.test/api/v1/auth/me").mock(return_value=httpx.Response(401))
+    old_session_headers = {"Authorization": f"Bearer {console_token(TENANT_A)}"}
+
+    created = client.post(
+        "/api/v1/playbooks",
+        json={"name": "revoked-response", "steps": []},
+        headers=old_session_headers,
+    )
+    assert created.status_code == 401, created.text
+
+    started = client.post(
+        f"/api/v1/playbooks/{owner_playbook}/run",
+        json={"context": {}, "dry_run": False},
+        headers=old_session_headers,
+    )
+    assert started.status_code == 401, started.text

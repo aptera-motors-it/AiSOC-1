@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import html
 import logging
+import os
 from dataclasses import dataclass
 from typing import Annotated, Any
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+import httpx
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -71,6 +73,54 @@ verifications_router = APIRouter(prefix="/api/v1/playbook-verifications", tags=[
 #: makes the tenant reachable from the handler — the dependency alone never
 #: was.
 ScopedPrincipal = Annotated[TenantPrincipal, Depends(require_console_or_service_auth)]
+
+_API_SESSION_URL = "/api/v1/auth/me"
+_API_SESSION_TIMEOUT_SECONDS = 2.0
+
+
+async def _require_playbook_execution(principal: TenantPrincipal, authorization: str | None) -> None:
+    """Require the API's live session and permission decision for a response playbook."""
+    if principal.delegated:
+        # Service callers are trusted workload identities. They do not
+        # represent a console session and therefore cannot be revoked through
+        # the users table.
+        return
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="invalid console credential")
+    access_token = authorization[len("Bearer ") :].strip()
+    if not access_token:
+        raise HTTPException(status_code=401, detail="invalid console credential")
+
+    api_url = os.getenv("AISOC_API_URL", "http://api:8000").rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=_API_SESSION_TIMEOUT_SECONDS) as client:
+            response = await client.get(
+                f"{api_url}{_API_SESSION_URL}",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+    except httpx.HTTPError as exc:
+        logger.warning("playbook execution session validation failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="session validation is unavailable") from exc
+
+    if response.status_code == 401:
+        raise HTTPException(status_code=401, detail="console session is no longer valid")
+    if response.status_code != 200:
+        logger.warning("playbook execution session validation returned status=%s", response.status_code)
+        raise HTTPException(status_code=503, detail="session validation is unavailable")
+
+    try:
+        session = response.json()
+        api_tenant_id = str(session["tenant_id"])
+        permissions = set(session["permissions"])
+    except (KeyError, TypeError, ValueError):
+        logger.warning("playbook execution session validation returned an invalid response")
+        raise HTTPException(status_code=503, detail="session validation is unavailable") from None
+
+    tenant_id = str(scoped_tenant_or_403(principal))
+    if api_tenant_id != tenant_id:
+        raise HTTPException(status_code=401, detail="console session tenant changed")
+    if not ({"*", "actions:*", "actions:execute"} & permissions):
+        raise HTTPException(status_code=403, detail="missing required permission: actions:execute")
 
 
 @dataclass(frozen=True)
@@ -185,7 +235,12 @@ async def list_playbooks(principal: ScopedPrincipal, enabled_only: bool = False)
 
 
 @router.post("", summary="Create a playbook", status_code=201)
-async def create_playbook(playbook: Playbook, principal: ScopedPrincipal) -> dict:
+async def create_playbook(
+    playbook: Playbook,
+    principal: ScopedPrincipal,
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict:
+    await _require_playbook_execution(principal, authorization)
     store = PlaybookStore.default()
     tenant_id = str(scoped_tenant_or_403(principal))
     created = store.create(playbook, tenant_id=tenant_id)
@@ -288,7 +343,9 @@ async def run_playbook(
     body: RunRequest,
     background_tasks: BackgroundTasks,
     principal: ScopedPrincipal,
+    authorization: Annotated[str | None, Header()] = None,
 ) -> dict:
+    await _require_playbook_execution(principal, authorization)
     store = PlaybookStore.default()
     tenant_id = str(scoped_tenant_or_403(principal))
     pb = store.get(playbook_id, tenant_id=tenant_id)

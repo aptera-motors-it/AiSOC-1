@@ -53,6 +53,7 @@ class UserMeResponse(BaseModel):
     username: str
     role: str
     is_active: bool
+    permissions: list[str] = []
     preferences: dict[str, Any] = {}
 
     model_config = {"from_attributes": True}
@@ -280,7 +281,9 @@ async def get_me(current_user: AuthUser, db: DBSession) -> UserMeResponse:
     user = result.scalar_one_or_none()
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-    return UserMeResponse.model_validate(user)
+    response = UserMeResponse.model_validate(user)
+    response.permissions = current_user.effective_permissions()
+    return response
 
 
 @router.patch("/me/preferences", response_model=UserMeResponse)
