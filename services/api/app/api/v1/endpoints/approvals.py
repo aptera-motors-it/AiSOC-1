@@ -139,13 +139,6 @@ _DISPATCH_FAILED = "failed"
 _DISPATCH_UNKNOWN = "unknown"
 _DISPATCH_NOT_EXECUTABLE = "not_executable"
 
-#: Dispatch states that mean the decision has not finished being carried out.
-#: A repeat decide re-enters on these rather than reporting success: the
-#: actions service claims an execution durably before contacting a vendor, so
-#: a re-entry cannot double-execute — it is answered 409 — and the alternative
-#: is an approval whose row says ``approved`` and whose action never ran.
-_UNRESOLVED_DISPATCH = frozenset({_DISPATCH_IN_FLIGHT, _DISPATCH_UNKNOWN})
-
 
 def _requester_principal(user: AuthUser) -> dict[str, Any]:
     """The identity that raised this approval, from authenticated context.
@@ -301,9 +294,8 @@ async def decide_approval(
 ) -> ApprovalResponse:
     """Approve or deny a pending approval.
 
-    Idempotent only on the same decision: re-approving an already
-    approved request returns the row unchanged; trying to flip an
-    approved row to denied (or vice versa) is a 409.
+    Each approval has one decision. Already decided, expired, self-requested,
+    or user-assigned approval rows are rejected before dispatch.
     """
     row = (
         await db.execute(
@@ -317,14 +309,31 @@ async def decide_approval(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Approval not found")
 
     new_status = "approved" if body.decision == "approve" else "denied"
-    unresolved = _dispatch_state(row) in _UNRESOLVED_DISPATCH
-
-    if row.status == new_status and not unresolved:
-        return ApprovalResponse.model_validate(row)
-    if row.status not in {"pending", "expired"} and row.status != new_status:
+    if row.status != "pending":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Approval already {row.status}; cannot change to {new_status}",
+            detail=f"Approval is {row.status}; only pending approvals can be decided",
+        )
+
+    if row.expires_at is not None and row.expires_at <= datetime.now(UTC):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Approval has expired")
+
+    requester = (row.action or {}).get(_REQUESTER_KEY)
+    requester_id = requester.get("user_id") if isinstance(requester, dict) else None
+    if not isinstance(requester_id, str):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Approval has no authenticated requester identity",
+        )
+    if requester_id == str(user.user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="The requester cannot decide their own approval",
+        )
+    if row.required_user_id is not None and row.required_user_id != user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This approval is assigned to a different user",
         )
 
     row.status = new_status
@@ -345,9 +354,8 @@ async def decide_approval(
     # Writing the attempt first costs the thing the old comment protected —
     # the window where the row says approved and the action has not run yet —
     # and that window is now *visible*, which is the property that matters:
-    # `dispatch.state` says `dispatching`, a repeat decide re-enters, and the
-    # actions service's durable claim is what stops a re-entry from executing
-    # twice.
+    # `dispatch.state` says `dispatching`, and any recovery can inspect the
+    # action service's durable claim without allowing a second decision.
     row.action = {
         **(row.action or {}),
         "dispatch": {"state": _DISPATCH_IN_FLIGHT, "started_at": datetime.now(UTC).isoformat()},

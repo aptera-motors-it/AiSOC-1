@@ -112,7 +112,7 @@ class TestExpiringIsNotDeciding:
     async def test_the_sweep_writes_only_a_status_and_a_note(self) -> None:
         """Nothing is dispatched. An expired approval is a request that
         stopped pretending to be live, not a decision taken for the
-        operator — and `/decide` still accepts an expired row."""
+        operator."""
         session = _Session(expired_rows=[_row()])
 
         await run_once(db=session)
@@ -122,10 +122,10 @@ class TestExpiringIsNotDeciding:
         for forbidden in ("decided_by_id", "decided_at", "action ="):
             assert forbidden not in update, f"the sweep must not write {forbidden}"
 
-    def test_the_decide_endpoint_still_accepts_an_expired_row(self) -> None:
+    def test_the_decide_endpoint_rejects_an_expired_row(self) -> None:
         source = (REPO_ROOT / "services" / "api" / "app" / "api" / "v1" / "endpoints" / "approvals.py").read_text(encoding="utf-8")
-        assert 'row.status not in {"pending", "expired"}' in source, (
-            "the guard changed; if `expired` no longer decides, this worker silently becomes a way to close approvals"
+        assert 'if row.status != "pending":' in source, (
+            "an expiry must make the row non-decidable; otherwise the worker only changes its label"
         )
 
     @pytest.mark.asyncio
@@ -136,7 +136,7 @@ class TestExpiringIsNotDeciding:
 
         note = next(p["note"] for p in session.params if "note" in p)
         assert "nothing was dispatched" in note
-        assert "can still be decided" in note
+        assert "cannot be decided" in note
 
 
 class TestTheSafeDefaultIsTheOneAlreadyDeclared:

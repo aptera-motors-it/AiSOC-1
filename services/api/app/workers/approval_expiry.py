@@ -29,10 +29,9 @@ ways would be worse than either.
 Expiring is not deciding
 ------------------------
 An expired approval is marked `expired`, and **nothing is dispatched**. The
-`/decide` endpoint deliberately still accepts an `expired` row — its guard is
-`status not in {"pending", "expired"}` — so a human who returns to a timed-out
-request can still act on it. Timing out removes the pretence that the request
-is live; it does not spend the decision on the operator's behalf.
+`/decide` endpoint rejects the row because it is no longer pending. Timing out
+removes the pretence that the request is live without deciding it on the
+operator's behalf.
 
 Only rows that opted in
 -----------------------
@@ -83,7 +82,7 @@ _SWEEP_SQL = text(
 
 _NOTE = (
     "Expired automatically: the approval window elapsed with no decision. "
-    f"Safe default is '{SAFE_DEFAULT}' — nothing was dispatched, and this request can still be decided."
+    f"Safe default is '{SAFE_DEFAULT}' — nothing was dispatched, and this request cannot be decided."
 )
 
 
