@@ -56,6 +56,7 @@ class _Realtime:
         self.step_id = ""
         self.reached = threading.Event()
         self.release = threading.Event()
+        self.dispatched: list[dict[str, Any]] = []
 
     def hold(self, playbook_id: str, step_id: str) -> None:
         self.reached.clear()
@@ -68,6 +69,7 @@ class _Realtime:
         if handler.path == "/api/v1/playbook-steps/dispatch":
             # The API's governed dispatch too, answering as it does while
             # action execution is off: the notify was previewed, not sent.
+            self.dispatched.append(event)
             report = {"executed": False, "status": "dry_run", "summary": "DRY RUN — 'notify' was previewed and nothing was changed."}
             body = json.dumps(report).encode()
             handler.send_response(200)
@@ -436,6 +438,35 @@ class TestADecisionReachesTheRun:
 
         run = await _finished_run(agents, tenants["owner"], pause["started_run_id"])
         assert run is not None and run["status"] == "completed", "the run its caller polls never left paused"
+
+    async def test_its_actions_name_the_run_its_caller_was_given(
+        self, api: Any, agents: str, db: Any, tenants: dict[str, str], realtime: _Realtime
+    ) -> None:
+        import httpx
+
+        owner = tenants["owner"]
+        block = {"type": "block_ip", "params": {"ip": "203.0.113.7"}, "on_failure": "continue"}
+        playbook = {
+            "name": "Block either side of a sign-off",
+            "steps": [
+                {"id": "before", "name": "Blocks before sign-off", **block},
+                {"id": "gate", "name": "Analyst signs off", "type": "approval", "params": {"prompt": "Block it again?"}},
+                {"id": "after", "name": "Blocks after sign-off", **block},
+            ],
+        }
+        seen = len(realtime.dispatched)
+        async with httpx.AsyncClient(base_url=agents, headers=_service(owner), timeout=10.0) as client:
+            created = await client.post("/api/v1/playbooks", json=playbook)
+            assert created.status_code == 201, created.text
+            started = await client.post(f"/api/v1/playbooks/{created.json()['id']}/run", json={"context": {}})
+        assert started.status_code == 202, started.text
+        run_id = str(started.json()["run_id"])
+
+        await _decide(api, tenants, await _pause_at(db, owner, created.json()["id"], "gate"), "approve")
+
+        assert await _finished_run(agents, owner, run_id) is not None, "the approval was recorded and the run never finished"
+        named = {call["playbook_step_id"]: call["playbook_run_id"] for call in realtime.dispatched[seen:]}
+        assert named == {"before": run_id, "after": run_id}, f"the run is {run_id} and its actions name {named}"
 
     async def test_a_denied_run_does_not_continue(self, api: Any, agents: str, db: Any, tenants: dict[str, str]) -> None:
         pause = await _paused_run(agents, db, tenants["owner"])
