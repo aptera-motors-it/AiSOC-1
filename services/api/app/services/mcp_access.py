@@ -42,7 +42,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.mcp_access import McpToolApproval, McpToolGrant
@@ -196,6 +196,7 @@ async def authorize(
     arguments: Mapping[str, Any] | None,
     has_permission: Any,
     requested_by: str,
+    requested_by_user_id: uuid.UUID,
 ) -> Decision:
     """Answer the three questions in the module docstring, in that order.
 
@@ -253,14 +254,27 @@ async def authorize(
         # Spent here rather than left standing: an approver is deciding about
         # a call, and a grant that outlives the call it was given for is a
         # permission nobody agreed to.
-        approval.state = "consumed"
-        await db.flush()
-        return Decision(
-            outcome="allow",
-            reason=f"approved by {approval.decided_by or 'an approver'}",
-            approval_id=approval.id,
-            required_permission=permission,
-        )
+        consumed = (
+            await db.execute(
+                update(McpToolApproval)
+                .execution_options(synchronize_session=False)
+                .where(
+                    McpToolApproval.id == approval.id,
+                    McpToolApproval.tenant_id == tenant_id,
+                    McpToolApproval.state == "approved",
+                    McpToolApproval.expires_at > datetime.now(UTC),
+                )
+                .values(state="consumed")
+                .returning(McpToolApproval.id, McpToolApproval.decided_by)
+            )
+        ).one_or_none()
+        if consumed is not None:
+            return Decision(
+                outcome="allow",
+                reason=f"approved by {consumed.decided_by or 'an approver'}",
+                approval_id=consumed.id,
+                required_permission=permission,
+            )
 
     pending = (
         await db.execute(
@@ -281,6 +295,7 @@ async def authorize(
             tenant_id=tenant_id,
             tool_name=tool_name,
             argument_fingerprint=fingerprint,
+            requested_by_user_id=requested_by_user_id,
             requested_by=requested_by,
             state="pending",
             expires_at=datetime.now(UTC) + APPROVAL_TTL,

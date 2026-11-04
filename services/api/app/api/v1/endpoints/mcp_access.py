@@ -55,7 +55,7 @@ from typing import Annotated, Any
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.api.v1.deps import AuthUser, require_permission
 from app.db.rls import TenantDBSession
@@ -190,6 +190,7 @@ async def authorize_tool_call(
         arguments=body.arguments,
         has_permission=permits,
         requested_by=current_user.api_key_prefix or current_user.email,
+        requested_by_user_id=current_user.user_id,
     )
 
     await emit_audit(
@@ -422,18 +423,46 @@ async def decide_approval(
     # Separation of duties, the same rule the response-action queue follows:
     # the caller who asked cannot be the caller who agrees. `requested_by` is
     # the key prefix or the email, whichever authenticated the request.
-    requester = row.requested_by
     actor = current_user.api_key_prefix or current_user.email
-    if requester and requester == actor:
+    if row.requested_by_user_id is None or row.requested_by_user_id == current_user.user_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="The principal that requested this call cannot approve it.",
         )
 
-    row.state = "approved" if body.approve else "denied"
-    row.decided_by = actor
-    row.decided_at = datetime.now(UTC)
-    row.decision_note = body.note
+    state = "approved" if body.approve else "denied"
+    row = (
+        await db.execute(
+            update(McpToolApproval)
+            .where(
+                McpToolApproval.id == approval_id,
+                McpToolApproval.tenant_id == current_user.tenant_id,
+                McpToolApproval.state == "pending",
+            )
+            .values(
+                state=state,
+                decided_by=actor,
+                decided_at=datetime.now(UTC),
+                decision_note=body.note,
+            )
+            .returning(McpToolApproval)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        existing = (
+            await db.execute(
+                select(McpToolApproval.state).where(
+                    McpToolApproval.id == approval_id,
+                    McpToolApproval.tenant_id == current_user.tenant_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such approval")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Approval {approval_id} is already {existing}.",
+        )
 
     await emit_audit(
         db=db,

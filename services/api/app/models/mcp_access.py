@@ -67,6 +67,10 @@ class McpToolApproval(Base):
     #: arguments because those carry hostnames and queries and this row is
     #: rendered in the console.
     argument_fingerprint: Mapped[str] = mapped_column(Text, nullable=False)
+    #: The authenticated principal that made the request. This is distinct
+    #: from the key prefix retained in ``requested_by`` for display and audit:
+    #: a person may hold more than one key.
+    requested_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     requested_by: Mapped[str] = mapped_column(Text, nullable=False, default="")
     state: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
     decided_by: Mapped[str | None] = mapped_column(Text, nullable=True)

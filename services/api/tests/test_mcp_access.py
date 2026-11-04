@@ -24,6 +24,7 @@ run in production rather than a double that agrees with them.
 
 from __future__ import annotations
 
+import sqlite3
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -38,7 +39,7 @@ from app.models.mcp_access import McpToolApproval, McpToolGrant
 from app.services import mcp_access as policy
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import event, select, text
 from sqlalchemy.dialects.postgresql import INET, JSONB
 from sqlalchemy.dialects.postgresql import UUID as PgUUID
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -50,6 +51,8 @@ APPROVER = uuid.UUID("22222222-2222-2222-2222-222222222222")
 
 READ_TOOL = "aisoc_list_alerts"
 WRITE_TOOL = "aisoc_run_investigation"
+
+sqlite3.register_adapter(uuid.UUID, str)
 
 
 @compiles(JSONB, "sqlite")
@@ -70,6 +73,11 @@ def _inet_sqlite(_type_, _compiler_, **_kw_):
 @pytest_asyncio.fixture
 async def session_factory():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _sqlite_now(dbapi_connection, _connection_record) -> None:
+        dbapi_connection.create_function("NOW", 0, lambda: datetime.now(UTC).isoformat())
+
     async with engine.begin() as conn:
         # Three tables, not the whole metadata: a full create_all drags in
         # models using Postgres ARRAY, which SQLite cannot render. The FKs to
@@ -79,6 +87,18 @@ async def session_factory():
         await conn.run_sync(
             Base.metadata.create_all,
             tables=[McpToolGrant.__table__, McpToolApproval.__table__, AuditLog.__table__],
+        )
+        await conn.execute(
+            text(
+                """
+                CREATE TABLE audit_chain_head (
+                    tenant_id CHAR(36) PRIMARY KEY,
+                    head_hash VARCHAR(64),
+                    next_index BIGINT NOT NULL,
+                    updated_at DATETIME
+                )
+                """
+            )
         )
     yield async_sessionmaker(engine, expire_on_commit=False)
     await engine.dispose()
@@ -375,6 +395,23 @@ async def test_the_requester_cannot_approve_their_own_call(client) -> None:
         "/api/v1/mcp/tool-calls/authorize",
         json={"tool_name": WRITE_TOOL, "arguments": {"case_id": "case-a"}},
     ).json()
+    res = client.post(f"/api/v1/mcp/approvals/{pending['approval_id']}/decide", json={"approve": True})
+    assert res.status_code == 403
+    assert "cannot approve" in res.text
+
+
+@pytest.mark.asyncio
+async def test_another_key_owned_by_the_requester_cannot_approve_their_call(client) -> None:
+    """Separation of duties is between people, rather than credentials."""
+    client.put(f"/api/v1/mcp/tools/{WRITE_TOOL}", json={"enabled": True})
+    pending = client.post(
+        "/api/v1/mcp/tool-calls/authorize",
+        json={"tool_name": WRITE_TOOL, "arguments": {"case_id": "case-a"}},
+    ).json()
+
+    client.state_holder["user"] = _principal(  # type: ignore[attr-defined]
+        user_id=ANALYST, scopes=["*"], key_prefix="aisoc_analyst_second_key"
+    )
     res = client.post(f"/api/v1/mcp/approvals/{pending['approval_id']}/decide", json={"approve": True})
     assert res.status_code == 403
     assert "cannot approve" in res.text
