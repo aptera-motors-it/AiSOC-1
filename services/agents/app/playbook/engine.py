@@ -20,6 +20,7 @@ import re
 import secrets
 import time
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Any
@@ -996,6 +997,15 @@ async def resume_after_approval(
             pause.playbook_id,
         )
         raise PlaybookDeleted(pause.playbook_id)
+
+    # The pause stored the step list before the approval step's entry was added.
+    approval = {
+        "step_id": pause.step_id,
+        "name": next((step.name for step in playbook.steps if step.id == pause.step_id), pause.step_id),
+        "status": StepStatus.SUCCESS,
+        "result": {"outcome": "approved", "approval_id": pause.approval_id, "decided_by": decided_by, "comment": comment},
+    }
+    pause = replace(pause, step_results=[*pause.step_results, approval])
 
     # What the shipped packs gate the approved action on:
     # `steps.<approval>.outcome == 'approved'`.
