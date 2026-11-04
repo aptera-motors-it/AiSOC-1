@@ -47,7 +47,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import structlog
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from slack_bolt.adapter.fastapi.async_handler import AsyncSlackRequestHandler
 from slack_bolt.async_app import AsyncApp
 
@@ -83,11 +83,6 @@ def _build_bolt_app(api_client: AisocApiClient, actions_client: AisocActionsClie
     """
     settings = get_settings()
 
-    # ``request_verification_enabled`` defaults to True; we explicitly
-    # disable it when no signing secret is set so docker-without-secrets
-    # bring-up doesn't 401 every Slack request. Production manifests must
-    # supply ``SLACK_SIGNING_SECRET``.
-    #
     # ``token`` defaults to a placeholder when missing so Bolt doesn't
     # reject the constructor; outbound API calls obviously won't succeed
     # without a real token, but startup still works for local dev / tests.
@@ -101,9 +96,7 @@ def _build_bolt_app(api_client: AisocApiClient, actions_client: AisocActionsClie
     if not settings.signature_verification_enabled:
         logger.warning(
             "slack_signing_secret_missing",
-            note=(
-                "Bolt request-signature verification disabled — acceptable for local dev only. Set SLACK_SIGNING_SECRET before shipping."
-            ),
+            note=("Inbound Slack requests are unavailable until SLACK_SIGNING_SECRET is configured."),
         )
     if not settings.SLACK_BOT_TOKEN:
         logger.warning(
@@ -361,5 +354,7 @@ async def slack_events(req: Request):
     Single endpoint Slack posts to for slash commands and interactive
     payloads. Bolt routes internally based on the payload shape.
     """
+    if not get_settings().SLACK_SIGNING_SECRET:
+        raise HTTPException(status_code=503, detail="Slack request verification is not configured")
     handler: AsyncSlackRequestHandler = req.app.state.bolt_handler
     return await handler.handle(req)

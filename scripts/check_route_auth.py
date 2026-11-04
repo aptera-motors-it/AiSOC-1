@@ -220,9 +220,9 @@ IN_BAND_CREDENTIAL_ROUTES: dict[str, tuple[str, str]] = {
         "Teams, so there is no Bot Framework signature to verify",
     ),
     "services/teams-bot/app/main.py::teams_webhook": (
-        "handle_card_action",
-        "the Bot Framework JWT is terminated by the fronting proxy and the card payload carries our own HMAC, verified with a replay "
-        "window by handle_card_action",
+        "_authenticated_proxy",
+        "the fronting proxy validates the Bot Framework JWT and injects a secret that the service compares in constant time before it "
+        "accepts the card payload's own HMAC",
     ),
     "services/actions/app/api/router.py::chatops_callback": (
         "verify_token",

@@ -23,9 +23,10 @@ We keep the surface small for two reasons:
 from __future__ import annotations
 
 import os
+import secrets
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 
 from app._health import install_health_routes
 from app.callbacks import callback_max_age_seconds, handle_card_action
@@ -69,6 +70,19 @@ def _resolve_approver(activity: dict[str, Any]) -> str:
     return str(sender.get("aadObjectId") or "").strip() or str(sender.get("id") or "").strip() or "unknown"
 
 
+def _authenticated_proxy(request: Request) -> bool:
+    """Accept callbacks only after the Bot Framework proxy authenticated them.
+
+    The proxy validates the Bot Framework JWT and injects this deployment
+    secret after removing any client-supplied copy of the header. Keeping the
+    check in-process prevents a direct route to the container from bypassing
+    that authentication boundary.
+    """
+    expected = os.environ.get("AISOC_TEAMS_PROXY_AUTH_SECRET", "")
+    supplied = request.headers.get("X-AiSOC-Teams-Proxy-Auth", "")
+    return bool(expected) and secrets.compare_digest(supplied, expected)
+
+
 @app.post("/teams/messages")
 async def teams_webhook(request: Request) -> dict[str, Any]:
     """
@@ -89,6 +103,11 @@ async def teams_webhook(request: Request) -> dict[str, Any]:
     into an HTTP 400 with a structured body so the deployment's
     operational tooling can alert.
     """
+    if not os.environ.get("AISOC_TEAMS_PROXY_AUTH_SECRET", ""):
+        raise HTTPException(status_code=503, detail="Teams Bot Framework authentication is not configured")
+    if not _authenticated_proxy(request):
+        raise HTTPException(status_code=401, detail="Teams Bot Framework authentication failed")
+
     body = await request.json()
     if not isinstance(body, dict):
         return {"ok": False, "error": "expected JSON object"}

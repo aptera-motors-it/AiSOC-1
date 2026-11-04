@@ -1549,6 +1549,9 @@ services:
       # callback handler. Unset means the bot refuses to post rather than
       # posting a card whose buttons the handler will reject.
       AISOC_TEAMS_CALLBACK_SECRET: ${AISOC_TEAMS_CALLBACK_SECRET:-}
+      # Set by the reverse proxy only after it validates the Bot Framework
+      # JWT. The bot refuses callbacks without this second in-process check.
+      AISOC_TEAMS_PROXY_AUTH_SECRET: ${AISOC_TEAMS_PROXY_AUTH_SECRET:-}
       # Empty disables posting, which is the right default: a bot that
       # posts into a channel nobody chose is worse than one posting nowhere.
       TEAMS_APPROVALS_WEBHOOK_URL: ${TEAMS_APPROVALS_WEBHOOK_URL:-}

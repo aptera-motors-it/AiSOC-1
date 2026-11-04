@@ -484,6 +484,38 @@ async def claim_for_execution(
         await conn.close()
 
 
+async def claim_chatops_reply(action_id: str) -> bool:
+    """Atomically reserve one ChatOps callback across every action replica.
+
+    A callback must be claimed before its timeline side effect is written.
+    Process-local deduplication admitted the same signed response after a
+    restart or on another replica.
+    """
+    dsn = _dsn()
+    if dsn is None:
+        raise ActionStoreUnavailable("a durable action store is required to record a ChatOps response")
+
+    try:
+        conn = await _connect(dsn)
+    except Exception as exc:  # noqa: BLE001
+        raise ActionStoreUnavailable("the action store is configured and unreachable") from exc
+    try:
+        claimed = await conn.fetchval(
+            """
+            INSERT INTO aisoc_chatops_callback_replies (action_id)
+            VALUES ($1)
+            ON CONFLICT (action_id) DO NOTHING
+            RETURNING action_id
+            """,
+            action_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise ActionStoreUnavailable("the action store could not record the ChatOps response") from exc
+    finally:
+        await conn.close()
+    return claimed is not None
+
+
 def clear() -> None:
     """Drop the in-memory copy. Used by tests."""
     _MEMORY.clear()

@@ -40,8 +40,8 @@ class SlackBotSettings(BaseSettings):
         default="",
         description=(
             "Slack signing secret used by Bolt to verify request signatures. "
-            "Required in production; an empty value disables signature checks "
-            "and is only acceptable for local pytest runs."
+            "Required to accept inbound Slack requests. An empty value "
+            "leaves the webhook unavailable."
         ),
     )
 
@@ -119,10 +119,7 @@ class SlackBotSettings(BaseSettings):
 
     @property
     def signature_verification_enabled(self) -> bool:
-        """
-        Bolt's signature verification is mandatory in production. Tests run
-        without a signing secret, so we let them opt out explicitly.
-        """
+        """Whether the inbound Slack webhook has the required signing secret."""
         return bool(self.SLACK_SIGNING_SECRET)
 
 

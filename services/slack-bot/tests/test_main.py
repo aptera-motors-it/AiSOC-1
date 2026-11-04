@@ -92,6 +92,18 @@ def test_slack_events_route_is_registered():
     assert "/slack/events" in paths
 
 
+def test_unsigned_events_are_refused_when_the_signing_secret_is_unset(monkeypatch):
+    """The real webhook must fail closed before Bolt sees an unsigned request."""
+    monkeypatch.delenv("SLACK_SIGNING_SECRET", raising=False)
+    main_module.get_settings.cache_clear()
+    try:
+        with TestClient(main_module.app) as client:
+            response = client.post("/slack/events", data={"payload": "{}"})
+        assert response.status_code == 503
+    finally:
+        main_module.get_settings.cache_clear()
+
+
 def test_health_route_is_registered():
     paths = {getattr(route, "path", None) for route in main_module.app.routes}
     assert "/health" in paths

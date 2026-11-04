@@ -75,11 +75,6 @@ _UNKNOWN_OUTCOME_FLOOR: frozenset[BlastRadius] = frozenset({BlastRadius.MEDIUM, 
 # analyst tapping Approve on a Slack card got "Action not found" for an
 # incident that was still live. Tests reset state with `action_store.clear()`.
 
-# Replay-protection set: action IDs that have already received a response.
-# Single-use enforcement is layered on top of HMAC + expiry. Anything more
-# durable belongs in Redis once we move off the in-memory action store.
-_chatops_replied: set[str] = set()
-
 
 def _requester_id(request: ActionRequest) -> str | None:
     """Who asked for this action, for separation of duties.
@@ -736,10 +731,9 @@ async def chatops_callback(token: str = Query(..., min_length=8)):
 
     The token is the HMAC-signed payload minted by
     :class:`app.executors.chatops.ChatOpsVerifyExecutor`. We re-verify
-    the signature + expiry, dedupe against ``_chatops_replied``, write a
+    the signature + expiry, claim its action id durably, write a
     ``chatops.verify.responded`` event onto the case timeline, and update
-    the in-memory action record so ``GET /actions/{id}`` reflects the
-    final status.
+    the action record so ``GET /actions/{id}`` reflects the final status.
 
     Returns an HTML acknowledgement page so the click lands cleanly in
     Slack/Teams' default browser tab.
@@ -762,7 +756,19 @@ async def chatops_callback(token: str = Query(..., min_length=8)):
         )
 
     action_id_str = str(claims.action_id)
-    if action_id_str in _chatops_replied:
+    try:
+        first_response = await action_store.claim_chatops_reply(action_id_str)
+    except ActionStoreUnavailable as exc:
+        logger.error("chatops_callback_store_unavailable", action_id=action_id_str, error=str(exc))
+        return HTMLResponse(
+            content=_chatops_response_html(
+                "Couldn't record your response",
+                "The response store is unavailable. Please try again shortly.",
+                ok=False,
+            ),
+            status_code=503,
+        )
+    if not first_response:
         return HTMLResponse(
             content=_chatops_response_html(
                 "Response already recorded",
@@ -800,8 +806,6 @@ async def chatops_callback(token: str = Query(..., min_length=8)):
             case_id=str(claims.case_id),
             error=timeline_warning,
         )
-
-    _chatops_replied.add(action_id_str)
 
     if record is not None:
         record["status"] = ActionStatus.COMPLETED

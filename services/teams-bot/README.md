@@ -47,9 +47,10 @@ malformed, or older than `AISOC_TEAMS_CALLBACK_MAX_AGE_SECONDS` (default
 
 | Variable                                | Required | Description                                              |
 | --------------------------------------- | -------- | -------------------------------------------------------- |
-| `AISOC_TEAMS_APP_ID`                    | not read | Declared for the Bot Framework registration, but no code in this service reads it today. |
-| `AISOC_TEAMS_APP_PASSWORD`              | not read | Same — the outbound Bot Framework client is not wired yet. |
+| `AISOC_TEAMS_APP_ID`                    | proxy | Bot Framework registration identifier, used by the authenticating reverse proxy. |
+| `AISOC_TEAMS_APP_PASSWORD`              | proxy | Bot Framework credential, used by the authenticating reverse proxy. |
 | `AISOC_TEAMS_CALLBACK_SECRET`           | yes      | Shared HMAC secret used to sign + verify card payloads (`app/main.py`). |
+| `AISOC_TEAMS_PROXY_AUTH_SECRET`         | yes      | Secret injected by the reverse proxy only after it validates the Bot Framework JWT. |
 | `AISOC_TEAMS_CALLBACK_MAX_AGE_SECONDS`  | no       | Replay window for signed payloads. Default `600` (`app/callbacks.py`). |
 | `AISOC_TEAMS_HMAC_MODULE_PATH`          | no       | Test hook: redirects the HMAC signer module lookup (`app/services/hmac_signer.py`). |
 | `AISOC_API_BASE_URL`                    | yes      | `services/api` base URL — same env var as the Slack bot. |

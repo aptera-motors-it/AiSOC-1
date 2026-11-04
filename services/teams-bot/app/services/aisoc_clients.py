@@ -116,25 +116,35 @@ def build_actions_client() -> _ActionsClient:
     return _FallbackActionsClient()
 
 
-class _NullAuditSink:
+class _StructlogAuditSink:
     async def record(self, event: Any) -> None:
-        return None
+        log.info(
+            "aisoc.approval_decision",
+            case_id=event.case_id,
+            action_id=event.action_id,
+            approver_id=event.approver_id,
+            decision=event.decision,
+            channel=event.channel,
+            actor_ip=event.actor_ip,
+            source=event.source,
+            error=event.error,
+        )
 
 
 def build_audit_sink() -> _AuditSink:
-    """Construct the shared audit sink if available; null sink otherwise."""
+    """Construct the shared audit sink, retaining an audit event in every image."""
     candidate = Path(__file__).resolve().parents[3] / "slack-bot" / "app" / "services" / "approval_audit.py"
     if not candidate.exists():
-        return _NullAuditSink()
+        return _StructlogAuditSink()
     spec = importlib.util.spec_from_file_location("_aisoc_audit", candidate)
     if spec is None or spec.loader is None:
-        return _NullAuditSink()
+        return _StructlogAuditSink()
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
     except Exception as exc:  # noqa: BLE001
         log.warning("teams_bot.audit_sink_import_failed", error=str(exc))
-        return _NullAuditSink()
+        return _StructlogAuditSink()
     if hasattr(module, "StructlogAuditSink"):
         return module.StructlogAuditSink()  # type: ignore[no-any-return]
-    return _NullAuditSink()
+    return _StructlogAuditSink()
