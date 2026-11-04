@@ -66,10 +66,16 @@ async def pool():  # noqa: ANN201
     admin = await asyncpg.connect(DSN)
     await admin.execute(f'CREATE SCHEMA "{schema}"')
 
-    async def set_test_schema(conn) -> None:  # noqa: ANN001
-        await conn.execute(f'SET search_path TO "{schema}"')
-
-    created = await asyncpg.create_pool(DSN, min_size=1, max_size=2, init=set_test_schema)
+    # asyncpg runs RESET ALL whenever a pooled connection is released. A
+    # search_path applied in `init` does not survive that reset, so the next
+    # statement looks in public. A startup setting is the session default and
+    # does survive it.
+    created = await asyncpg.create_pool(
+        DSN,
+        min_size=1,
+        max_size=2,
+        server_settings={"search_path": schema},
+    )
     async with created.acquire() as conn:
         await conn.execute(_ALERTS_SCHEMA)
     try:
