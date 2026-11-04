@@ -351,6 +351,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### BREAKING
 
+- **The ingest graph stream, the metrics scrape, and an empty HMAC secret now fail closed.**
+  The graph websocket accepted a handshake with no credential and subscribed
+  to whatever `tenant_id` the query string named. `/metrics` answered
+  anonymously even when `METRICS_TOKEN` was set, and stayed open when it
+  was unset outside development. A minted push or inbox token whose HMAC
+  secret was empty skipped the signature check, and a signature computed
+  under that empty key was accepted. A caller now needs the same ingest
+  credential as the rest of the service, the scrape needs the metrics
+  bearer outside development, and a non-delegated token with no secret is
+  refused. The console proxy presents `AISOC_SERVICE_TOKEN` and the tenant
+  it already resolved, so that path still dials. Tokens minted with an
+  empty secret stop working and have to be reissued with one.
+
 - **`GET /posture/summary` now returns `null` rather than `0` for every count
   when nothing has collected.** The eight integer fields on `PostureSummary`
   — `total`, `critical`, `high`, `medium`, `low`, `open`, `resolved` and

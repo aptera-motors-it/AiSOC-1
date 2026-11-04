@@ -68,9 +68,10 @@ func (e *Error) Error() string { return e.Msg }
 // Identity is the outcome of authenticating one request.
 type Identity struct {
 	Principal Principal
-	// HMACSecret is non-empty when the presented token was minted with a
-	// signature secret, in which case the body must carry a matching
-	// X-Signature. Empty means the token itself is the only authenticator.
+	// HMACSecret is the signature secret a minted token was issued with.
+	// Empty is not a mode: VerifySignature refuses a non-delegated identity
+	// that has none. A delegated service credential has no second secret;
+	// the service token itself is the authenticator.
 	HMACSecret string
 }
 
@@ -251,13 +252,23 @@ func (a *Authenticator) authenticateService(ctx context.Context, r *http.Request
 	return Identity{Principal: NewPrincipal("service", true, id)}, nil
 }
 
-// VerifySignature enforces the optional HMAC-SHA256 body signature when the
-// presented token was minted with a secret. Same headers and same
-// constant-time comparison as the inbox routes, so an operator who has
-// signed one push path already knows how to sign this one.
+// VerifySignature requires an HMAC-SHA256 body signature for a minted token.
+//
+// A delegated service credential is already the shared secret and has
+// nothing further to sign. An empty secret on a minted token used to skip
+// the check, so the token alone — the thing that ends up in a vendor's
+// webhook configuration and in access logs — was enough to submit. A
+// signature computed under that empty key is the same skip: anyone who
+// can see the URL can produce it.
 func VerifySignature(r *http.Request, id Identity, body []byte) error {
-	if id.HMACSecret == "" {
+	if id.Principal.Delegated {
 		return nil
+	}
+	if strings.TrimSpace(id.HMACSecret) == "" {
+		return &Error{
+			Status: http.StatusUnauthorized,
+			Msg:    "this token has no HMAC secret; mint one with a secret and set X-Signature: sha256=<hex>",
+		}
 	}
 	provided := r.Header.Get("X-Signature")
 	if provided == "" {

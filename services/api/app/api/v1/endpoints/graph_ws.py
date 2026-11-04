@@ -12,11 +12,11 @@ Why a proxy and not direct?
 ---------------------------
 Two reasons:
 
-  1. **Auth boundary.** The ingest WebSocket runs on the internal
-     service network and has no notion of users. The API service
-     already owns the auth path (``app.api.v1.deps.get_current_user``)
-     and the RBAC model. Re-implementing JWT/API-key validation
-     inside the Go broadcaster would duplicate state and risk drift.
+  1. **Auth boundary.** The browser's session is checked here. The
+     ingest broadcaster is the next hop, and it checks a credential
+     of its own: the service token (``AISOC_SERVICE_TOKEN``) plus the
+     tenant this proxy already resolved. A query-string tenant on
+     that hop is not a subscription.
   2. **Tenant binding.** A browser-facing endpoint that respects an
      attacker-supplied ``?tenant_id=...`` query param is a
      cross-tenant leak waiting to happen. We rebind the tenant
@@ -80,6 +80,29 @@ router = APIRouter(prefix="/graph_ws", tags=["graph", "realtime"])
 # Operators override per-deployment with AISOC_INGEST_GRAPH_WS_URL,
 # e.g. ws://ingest.aisoc.svc.cluster.local:8080/v1/graph_ws/stream.
 _DEFAULT_UPSTREAM = "ws://ingest:8080/v1/graph_ws/stream"
+
+
+def _upstream_credential() -> str:
+    """The shared secret ingest accepts for a service-to-service dial."""
+
+    return (os.environ.get("AISOC_SERVICE_TOKEN") or "").strip()
+
+
+def _upstream_headers(tenant_id: uuid.UUID) -> dict[str, str]:
+    """Headers the ingest broadcaster checks on the upgrade.
+
+    The browser's session token stops at this proxy. The internal dial
+    is a different hop. The service token is the credential ingest
+    already requires on its write routes; the tenant header is the
+    declaration that credential has to make, and it is the tenant this
+    proxy resolved from the caller. Neither value goes in the URL,
+    because the URL is what ends up in an access log.
+    """
+
+    return {
+        "Authorization": f"Bearer {_upstream_credential()}",
+        "X-Tenant-ID": str(tenant_id),
+    }
 
 
 def _upstream_url(tenant_id: uuid.UUID) -> str:
@@ -203,6 +226,13 @@ async def graph_updates_stream(
         return
 
     upstream_url = _upstream_url(user.tenant_id)
+    if not _upstream_credential():
+        logger.error("graph_ws: AISOC_SERVICE_TOKEN is unset; refusing to dial ingest")
+        await websocket.close(
+            code=status.WS_1011_INTERNAL_ERROR,
+            reason="ingest service credential is not configured",
+        )
+        return
     logger.info(
         "graph_ws: proxying for tenant=%s upstream=%s user=%s",
         user.tenant_id,
@@ -211,7 +241,7 @@ async def graph_updates_stream(
     )
 
     try:
-        await _relay(websocket, upstream_url)
+        await _relay(websocket, upstream_url, _upstream_headers(user.tenant_id))
     except WebSocketDisconnect:
         logger.debug("graph_ws: client disconnected tenant=%s", user.tenant_id)
     except Exception as exc:  # pragma: no cover — defensive
@@ -230,7 +260,7 @@ async def graph_updates_stream(
             pass
 
 
-async def _relay(websocket: WebSocket, upstream_url: str) -> None:
+async def _relay(websocket: WebSocket, upstream_url: str, headers: dict[str, str]) -> None:
     """Pipe envelopes from the internal broadcaster to the browser.
 
     We use ``httpx`` for the upstream WebSocket because the existing
@@ -254,7 +284,7 @@ async def _relay(websocket: WebSocket, upstream_url: str) -> None:
         return
 
     try:
-        async with aconnect_ws(upstream_url) as upstream:
+        async with aconnect_ws(upstream_url, headers=headers) as upstream:
             done: asyncio.Event = asyncio.Event()
 
             async def client_to_upstream() -> None:

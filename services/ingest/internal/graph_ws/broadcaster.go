@@ -7,9 +7,10 @@
 //     publishes to. Each message is a graph.GraphUpdate envelope.
 //  2. Demux per-tenant: the Kafka envelope carries tenant_id; the
 //     broadcaster maintains a tenant -> subscribers map so a client
-//     opened with ?tenant_id=X only receives updates whose tenant_id
+//     subscribed as tenant X only receives updates whose tenant_id
 //     matches X (or are unscoped, for the global cross-tenant admin
-//     view which is currently not exposed to end users).
+//     view which is currently not exposed to end users). The HTTP
+//     upgrade decides X from the credential, not from the query string.
 //  3. Fan out with backpressure: each subscriber has a bounded buffer.
 //     If the buffer is full (a slow client) the broadcaster drops the
 //     in-flight message for that subscriber and increments

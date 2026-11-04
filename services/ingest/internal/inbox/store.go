@@ -259,6 +259,11 @@ func (s *Store) evictIfFullLocked() {
 // logged at debug level; this metadata is purely for the UI's "last
 // vendor delivery" badge so a missed update never affects ingest.
 func (s *Store) touchLastUsed(token string) {
+	// Resolve fires this on a cache hit, including when a test store has no
+	// pool. A metadata write must not take the request down with it.
+	if s == nil || s.pool == nil {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_, err := s.pool.Exec(ctx, `

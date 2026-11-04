@@ -3,6 +3,8 @@ package server
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"fmt"
 	"net/http"
 	"os"
@@ -10,6 +12,7 @@ import (
 	"time"
 
 	"github.com/beenuar/aisoc/services/ingest/internal/config"
+	"github.com/beenuar/aisoc/services/ingest/internal/envmode"
 	"github.com/beenuar/aisoc/services/ingest/internal/graph_ws"
 	"github.com/beenuar/aisoc/services/ingest/internal/handler"
 	"github.com/beenuar/aisoc/services/ingest/internal/inbox"
@@ -118,7 +121,7 @@ func New(cfg *config.Config, h *handler.Handler, inboxHandler *inbox.Handler, gr
 	r.Get("/health", h.Health)
 	r.Get("/livez", h.Livez)
 	r.Get("/readyz", h.Readyz)
-	r.Get("/metrics", promhttp.Handler().ServeHTTP)
+	r.Get("/metrics", serveMetrics)
 
 	r.Route("/v1", func(r chi.Router) {
 		r.Post("/ingest", h.IngestEvents)
@@ -149,14 +152,13 @@ func New(cfg *config.Config, h *handler.Handler, inboxHandler *inbox.Handler, gr
 			log.Warn().Msg("inbox routes disabled (no Postgres pool wired)")
 		}
 
-		// T1.4 — graph-update WebSocket fan-out. The Python API
-		// proxy at services/api/app/api/v1/endpoints/graph_ws.py is
-		// the public-facing entry point (auth + tenant binding); the
-		// ingest route is internal and trusts that the proxy has
-		// validated the connecting tenant. We still require
-		// ?tenant_id=<id> as a defence-in-depth filter so a misrouted
-		// internal client can't subscribe to every tenant by accident.
+		// Graph-update WebSocket. The Python proxy is what a browser
+		// talks to. This hop authenticates the caller itself, with the
+		// same credential /v1/ingest uses, and subscribes to the tenant
+		// that credential covers. A query-string tenant is intersected
+		// with it; it does not select the subscription.
 		if graphWSServer != nil {
+			graphWSServer.SetAuthenticator(h.Authenticator())
 			r.Handle("/graph_ws/stream", graphWSServer.Handler())
 		}
 
@@ -178,6 +180,47 @@ func New(cfg *config.Config, h *handler.Handler, inboxHandler *inbox.Handler, gr
 			IdleTimeout:  120 * time.Second,
 		},
 	}
+}
+
+// serveMetrics is the Prometheus scrape.
+//
+// The same rule as the API and the agents service: a bearer token when
+// METRICS_TOKEN is set, compared in constant time, and a refusal rather
+// than an anonymous scrape when it is unset outside a development
+// environment. This process is the one that sees every event, so an open
+// scrape is a map of which tenants are receiving what.
+func serveMetrics(w http.ResponseWriter, r *http.Request) {
+	token := strings.TrimSpace(os.Getenv("METRICS_TOKEN"))
+	if token != "" {
+		if !metricsTokenMatches(presentedBearer(r), token) {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="metrics"`)
+			http.Error(w, "invalid metrics token", http.StatusUnauthorized)
+			return
+		}
+	} else if !envmode.IsDevRuntime() {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="metrics"`)
+		http.Error(w, "metrics endpoint requires METRICS_TOKEN outside development", http.StatusUnauthorized)
+		return
+	}
+	promhttp.Handler().ServeHTTP(w, r)
+}
+
+func presentedBearer(r *http.Request) string {
+	parts := strings.Fields(r.Header.Get("Authorization"))
+	if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+		return parts[1]
+	}
+	return ""
+}
+
+// metricsTokenMatches compares digests so a shorter guess does not return
+// early, and so the comparison itself does not leak the token.
+func metricsTokenMatches(presented, want string) bool {
+	sum := func(s string) []byte {
+		d := sha256.Sum256([]byte(s))
+		return d[:]
+	}
+	return hmac.Equal(sum(presented), sum(want))
 }
 
 // Start runs the HTTP server and gracefully shuts down when ctx is cancelled
