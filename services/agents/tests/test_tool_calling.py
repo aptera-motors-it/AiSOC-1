@@ -57,6 +57,40 @@ async def test_registry_execute_runs_real_tool_and_handles_unknown():
 
 
 @pytest.mark.asyncio
+async def test_registry_refuses_arguments_outside_the_tool_schema():
+    called = False
+
+    def _tool(**kwargs: str) -> str:
+        nonlocal called
+        called = True
+        return kwargs["text"]
+
+    registry = ToolRegistry(
+        [
+            Tool(
+                name="echo",
+                description="Echo one string.",
+                parameters={
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"],
+                },
+                fn=_tool,
+            )
+        ]
+    )
+    result = await registry.execute(
+        "echo",
+        {"text": "safe", "unexpected": "attacker-controlled"},
+        identity=issue_identity("investigation", run_id="run-1").with_granted_tools({"echo"}),
+    )
+
+    assert "error" in result
+    assert "unexpected" in result["error"]
+    assert called is False
+
+
+@pytest.mark.asyncio
 async def test_tool_loop_executes_selected_tool_then_answers():
     reg = default_registry()
     llm = _FakeLLM([_tool_call("extract_iocs", {"text": "45.9.148.99 and evil.example"}), _final("Two IOCs found.")])

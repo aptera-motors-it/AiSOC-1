@@ -60,7 +60,7 @@ def deployment_enabled() -> bool:
 
 
 def live_playbook_ids() -> set[str]:
-    """Playbooks allowed to run live, as `tenant:playbook` or `playbook`.
+    """Playbooks allowed to run live, as `tenant:playbook`.
 
     Read per call rather than cached, so turning one off takes effect on
     the next alert rather than on the next restart. A playbook that can
@@ -73,7 +73,7 @@ def live_playbook_ids() -> set[str]:
 
 def is_live(*, tenant_id: str, playbook_id: str) -> bool:
     allowed = live_playbook_ids()
-    return bool(allowed & {f"{tenant_id}:{playbook_id}", playbook_id})
+    return f"{tenant_id}:{playbook_id}" in allowed
 
 
 @dataclass
@@ -113,12 +113,7 @@ def alert_context(state: Any) -> dict[str, Any]:
         "tags": raw.get("tags") or [],
         "title": raw.get("title") or "",
         "verdict": getattr(state, "verdict", None),
-        "confidence": getattr(state, "confidence", None),
     }
-    for key in ("host", "hostname", "username", "user", "src_ip", "dst_ip", "domain", "file_hash"):
-        value = raw.get(key)
-        if value:
-            context.setdefault(key, value)
     return context
 
 

@@ -74,7 +74,7 @@ class TestTheLiveList:
         [
             ("t-1:pb-1", "t-1", "pb-1", True),
             ("t-1:pb-1", "t-2", "pb-1", False),
-            ("pb-1", "t-9", "pb-1", True),
+            ("pb-1", "t-9", "pb-1", False),
             ("pb-2", "t-1", "pb-1", False),
             ("", "t-1", "pb-1", False),
             ("t-1:pb-1, t-1:pb-2", "t-1", "pb-2", True),
@@ -88,7 +88,7 @@ class TestTheLiveList:
         """Turning one off should take effect on the next alert, not the
         next restart. A playbook that can contain a host should be
         switchable off faster than a deploy."""
-        monkeypatch.setenv(alert_trigger.LIVE_PLAYBOOKS_ENV, "pb-1")
+        monkeypatch.setenv(alert_trigger.LIVE_PLAYBOOKS_ENV, "t:pb-1")
         assert alert_trigger.is_live(tenant_id="t", playbook_id="pb-1") is True
         monkeypatch.setenv(alert_trigger.LIVE_PLAYBOOKS_ENV, "")
         assert alert_trigger.is_live(tenant_id="t", playbook_id="pb-1") is False
@@ -104,17 +104,16 @@ class TestTheTriggerContext:
         assert context["tags"] == ["identity"]
         assert context["tenant_id"] == "t-1"
 
-    def test_it_carries_the_verdict_and_confidence(self) -> None:
-        """A playbook's conditions read them, which is why the trigger runs
-        after triage rather than before."""
+    def test_it_does_not_carry_model_confidence(self) -> None:
+        """A model score must not raise a response action's autonomy band."""
         context = alert_trigger.alert_context(_State(verdict="benign", confidence=0.4))
         assert context["verdict"] == "benign"
-        assert context["confidence"] == 0.4
+        assert "confidence" not in context
 
-    def test_entity_fields_are_lifted_for_templating(self) -> None:
+    def test_it_does_not_carry_alert_entities_into_response_context(self) -> None:
         context = alert_trigger.alert_context(_State(raw_alert={"severity": "high", "host": "WIN-01", "username": "j.doe"}))
-        assert context["host"] == "WIN-01"
-        assert context["username"] == "j.doe"
+        assert "host" not in context
+        assert "username" not in context
 
     def test_a_malformed_alert_does_not_raise(self) -> None:
         context = alert_trigger.alert_context(_State(raw_alert="not a dict"))
@@ -163,10 +162,12 @@ class TestRunning:
         monkeypatch.setenv(alert_trigger.LIVE_PLAYBOOKS_ENV, "t-1:pb-1")
 
         seen: list[bool] = []
+        contexts: list[dict[str, Any]] = []
 
         class _Engine:
-            async def run(self, playbook, context, *, dry_run=False):  # noqa: ANN001, ANN202, ARG002
+            async def run(self, playbook, context, *, dry_run=False):  # noqa: ANN001, ANN202
                 seen.append(dry_run)
+                contexts.append(context)
 
                 class _Run:
                     run_id = "r1"
@@ -186,9 +187,11 @@ class TestRunning:
         monkeypatch.setattr(engine, "PlaybookEngine", _Engine)
         monkeypatch.setattr(store.PlaybookStore, "default", staticmethod(lambda: _Store()))
 
-        outcome = await alert_trigger.run_for_alert(_State())
+        outcome = await alert_trigger.run_for_alert(_State(confidence=0.99, raw_alert={"severity": "high", "host": "attacker-controlled"}))
         assert seen == [False]
         assert outcome.executed and not outcome.previewed
+        assert "confidence" not in contexts[0]
+        assert "host" not in contexts[0]
 
     async def test_a_playbook_failure_does_not_lose_the_triage_result(self, monkeypatch) -> None:  # noqa: ANN001
         monkeypatch.setenv(alert_trigger.ENABLED_ENV, "1")
