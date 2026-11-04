@@ -2061,6 +2061,7 @@ class PlaybookEngine:
             # the realtime stream and the ledger rather than appearing as
             # a second, unrelated one that starts halfway through.
             pr.run_id = resume_run_id
+            pr.context["_run_id"] = resume_run_id
         if resume_results:
             pr.step_results = list(resume_results)
         pr.started_at = datetime.now(UTC).isoformat()
