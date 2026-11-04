@@ -423,6 +423,21 @@ class TestADecisionReachesTheRun:
         gated = {step["step_id"]: step["status"] for step in run["step_results"]}.get("after")
         assert gated == "success", f"both approvals were granted and the step gated on the first reads {gated}"
 
+    async def test_its_completed_record_names_the_approval_and_who_decided_it(
+        self, api: Any, agents: str, db: Any, tenants: dict[str, str]
+    ) -> None:
+        pause = await _paused_run(agents, db, tenants["owner"])
+
+        await _decide(api, tenants, pause, "approve")
+
+        run = await _finished_run(agents, tenants["owner"], pause["run_id"])
+        assert run is not None and run["status"] == "completed", f"the approved run reads {run and run['status']}"
+        listed = [step["step_id"] for step in run["step_results"]]
+        assert listed == ["gate", "after"], f"the completed record lists {listed}"
+        gate = run["step_results"][0]
+        assert gate["status"] == "success", gate
+        assert gate["result"]["decided_by"] == tenants["owner_user"], gate
+
     async def test_the_run_its_caller_started_is_the_one_that_continues(
         self, api: Any, agents: str, db: Any, tenants: dict[str, str]
     ) -> None:
