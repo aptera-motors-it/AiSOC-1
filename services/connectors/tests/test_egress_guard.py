@@ -32,6 +32,8 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from app.connectors.duo_security import DuoSecurityConnector
+from app.connectors.splunk import SplunkConnector
 from app.security.egress import EgressRefused, refuse_internal_destinations
 
 INTERNAL_URLS = [
@@ -73,6 +75,12 @@ def test_non_url_strings_and_non_strings_are_ignored() -> None:
             "host_label": "prod-splunk",  # not a URL shape; out of scope by design
         }
     )
+
+
+def test_bare_destination_hostname_is_refused() -> None:
+    with pytest.raises(EgressRefused) as exc_info:
+        refuse_internal_destinations({"api_hostname": "10.0.0.5"})
+    assert exc_info.value.field_name == "api_hostname"
 
 
 def test_list_values_are_walked() -> None:
@@ -152,6 +160,50 @@ async def test_the_test_route_refuses_internal_destinations(client: httpx.AsyncC
         )
     assert r.status_code == 422, r.text
     assert "destination refused" in r.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        (
+            "/api/v1/connectors/splunk/query",
+            {
+                "auth_config": {"token": "x"},
+                "connector_config": {"base_url": "http://169.254.169.254"},
+                "query": {"free_text": "index=notable"},
+            },
+        ),
+        (
+            "/api/v1/connectors/splunk/resource_config",
+            {
+                "auth_config": {"token": "x"},
+                "connector_config": {"base_url": "http://169.254.169.254"},
+                "resource_id": "resource",
+            },
+        ),
+        (
+            "/api/v1/connectors/duo_security/test",
+            {
+                "auth_config": {"integration_key": "x", "secret_key": "x", "api_hostname": "10.0.0.5"},
+            },
+        ),
+    ],
+)
+async def test_credentialed_routes_refuse_internal_destinations(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, path: str, payload: dict[str, object]
+) -> None:
+    monkeypatch.setattr(SplunkConnector, "query", AsyncMock(return_value=[]))
+    monkeypatch.setattr(SplunkConnector, "get_resource_config", AsyncMock(return_value={}))
+    monkeypatch.setattr(DuoSecurityConnector, "test_connection", AsyncMock(return_value={"success": True}))
+    async with client as c:
+        response = await c.post(
+            path,
+            headers={"Authorization": f"Bearer {_console_jwt('viewer')}"},
+            json=payload,
+        )
+    assert response.status_code == 422, response.text
+    assert "destination refused" in response.text
 
 
 @pytest.mark.asyncio

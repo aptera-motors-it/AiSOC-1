@@ -247,6 +247,16 @@ def _instantiate_or_422(cls: type, kwargs: dict[str, Any]) -> Any:
         ) from exc
 
 
+def _refuse_internal_destinations_or_422(kwargs: dict[str, Any]) -> None:
+    try:
+        refuse_internal_destinations(kwargs)
+    except EgressRefused as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+
+
 def _require_capability(cls: type, capability: Capability, connector_id: str) -> None:
     """Reject calls to a connector that doesn't declare ``capability``.
 
@@ -347,13 +357,7 @@ async def test_connector_connection(connector_id: str, payload: TestConnectionRe
     # base_url pointing at cloud metadata, loopback or an internal service is
     # refused here rather than fetched and reflected (GHSA-cq4g-g6wp-4m2w —
     # this exact route was the reproduced entry point).
-    try:
-        refuse_internal_destinations(kwargs)
-    except EgressRefused as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc),
-        ) from exc
+    _refuse_internal_destinations_or_422(kwargs)
 
     try:
         connector = cls(**kwargs)
@@ -464,6 +468,7 @@ async def get_instance_resource_config(
         ) from exc
 
     kwargs = {**auth, **_connector_kwargs(target.connector_config or {})}
+    _refuse_internal_destinations_or_422(kwargs)
     try:
         connector = cls(**kwargs)
     except TypeError as exc:
@@ -503,6 +508,7 @@ async def get_resource_config(connector_id: str, payload: ResourceConfigRequest)
         raise HTTPException(status_code=404, detail=f"Connector '{connector_id}' not found")
 
     kwargs = {**payload.auth_config, **payload.connector_config}
+    _refuse_internal_destinations_or_422(kwargs)
     try:
         connector = cls(**kwargs)
     except TypeError as exc:
@@ -608,6 +614,7 @@ async def run_federated_query(connector_id: str, payload: FederatedQueryRequest)
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
 
     kwargs = {**payload.auth_config, **payload.connector_config}
+    _refuse_internal_destinations_or_422(kwargs)
     try:
         connector = cls(**kwargs)
     except TypeError as exc:

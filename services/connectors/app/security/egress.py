@@ -13,19 +13,11 @@ service's network position, with the test response as an oracle.
 What is validated
 -----------------
 Every **value** in the merged constructor kwargs that is an ``http(s)://``
-URL, under whatever key the connector's schema chose (``base_url``,
-``api_url``, ``instance_url``, ``gitlab_url``, ``spool_url``, …). Matching on
-the value's shape rather than a list of key names is deliberate: the census
-found 18 connectors declaring ``base_url`` and a dozen other spellings, and a
-key-name list is the kind of one-directional check that silently misses the
-next connector. Lists are walked for their string items.
-
-Known residual, stated rather than hidden: a connector that assembles its URL
-from a bare host/subdomain field (``host``, ``domain``, ``api_hostname``,
-``subdomain``) is not covered by the value-shape rule — synthesizing URLs from
-those would refuse legitimate values like a bare vendor subdomain. Those
-fields are tenant-vendor hostnames rather than full destinations, and the
-vendors' own TLS endpoints bound what they can reach.
+URL is checked under whatever key the connector's schema chose (``base_url``,
+``api_url``, ``instance_url``, ``gitlab_url``, ``spool_url``, …). The
+well-known bare destination fields (``host``, ``hostname``, ``api_hostname``,
+``domain``, and ``subdomain``) are checked by treating them as HTTPS
+destinations. Lists are walked for their string items.
 
 Two refusal classes, deliberately (same split as the outbound-webhook
 delivery path): a *policy* refusal — metadata endpoint, loopback, private
@@ -48,6 +40,8 @@ from app.security.ssrf_guard import SSRFError, validate_outbound_url
 
 __all__ = ["EgressRefused", "refuse_internal_destinations"]
 
+_BARE_HOST_FIELDS = frozenset({"host", "hostname", "api_hostname", "domain", "subdomain"})
+
 
 class EgressRefused(ValueError):
     """A connector config named a destination inside the deployment."""
@@ -59,7 +53,7 @@ class EgressRefused(ValueError):
 
 
 def refuse_internal_destinations(kwargs: dict[str, Any]) -> None:
-    """Validate every URL-shaped value in a connector's constructor kwargs.
+    """Validate every URL or known bare-host value in connector constructor kwargs.
 
     Raises :class:`EgressRefused` naming the offending field on a policy
     refusal. A resolution failure (the guard chains ``socket.gaierror``) is
@@ -68,10 +62,16 @@ def refuse_internal_destinations(kwargs: dict[str, Any]) -> None:
     for field_name, value in kwargs.items():
         items = value if isinstance(value, list) else [value]
         for item in items:
-            if not isinstance(item, str) or not item.startswith(("http://", "https://")):
+            if not isinstance(item, str):
+                continue
+            if item.startswith(("http://", "https://")):
+                destination = item
+            elif field_name in _BARE_HOST_FIELDS:
+                destination = f"https://{item}"
+            else:
                 continue
             try:
-                validate_outbound_url(item)
+                validate_outbound_url(destination)
             except SSRFError as exc:
                 if isinstance(exc.__cause__, socket.gaierror):
                     continue
