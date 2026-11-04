@@ -17,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 import pytest_asyncio
 
@@ -127,8 +128,6 @@ def realtime() -> Iterator[_Realtime]:
 
 @pytest.fixture(scope="module")
 def agents(tmp_path_factory: pytest.TempPathFactory, realtime: _Realtime) -> Any:
-    import httpx
-
     port = _free_port()
     env = {
         **os.environ,
@@ -200,8 +199,6 @@ async def db() -> AsyncIterator[Any]:
 
 @pytest_asyncio.fixture(scope="module", loop_scope="module")
 async def api(agents: str) -> AsyncIterator[Any]:
-    import httpx
-
     os.environ["DATABASE_URL"] = _dsn()
     os.environ["AISOC_SERVICE_TOKEN"] = SERVICE_TOKEN
     os.environ["SECRET_KEY"] = CONSOLE_SECRET
@@ -293,8 +290,6 @@ async def _started_run(
     callback_first: bool = False,
     **gate: Any,
 ) -> tuple[str, str]:
-    import httpx
-
     playbook = {
         "name": "Contain after sign-off",
         "steps": [
@@ -362,8 +357,6 @@ async def _pause_status(db: Any, pause: dict[str, Any]) -> str:
 
 
 async def _run_record(agents: str, tenant: str, run_id: str) -> dict[str, Any] | None:
-    import httpx
-
     async with httpx.AsyncClient(base_url=agents, headers=_service(tenant), timeout=10.0) as client:
         response = await client.get(f"/api/v1/playbooks/runs/{run_id}")
     return response.json() if response.status_code == 200 else None
@@ -387,8 +380,6 @@ async def _decide(api: Any, tenants: dict[str, str], pause: dict[str, Any], deci
 
 
 async def _resume_directly(agents: str, pause: dict[str, Any], headers: dict[str, str]) -> int:
-    import httpx
-
     async with httpx.AsyncClient(base_url=agents, headers=headers, timeout=10.0) as client:
         response = await client.post(f"/api/v1/playbooks/approvals/{pause['approval_id']}/resume")
     return response.status_code
@@ -457,8 +448,6 @@ class TestADecisionReachesTheRun:
     async def test_its_actions_name_the_run_its_caller_was_given(
         self, api: Any, agents: str, db: Any, tenants: dict[str, str], realtime: _Realtime
     ) -> None:
-        import httpx
-
         owner = tenants["owner"]
         block = {"type": "block_ip", "params": {"ip": "203.0.113.7"}, "on_failure": "continue"}
         playbook = {
@@ -473,11 +462,12 @@ class TestADecisionReachesTheRun:
         async with httpx.AsyncClient(base_url=agents, headers=_service(owner), timeout=10.0) as client:
             created = await client.post("/api/v1/playbooks", json=playbook)
             assert created.status_code == 201, created.text
-            started = await client.post(f"/api/v1/playbooks/{created.json()['id']}/run", json={"context": {}})
+            playbook_id = created.json()["id"]
+            started = await client.post(f"/api/v1/playbooks/{playbook_id}/run", json={"context": {}})
         assert started.status_code == 202, started.text
         run_id = str(started.json()["run_id"])
 
-        await _decide(api, tenants, await _pause_at(db, owner, created.json()["id"], "gate"), "approve")
+        await _decide(api, tenants, await _pause_at(db, owner, playbook_id, "gate"), "approve")
 
         assert await _finished_run(agents, owner, run_id) is not None, "the approval was recorded and the run never finished"
         named = {call["playbook_step_id"]: call["playbook_run_id"] for call in realtime.dispatched[seen:]}
@@ -634,8 +624,6 @@ class TestAnEarlierResumeCannotUndoALaterDecision:
 
 
 async def _unsent_verification(agents: str, db: Any, tenant: str, *, gates: tuple[str, ...] = ()) -> dict[str, str]:
-    import httpx
-
     playbook = {
         "name": "Ask the account holder",
         "steps": [
@@ -663,8 +651,6 @@ async def _unsent_verification(agents: str, db: Any, tenant: str, *, gates: tupl
 
 
 async def _answer(agents: str, token: str) -> int:
-    import httpx
-
     signature = hmac.new(ANSWER_SECRET.encode(), f"{token}|acknowledged|user".encode(), hashlib.sha256).hexdigest()
     async with httpx.AsyncClient(base_url=agents, timeout=60.0) as client:
         response = await client.get(f"/api/v1/playbook-verifications/{token}/acknowledged", params={"sig": signature})
@@ -809,8 +795,6 @@ class TestADecisionBeforeItsPauseIsWritten:
 
 class TestAPlaybookDeletedWhileItsRunWaits:
     async def test_an_approval_after_the_delete_fails_the_run(self, api: Any, agents: str, db: Any, tenants: dict[str, str]) -> None:
-        import httpx
-
         owner = tenants["owner"]
         pause = await _paused_run(agents, db, owner)
         async with httpx.AsyncClient(base_url=agents, headers=_service(owner), timeout=10.0) as client:
