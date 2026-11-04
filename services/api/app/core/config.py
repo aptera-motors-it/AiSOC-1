@@ -1227,22 +1227,35 @@ class InsecureProductionDefaultsError(RuntimeError):
     """Raised at boot when insecure defaults remain in a production deploy."""
 
 
+def _refuses_insecure_defaults(env: str | None) -> bool:
+    """Environments that must not serve with a published secret still in place.
+
+    ``production`` was the original gate. ``demo`` is included for every
+    insecure default that is still present when this runs. A published
+    ``SECRET_KEY`` is not one of them: the model validator above replaces
+    it with a per-process key so the documented demo deploy still starts.
+    """
+    return (env or "").strip().lower() in {"production", "demo"}
+
+
 def enforce_secure_defaults(s: Settings | None = None) -> list[str]:
-    """Warn everywhere; **hard-fail the boot** in production (Phase 2).
+    """Warn everywhere; **hard-fail the boot** in production and demo.
 
-    ``warn_if_insecure_defaults`` only warns, which means a production deploy
-    can silently start with ``changeme``/placeholder secrets. This wrapper is
+    ``warn_if_insecure_defaults`` only warns, which means a deploy can
+    silently start with ``changeme``/placeholder secrets. This wrapper is
     the boot-time gate: it emits the same warnings and then, if
-    ``ENVIRONMENT=production`` and any insecure default remains, raises so the
-    container crash-loops loudly instead of serving with a known-bad secret.
+    ``ENVIRONMENT`` is ``production`` or ``demo`` and any insecure default
+    remains, raises so the container crash-loops loudly instead of serving
+    with a known-bad secret.
 
-    Returns the (empty, in a healthy prod) list of messages so callers/tests
+    Returns the (empty, in a healthy boot) list of messages so callers/tests
     can assert on it.
     """
     s = s or settings
     msgs = warn_if_insecure_defaults(s)
-    if is_production(s.ENVIRONMENT) and msgs:
-        raise InsecureProductionDefaultsError("Refusing to boot in production with insecure defaults:\n  - " + "\n  - ".join(msgs))
+    if _refuses_insecure_defaults(s.ENVIRONMENT) and msgs:
+        label = (s.ENVIRONMENT or "").strip().lower()
+        raise InsecureProductionDefaultsError(f"Refusing to boot in {label} with insecure defaults:\n  - " + "\n  - ".join(msgs))
     return msgs
 
 

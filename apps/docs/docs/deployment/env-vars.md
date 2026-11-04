@@ -238,12 +238,12 @@ its migrations do not create.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OPENSEARCH_URL` | `http://localhost:9200` | OpenSearch base URL |
+| `OPENSEARCH_URL` | `https://localhost:9200` | OpenSearch base URL. The node requires the admin password in `OPENSEARCH_INITIAL_ADMIN_PASSWORD`, which `make env` generates. |
 | `ES_URL` | — | Deployment-wide Elasticsearch cluster for scheduled hunts. Optional: the normal path is a per-tenant **Elastic connector** added from the console, whose endpoint and secret are vault-encrypted. Set this only if one cluster serves every tenant. |
 | `ES_API_KEY` | — | API key paired with `ES_URL`. Both must be set for the fallback to apply. |
 | `NEO4J_URI` | `bolt://localhost:7687` | Neo4j Bolt URI |
 | `NEO4J_USER` | `neo4j` | Neo4j user |
-| `NEO4J_PASSWORD` | — | Neo4j password |
+| `NEO4J_PASSWORD` | _empty_ | Neo4j password. `make env` generates one. |
 | `QDRANT_URL` | `http://localhost:6333` | Qdrant base URL |
 | `CLICKHOUSE_HOST` / `CLICKHOUSE_PORT` / `CLICKHOUSE_DATABASE` / `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` | `localhost` / `9000` / `aisoc` / `default` / — | ClickHouse connection details |
 
@@ -276,7 +276,7 @@ Source: [`services/agents/app/`](https://github.com/beenuar/AiSOC/tree/main/serv
 |----------|---------|-------------|
 | `OPENAI_API_KEY` | — | Provider key. With the bundled gateway running, the *gateway* uses this to reach the upstream model; AiSOC itself authenticates with `LITELLM_MASTER_KEY`. |
 | `LLM_GATEWAY_URL` | `http://litellm:4000/v1` (set by compose) | In-network URL of the bundled LiteLLM gateway. Both resolvers read it for any `aisoc-<role>` alias — an alias resolves nowhere else. A concrete `AISOC_MODEL_PIN_<ROLE>` is left pointing at its provider. |
-| `LITELLM_MASTER_KEY` | `sk-aisoc-local` in compose | Bearer AiSOC sends when it routes to the gateway itself. Resolved *with* the URL, so a provider key is never sent to the gateway (it rejects one). |
+| `LITELLM_MASTER_KEY` | _empty_ | Bearer AiSOC sends when it routes to the gateway itself. `make env` generates one, and compose requires it. Resolved *with* the URL, so a provider key is never sent to the gateway (it rejects one). |
 | `AISOC_LITELLM_REQUEST_TIMEOUT` | `60` (seconds, set by compose) | How long the gateway waits on one generation before giving up. Raise it when the bundled local model is doing CPU-only inference and long generations are timing out; the Settings → Deployment & AI panel reports **Degraded** when recent calls are failing, which is the signal to turn this up. Compose must always pass a value — an unset variable resolves to `None` inside the gateway, which then serves `/health/liveliness` 200 while failing every completion. |
 | `AISOC_INVESTIGATION_MAX_SECONDS` | `120` | Wall-clock budget for one investigation, on **both** the auto-triage path and the console's manual "Investigate with agent". A run that exceeds it is closed as `failed` with the reason, in the run store and in the `investigation_runs` row. |
 | `AISOC_INVESTIGATION_STALE_AFTER_SECONDS` | `3 × AISOC_INVESTIGATION_MAX_SECONDS`, floor 300 | When a background sweep closes an `investigation_runs` row abandoned by a process that exited mid-run. Derived from the budget above so the two cannot disagree; set it only if you need a different margin. |
@@ -568,7 +568,7 @@ DATABASE_MIGRATION_URL=postgresql+asyncpg://aisoc:changeme@localhost:5432/aisoc
 AISOC_APP_DB_PASSWORD=...
 REDIS_URL=redis://localhost:6379/0
 KAFKA_BOOTSTRAP_SERVERS=localhost:9092
-OPENSEARCH_URL=http://localhost:9200
+OPENSEARCH_URL=https://localhost:9200
 QDRANT_URL=http://localhost:6333
 # Canonical, applies to every service. Legacy CORS_ORIGINS still works.
 AISOC_CORS_ORIGINS=http://localhost:3000

@@ -277,3 +277,28 @@ def test_full_profile_stores_are_reachable_over_a_published_port(service: str) -
     reported as not answering while serving 200 on every request.
     """
     assert _published(_services()[service]), f"{service} publishes no port, so the doctor cannot probe it from the host."
+
+
+def test_opensearch_rejects_anonymous_access() -> None:
+    """The full-profile node shipped with the security plugin off.
+
+    `GET /_cluster/health` then returned 200 with no credentials. The plugin
+    has to be on, the admin password has to be required, and the healthcheck
+    has to present that password — an anonymous curl is not a healthy node.
+    """
+    svc = _services()["opensearch"]
+    env = _env(svc)
+    disabled = env.get("DISABLE_SECURITY_PLUGIN", "")
+    assert disabled.lower() != "true", "OpenSearch sets DISABLE_SECURITY_PLUGIN=true, so anonymous requests are served"
+    password = env.get("OPENSEARCH_INITIAL_ADMIN_PASSWORD", "")
+    assert ":?" in password, f"OpenSearch admin password is {password!r}; an unset variable must not boot the node"
+    health = " ".join(str(part) for part in (svc.get("healthcheck") or {}).get("test") or [])
+    assert "-u" in health and "https://" in health, (
+        f"the OpenSearch healthcheck is {health!r}. It has to authenticate over the secured port; "
+        "an anonymous http://localhost:9200/_cluster/health is the open node."
+    )
+
+    threatintel = _env(_services()["threatintel"])
+    assert ":?" in threatintel.get("OPENSEARCH_PASSWORD", ""), (
+        "threatintel is not given the OpenSearch password, so it keeps connecting anonymously"
+    )

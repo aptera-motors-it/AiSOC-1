@@ -504,12 +504,14 @@ jobs:
           # as zero nodes — and an error message that happened to contain a
           # digit would have been read as a node count and passed the gate.
           # An error must not be able to look like either verdict.
-          # sed for the same reason as above, and it matters more here: .env
-          # carries no NEO4J_PASSWORD line at all, so `grep | cut` exits 1 on
-          # every run and `set -e` would kill this step before it reached the
-          # graph. Measured — that is what the first draft of this fix did.
+          # sed for the same reason as above. `make env` writes NEO4J_PASSWORD;
+          # an empty value means that step did not run, and substituting a
+          # published password would hide it.
           neo4j_password="$(sed -n 's/^NEO4J_PASSWORD=//p' .env | tail -1)"
-          neo4j_password="${neo4j_password:-neo4j_dev_secret}"
+          if [ -z "${neo4j_password}" ]; then
+            echo "::error::NEO4J_PASSWORD is empty in .env"
+            exit 1
+          fi
 
           ok=""
           for i in $(seq 1 30); do

@@ -143,7 +143,7 @@ If you'd rather drive the pieces yourself:
 
 ```sh
 # 1. Make sure the stack is up.
-pnpm aisoc:demo            # or: docker compose -f infra/compose/docker-compose.demo.yml up -d
+pnpm aisoc:demo            # or: docker compose --env-file .env -f infra/compose/docker-compose.demo.yml up -d
 
 # 2. Bring up the tunnel.
 bash infra/cloudflare/tunnel.sh

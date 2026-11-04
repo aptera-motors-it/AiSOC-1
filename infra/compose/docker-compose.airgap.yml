@@ -9,8 +9,8 @@
 #   — ~2 GB on disk, fits in 6 GB VRAM (or CPU-only with 8 GB RAM).
 #   — Swap for a larger model by setting AIRGAP_LLM_MODEL= in your env.
 #
-# Usage (air-gapped demo):
-#   docker compose \
+# Usage (air-gapped demo, from the repository root, after `make env`):
+#   docker compose --env-file .env \
 #     -f infra/compose/docker-compose.demo.yml \
 #     -f infra/compose/docker-compose.airgap.yml \
 #     up -d

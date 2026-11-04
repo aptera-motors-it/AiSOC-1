@@ -56,12 +56,33 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from check_env_placeholders import is_placeholder, parse_env
+from check_published_secrets import RETIRED_PUBLISHED_DEFAULTS
 from gate_toolkit import repo_root, self_test_if_requested
 
 # `--check` is a verdict, so it answers `--self-test` like every other verdict
 # in this tree: over a repository with no content there is neither a `.env` nor
 # a template to copy one from, and the only honest answer is to refuse.
 self_test_if_requested(__file__)
+
+
+def _opensearch_admin_password() -> str:
+    """A password the OpenSearch demo installer will accept.
+
+    From 2.12 the image refuses to boot unless the initial admin password has
+    an upper-case letter, a lower-case letter, a digit and a symbol. The
+    symbol set avoids ``$``, ``{``, ``}`` and anything that changes meaning
+    inside a dotenv file or a compose interpolation.
+    """
+    required = [
+        secrets.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+        secrets.choice("abcdefghijklmnopqrstuvwxyz"),
+        secrets.choice("0123456789"),
+        secrets.choice("-_.=+"),
+    ]
+    pool = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.=+"
+    chars = required + [secrets.choice(pool) for _ in range(28)]
+    secrets.SystemRandom().shuffle(chars)
+    return "".join(chars)
 
 
 def _fernet_key() -> str:
@@ -193,7 +214,33 @@ GENERATED: dict[str, tuple[Callable[[], str], str]] = {
         lambda: secrets.token_hex(24),
         "ClickHouse event-lake password. Referenced by CLICKHOUSE_URL rather than repeated inside it.",
     ),
+    "NEO4J_PASSWORD": (
+        lambda: secrets.token_hex(24),
+        "Neo4j password. Compose refuses to start the graph without it.",
+    ),
+    "LITELLM_MASTER_KEY": (
+        lambda: secrets.token_hex(32),
+        "Bearer the API and agents present to the bundled LLM gateway.",
+    ),
+    "GRAFANA_ADMIN_PASSWORD": (
+        lambda: secrets.token_hex(24),
+        "Grafana admin password for the monitoring profile.",
+    ),
+    "KAFKA_UI_PASSWORD": (
+        lambda: secrets.token_hex(24),
+        "Password for the Kafka topic browser. The username is aisoc.",
+    ),
+    "OPENSEARCH_INITIAL_ADMIN_PASSWORD": (
+        _opensearch_admin_password,
+        "OpenSearch admin password. The full-profile node refuses anonymous access.",
+    ),
+    "AISOC_OSQUERY_TLS_ENROLL_SECRET": (
+        lambda: secrets.token_hex(24),
+        "Shared secret an osquery host presents when it enrolls.",
+    ),
 }
+
+_RETIRED_VALUES = frozenset(RETIRED_PUBLISHED_DEFAULTS.values())
 
 
 def _assignment(key: str) -> re.Pattern[str]:
@@ -206,7 +253,7 @@ def needs_filling(text: str, key: str) -> bool:
         if name != key:
             continue
         stripped = value.strip()
-        return not stripped or is_placeholder(stripped)
+        return not stripped or is_placeholder(stripped) or stripped in _RETIRED_VALUES
     return True
 
 

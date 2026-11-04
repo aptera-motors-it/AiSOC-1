@@ -35,6 +35,8 @@ class Settings(BaseSettings):
     OPENSEARCH_PORT: int = 9200
     OPENSEARCH_USER: str = ""
     OPENSEARCH_PASSWORD: str = ""
+    OPENSEARCH_USE_SSL: bool = False
+    OPENSEARCH_VERIFY_CERTS: bool = True
     OPENSEARCH_INDEX_IOC: str = "threatintel-iocs"
     OPENSEARCH_INDEX_ACTOR: str = "threatintel-actors"
 

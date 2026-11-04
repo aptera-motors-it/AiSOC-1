@@ -436,17 +436,42 @@ if [ "$PROFILE_FULL" = "1" ]; then
       fi" || echo 000
   }
 
-  for spec in "clickhouse 8123 /ping" "neo4j 7474 /" "qdrant 6333 /readyz" "opensearch 9200 /"; do
+  # The security plugin is on. An anonymous HTTP GET is a 401, which this
+  # probe used to report as the node being down.
+  opensearch_probe() {
+    # $1 path
+    _path="$1"
+    _pw="$(sed -n 's/^OPENSEARCH_INITIAL_ADMIN_PASSWORD=//p' .env 2>/dev/null | tail -1)"
+    _sb_host_port="$(svc_published_port opensearch 9200 || true)"
+    if [ -n "${_sb_host_port:-}" ] && [ -n "${_pw:-}" ]; then
+      curl -fsS -k -m 6 -o /dev/null -u "admin:${_pw}" "https://localhost:${_sb_host_port}${_path}" && echo 200 || echo 000
+      return
+    fi
+    dc_exec opensearch sh -c "curl -fsS -k -m 3 -o /dev/null -u \"admin:\$OPENSEARCH_INITIAL_ADMIN_PASSWORD\" https://localhost:9200${_path} && echo 200 || echo 000" || echo 000
+  }
+
+  for spec in "clickhouse 8123 /ping" "neo4j 7474 /" "qdrant 6333 /readyz" "opensearch 9200 /_cluster/health"; do
     set -- $spec; name="$1"; port="$2"; path="$3"
     if svc_running "$name"; then
-      code="$(store_probe "$name" "$port" "$path")"
+      if [ "$name" = "opensearch" ]; then
+        code="$(opensearch_probe "$path")"
+      else
+        code="$(store_probe "$name" "$port" "$path")"
+      fi
       case "$code" in
         200) pass "$name responding on $port" ;;
         noclient)
           warn "$name could not be probed: no host port published and the image has no curl or wget" \
                "publish the port, or check it by hand: $COMPOSE_HINT logs $name | tail -20" ;;
-        *)   warn "$name is running but did not answer http://localhost:${port}${path}" \
-                  "$COMPOSE_HINT logs $name | tail -20" ;;
+        *)
+          if [ "$name" = "opensearch" ]; then
+            warn "$name is running but did not answer https://localhost:${port}${path} with the generated admin password" \
+                 "$COMPOSE_HINT logs $name | tail -20"
+          else
+            warn "$name is running but did not answer http://localhost:${port}${path}" \
+                 "$COMPOSE_HINT logs $name | tail -20"
+          fi
+          ;;
       esac
     else
       warn "$name is not running (full profile)" "$COMPOSE_HINT --profile full up -d $name"

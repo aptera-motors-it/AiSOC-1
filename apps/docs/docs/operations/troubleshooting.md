@@ -269,13 +269,14 @@ Lag on `aisoc.normalized_events` → fusion is overloaded or stalled. Lag on `ai
 Run:
 
 ```bash
-curl -s http://localhost:9200/_cluster/health?pretty
+curl -sk -u "admin:$(sed -n 's/^OPENSEARCH_INITIAL_ADMIN_PASSWORD=//p' .env | tail -1)" https://localhost:9200/_cluster/health?pretty
 ```
 
 Red almost always means disk pressure (default flood-stage watermark is 95 %). Free disk space, then:
 
 ```bash
-curl -X PUT 'http://localhost:9200/_all/_settings' \
+curl -sk -u "admin:$(sed -n 's/^OPENSEARCH_INITIAL_ADMIN_PASSWORD=//p' .env | tail -1)" \
+  -X PUT 'https://localhost:9200/_all/_settings' \
   -H 'Content-Type: application/json' \
   -d '{ "index.blocks.read_only_allow_delete": null }'
 ```

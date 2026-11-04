@@ -103,6 +103,10 @@ services:
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:?set NEO4J_PASSWORD}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD}
       GRAFANA_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD — required for the monitoring profile}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY — run `make env` to generate it}
+      KAFKA_UI_PASSWORD: ${KAFKA_UI_PASSWORD:?set KAFKA_UI_PASSWORD — required for the full profile}
+      OPENSEARCH_INITIAL_ADMIN_PASSWORD: ${OPENSEARCH_INITIAL_ADMIN_PASSWORD:?set OPENSEARCH_INITIAL_ADMIN_PASSWORD — required for the full profile}
+      AISOC_OSQUERY_TLS_ENROLL_SECRET: ${AISOC_OSQUERY_TLS_ENROLL_SECRET:?set AISOC_OSQUERY_TLS_ENROLL_SECRET — run `make env` to generate it}
 
   # ---------------------------------------------------------------------------
   # Data plane. No published ports: in the development stack these are bound to

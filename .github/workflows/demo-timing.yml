@@ -140,8 +140,8 @@ jobs:
       - name: Diagnostics on failure
         if: failure()
         run: |
-          docker compose -f infra/compose/docker-compose.demo.yml ps -a || true
-          docker compose -f infra/compose/docker-compose.demo.yml logs --tail 150 || true
+          docker compose --env-file .env -f infra/compose/docker-compose.demo.yml ps -a || true
+          docker compose --env-file .env -f infra/compose/docker-compose.demo.yml logs --tail 150 || true
 
       - name: Publish the measurement
         if: always()
@@ -160,4 +160,4 @@ jobs:
         # inside the compose file). A bare `docker compose down` here would
         # target the root project and leave this one running, which is the
         # bug console-visuals.yml still has.
-        run: docker compose -f infra/compose/docker-compose.demo.yml down -v || true
+        run: docker compose --env-file .env -f infra/compose/docker-compose.demo.yml down -v || true

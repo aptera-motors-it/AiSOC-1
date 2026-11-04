@@ -18,7 +18,8 @@ LiteLLM, or vLLM).
 The easiest path is the pre-built air-gap overlay shipped in the repository:
 
 ```bash
-docker compose \
+make env
+docker compose --env-file .env \
   -f infra/compose/docker-compose.demo.yml \
   -f infra/compose/docker-compose.airgap.yml \
   up -d
@@ -37,7 +38,7 @@ a larger model:
 
 ```bash
 AIRGAP_LLM_MODEL=llama3.1:8b-instruct-q4_K_M \
-docker compose -f infra/compose/docker-compose.demo.yml -f infra/compose/docker-compose.airgap.yml up -d
+docker compose --env-file .env -f infra/compose/docker-compose.demo.yml -f infra/compose/docker-compose.airgap.yml up -d
 ```
 
 ---

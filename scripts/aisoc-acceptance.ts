@@ -144,7 +144,7 @@ function tearDownStack(): void {
   console.log(c.dim("  tearing down any running demo stack..."));
   // stdio:ignore because compose chats a lot about not-found resources on a
   // truly clean machine, and that noise hides the meaningful output below.
-  spawnSync("docker", ["compose", "-f", COMPOSE_FILE, "down", "-v"], {
+  spawnSync("docker", ["compose", "--env-file", join(ROOT, ".env"), "-f", COMPOSE_FILE, "down", "-v"], {
     cwd: ROOT,
     stdio: "ignore",
   });

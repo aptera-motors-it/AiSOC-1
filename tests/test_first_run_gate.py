@@ -367,3 +367,24 @@ def test_each_compose_file_pulls_the_image_built_for_it() -> None:
     assert "demo" in demo_ref.group(1), (
         f"the demo stack pulls {demo_ref.group(1)}, which is the product build: no banner, no auto-login, and a visitor bounced to /login"
     )
+
+
+# Strings the demo compose used to bake in. A reader of the file can
+# authenticate with any of them, and `docker compose config` prints them
+# as the value the container receives.
+_DEMO_PUBLISHED = (
+    "aisoc_dev_secret",
+    "aisoc_app_dev_secret",
+    "redis_dev_secret",
+    "dev_secret_key_change_in_production",
+)
+
+
+def test_the_demo_compose_has_no_published_secret() -> None:
+    text = DEMO_COMPOSE.read_text(encoding="utf-8")
+    found = [literal for literal in _DEMO_PUBLISHED if literal in text]
+    assert not found, (
+        "infra/compose/docker-compose.demo.yml still contains published credentials:\n  "
+        + "\n  ".join(found)
+        + "\n\nInterpolate the generated variables (`${NAME:?set NAME}`) instead of a literal."
+    )

@@ -121,10 +121,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     redis = aioredis.from_url(settings.REDIS_URL, decode_responses=False)
 
     # ── OpenSearch ────────────────────────────────────────────────────────────
+    os_password = (settings.OPENSEARCH_PASSWORD or "").strip()
     os_client = AsyncOpenSearch(
         hosts=[{"host": settings.OPENSEARCH_HOST, "port": settings.OPENSEARCH_PORT}],
-        http_auth=(settings.OPENSEARCH_USER, settings.OPENSEARCH_PASSWORD) if settings.OPENSEARCH_USER else None,
-        use_ssl=False,
+        http_auth=((settings.OPENSEARCH_USER or "admin"), os_password) if os_password else None,
+        use_ssl=settings.OPENSEARCH_USE_SSL,
+        verify_certs=settings.OPENSEARCH_VERIFY_CERTS,
+        ssl_show_warn=settings.OPENSEARCH_VERIFY_CERTS,
     )
 
     # ── Qdrant ────────────────────────────────────────────────────────────────

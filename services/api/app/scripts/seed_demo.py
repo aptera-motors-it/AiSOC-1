@@ -1621,24 +1621,23 @@ async def _ensure_tenant(session) -> Tenant:
 async def _ensure_user(session, tenant: Tenant) -> User:
     """Upsert the demo user.
 
-    If the deterministic demo user already exists from a previous seed (with a
-    stale email like the old ``demo@aisoc.local``, or a different password),
-    bring it back into sync rather than skipping. This keeps re-seeds idempotent
-    *and* self-healing against drift introduced by previous schema decisions.
+    Email, role and the active flag are brought back into line on every run
+    so a renamed demo user is repaired. The password is hashed only when the
+    row is created. Writing ``aisoc-demo`` again on every deploy put that
+    published password back onto an account whose password had been changed.
     """
     result = await session.execute(select(User).where(User.id == DEMO_USER_ID))
     user = result.scalar_one_or_none()
-    hashed = get_password_hash("aisoc-demo")
     if user is not None:
         user.tenant_id = tenant.id
         user.email = DEMO_USER_EMAIL
         user.username = "demo"
-        user.hashed_password = hashed
         user.role = DEMO_USER_ROLE
         user.is_active = True
         user.is_verified = True
         await session.flush()
         return user
+    hashed = get_password_hash("aisoc-demo")
     user = User(
         id=DEMO_USER_ID,
         tenant_id=tenant.id,

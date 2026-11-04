@@ -33,15 +33,16 @@
 # Usage:
 #   pnpm aisoc:demo
 #
-# Manual usage:
-#   docker compose -f infra/compose/docker-compose.demo.yml pull
-#   docker compose -f infra/compose/docker-compose.demo.yml up -d
+# Manual usage (from the repository root, after `make env`):
+#   docker compose --env-file .env -f infra/compose/docker-compose.demo.yml pull
+#   docker compose --env-file .env -f infra/compose/docker-compose.demo.yml up -d
 #
 # SECURITY NOTE
 # -------------
-# Host port publishings below are bound to 127.0.0.1 so the demo's
-# development passwords are not exposed on the LAN. The same passwords
-# ship with every clone of this repo.
+# Host port publishings below are bound to 127.0.0.1. Passwords come from
+# the generated `.env` at the repository root. This file's directory is the
+# compose project directory, so that file is not loaded unless `--env-file`
+# points at it, and a missing password refuses the start.
 #
 # To change a binding, write a docker-compose.override.yml and tag the
 # list `!override`:
@@ -80,10 +81,10 @@ services:
       # Owner / migration role. No service connects as this one.
       POSTGRES_DB: aisoc
       POSTGRES_USER: aisoc
-      POSTGRES_PASSWORD: aisoc_dev_secret
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
       # Runtime role credential, applied by the init hook below once
       # 061_runtime_app_role.sql has created the role and its grants.
-      AISOC_APP_DB_PASSWORD: ${AISOC_APP_DB_PASSWORD:-aisoc_app_dev_secret}
+      AISOC_APP_DB_PASSWORD: ${AISOC_APP_DB_PASSWORD:?set AISOC_APP_DB_PASSWORD}
     # Host port is overridable so `pnpm aisoc:demo` can fall forward to the
     # next free port when a local Postgres is already bound to 5432. The
     # container port stays at 5432; only the publish side changes.
@@ -109,7 +110,9 @@ services:
   redis:
     image: redis:7-alpine
     container_name: aisoc-demo-redis
-    command: redis-server --appendonly yes --requirepass redis_dev_secret
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+    command: ["sh", "-c", "redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
     ports:
       - "127.0.0.1:${AISOC_REDIS_PORT:-6379}:6379"
     volumes:
@@ -117,7 +120,7 @@ services:
     networks:
       - aisoc-demo
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "redis_dev_secret", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -189,13 +192,13 @@ services:
     ports:
       - "127.0.0.1:${AISOC_API_PORT:-8000}:8000"
     environment:
-      DATABASE_URL: postgresql+asyncpg://aisoc_app:${AISOC_APP_DB_PASSWORD:-aisoc_app_dev_secret}@postgres:5432/aisoc
+      DATABASE_URL: postgresql+asyncpg://aisoc_app:${AISOC_APP_DB_PASSWORD:?set AISOC_APP_DB_PASSWORD}@postgres:5432/aisoc
       # DDL runs as the owner; the service itself does not hold it.
-      DATABASE_MIGRATION_URL: postgresql+asyncpg://aisoc:aisoc_dev_secret@postgres:5432/aisoc
-      AISOC_APP_DB_PASSWORD: ${AISOC_APP_DB_PASSWORD:-aisoc_app_dev_secret}
-      REDIS_URL: redis://:redis_dev_secret@redis:6379/0
+      DATABASE_MIGRATION_URL: postgresql+asyncpg://aisoc:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/aisoc
+      AISOC_APP_DB_PASSWORD: ${AISOC_APP_DB_PASSWORD:?set AISOC_APP_DB_PASSWORD}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/0
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      SECRET_KEY: dev_secret_key_change_in_production
+      SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY}
       ENV: development
       ENVIRONMENT: development
       LOG_LEVEL: info
@@ -236,8 +239,8 @@ services:
     ports:
       - "127.0.0.1:${AISOC_AGENTS_PORT:-8001}:8084"
     environment:
-      DATABASE_URL: postgresql+asyncpg://aisoc_app:${AISOC_APP_DB_PASSWORD:-aisoc_app_dev_secret}@postgres:5432/aisoc
-      REDIS_URL: redis://:redis_dev_secret@redis:6379/4
+      DATABASE_URL: postgresql+asyncpg://aisoc_app:${AISOC_APP_DB_PASSWORD:?set AISOC_APP_DB_PASSWORD}@postgres:5432/aisoc
+      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/4
       CORE_API_URL: http://api:8000
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
@@ -273,8 +276,8 @@ services:
       - "127.0.0.1:${AISOC_REALTIME_PORT:-8086}:4000"
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      REDIS_URL: redis://:redis_dev_secret@redis:6379
-      REDIS_PASSWORD: redis_dev_secret
+      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
       PORT: 4000
     networks:
       - aisoc-demo
@@ -299,9 +302,9 @@ services:
       api:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql+asyncpg://aisoc_app:${AISOC_APP_DB_PASSWORD:-aisoc_app_dev_secret}@postgres:5432/aisoc
-      REDIS_URL: redis://:redis_dev_secret@redis:6379/0
-      SECRET_KEY: dev_secret_key_change_in_production
+      DATABASE_URL: postgresql+asyncpg://aisoc_app:${AISOC_APP_DB_PASSWORD:?set AISOC_APP_DB_PASSWORD}@postgres:5432/aisoc
+      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY}
       ENV: development
       ENVIRONMENT: development
       LOG_LEVEL: info

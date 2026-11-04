@@ -69,7 +69,14 @@ add:
 DATABASE_URL=${{ Postgres.DATABASE_URL }}
 REDIS_URL=${{ Redis.REDIS_URL }}
 JWT_SECRET=<generate a random 32-char string>
+SECRET_KEY=<generate a random 32-char string>
 ```
+
+`ENVIRONMENT` is `demo`. A published `SECRET_KEY` is replaced with a
+per-process key at boot, so the documented deploy still starts; sessions
+then end at every restart, and more than one replica needs a key you
+generate. Do not commit one into `railway.toml`. The database URL has to
+require TLS as well; a cleartext URL is refused.
 
 Railway auto-redeploys when variables change. The api will run Alembic
 migrations on the next boot and become healthy.
@@ -143,8 +150,9 @@ The api service runs `alembic upgrade head && python -m
 app.scripts.seed_demo` on every deploy via Railway's `releaseCommand`,
 so the canonical 15 incidents (including the in-flight LockBit 3.0
 ransomware investigation `INC-RT-001`) are present before the new
-instance accepts traffic. The seeder is idempotent — re-running against
-an already-seeded database is a cheap no-op.
+instance accepts traffic. The seeder is idempotent. The demo password is
+written only when the user row is created; a later deploy does not put
+`aisoc-demo` back onto an account whose password was changed.
 
 If you ever need to re-seed manually, open the api service's shell in
 Railway and run:
