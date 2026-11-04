@@ -85,6 +85,31 @@ def _resolve_caller(
     )
 
 
+def _resolve_reference_caller(
+    body_tenant_id: uuid.UUID | None,
+    user: CurrentUser | None,
+    service_token: str | None,
+) -> uuid.UUID:
+    """Return the tenant for the internal worker that resolves secrets."""
+    if user is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="playbook references are available only to the agents service",
+        )
+    if not service_token_valid(service_token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="authentication required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if body_tenant_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="a service caller must name the tenant it is acting for",
+        )
+    return body_tenant_id
+
+
 @router.post("/dispatch", summary="Run one playbook step through governed action dispatch")
 async def dispatch_playbook_step(
     body: StepDispatchRequest,
@@ -146,7 +171,7 @@ async def resolve_playbook_references(
     *names* in the run result, never values — the run record is readable by
     anyone with access to the case.
     """
-    tenant_id, _requested_by = _resolve_caller(body.tenant_id, user, x_aisoc_service_token)
+    tenant_id = _resolve_reference_caller(body.tenant_id, user, x_aisoc_service_token)
     try:
         references = await playbook_references.resolve(db, tenant_id=tenant_id, names=list(body.names))
     except playbook_references.ReferenceError as exc:
