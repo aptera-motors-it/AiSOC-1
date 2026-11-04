@@ -539,13 +539,16 @@ async def verify(body: VerifyRequest, db: DBSession, request: Request) -> Sessio
     await set_rls_context(db, row["tenant_id"])
     step = totp.verify_totp(_decrypt_secret(row["secret_encrypted"]), body.code, last_used_step=row["last_used_step"])
     if step is not None:
-        await db.execute(
-            text("UPDATE aisoc_user_mfa SET last_used_step = :s, updated_at = now() WHERE user_id = :u AND tenant_id = :t").bindparams(
-                s=step, u=user_id, t=row["tenant_id"]
-            )
+        result = await db.execute(
+            text(
+                "UPDATE aisoc_user_mfa SET last_used_step = :s, updated_at = now() "
+                "WHERE user_id = :u AND tenant_id = :t "
+                "AND (last_used_step IS NULL OR last_used_step < :s)"
+            ).bindparams(s=step, u=user_id, t=row["tenant_id"])
         )
-        await db.commit()
-        return SessionTokens(**await _issue_session(db, user_id, row["tenant_id"]))
+        if result.rowcount == 1:
+            await db.commit()
+            return SessionTokens(**await _issue_session(db, user_id, row["tenant_id"]))
 
     if await _consume_recovery_code(db, user_id=user_id, tenant_id=row["tenant_id"], code=body.code, request=request):
         return SessionTokens(**await _issue_session(db, user_id, row["tenant_id"]))

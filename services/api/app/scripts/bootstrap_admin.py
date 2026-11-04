@@ -46,6 +46,7 @@ import secrets
 import string
 import sys
 import uuid
+from datetime import UTC, datetime
 
 from email_validator import EmailNotValidError, validate_email
 from sqlalchemy import func, select
@@ -351,6 +352,7 @@ async def bootstrap(
             user.is_active = True
             user.is_verified = True
             user.role = "admin"
+            user.sessions_revoked_at = datetime.now(UTC)
             await _record(
                 session,
                 tenant_id=tenant.id,

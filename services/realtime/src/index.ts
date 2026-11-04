@@ -9,7 +9,7 @@ import pino from 'pino';
 import rateLimit from 'express-rate-limit';
 
 import { PushManager } from './push';
-import { resolveTicketSecret, verifyRealtimeTicket } from './auth';
+import { resolveTicketSecret, tenantForEvent, verifyRealtimeTicket } from './auth';
 import { setupTelemetry, type Shutdown } from './telemetry';
 import { resolveKafkaTransport } from './kafkaTransport.js';
 
@@ -512,7 +512,13 @@ async function startKafkaConsumer(onCrash: (err: unknown) => void) {
       if (!message.value) return;
       try {
         const event = JSON.parse(message.value.toString());
-        const tenantId = event?.alert?.tenant_id || event?.tenant_id || 'default';
+        const tenantId = tenantForEvent({
+          tenant_id: event?.alert?.tenant_id ?? event?.tenant_id,
+        });
+        if (tenantId === null) {
+          log.warn('Dropping fused alert without tenant_id');
+          return;
+        }
 
         broadcastToTenant(tenantId, {
           type: 'alert.fused',
@@ -626,10 +632,11 @@ async function startGraphUpdateConsumer(onCrash: (err: unknown) => void) {
           return;
         }
 
-        // Per-tenant fan-out. Default to "default" so single-tenant
-        // self-hosted deploys keep working without explicit tenant tagging
-        // (matches the policy on the fused-alerts consumer above).
-        const tenantId = update.tenant_id || 'default';
+        const tenantId = tenantForEvent(update);
+        if (tenantId === null) {
+          log.warn({ entityId: update.entity_id }, 'Dropping graph update without tenant_id');
+          return;
+        }
 
         broadcastToTenant(tenantId, {
           type: 'graph.update',

@@ -13,6 +13,7 @@ import crypto from 'node:crypto';
 import {
   REALTIME_TICKET_AUDIENCE,
   resolveTicketSecret,
+  tenantForEvent,
   verifyRealtimeTicket,
   type RealtimeClaims,
 } from '../src/auth';
@@ -142,6 +143,11 @@ test('rejects a ticket missing tenant_id', () => {
 test('rejects a non-numeric exp', () => {
   const token = mintTicket(validClaims({ exp: 'soon' }));
   assert.equal(verifyRealtimeTicket(token, SECRET), null);
+});
+
+test('drops events without a tenant instead of broadcasting them to the default tenant', () => {
+  assert.equal(tenantForEvent({ tenant_id: 'tenant-abc' }), 'tenant-abc');
+  assert.equal(tenantForEvent({}), null);
 });
 
 // GHSA-4m55-xhcm-wjcr. This asserted the fallback and was the vulnerability:

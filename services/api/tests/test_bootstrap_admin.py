@@ -331,6 +331,7 @@ async def test_reset_password_replaces_the_credential(session_factory) -> None:
     assert user is not None
     assert verify_password(new, user.hashed_password)
     assert not verify_password(old, user.hashed_password)
+    assert user.sessions_revoked_at is not None
 
 
 async def test_a_deactivated_orphan_does_not_block_the_first_administrator(

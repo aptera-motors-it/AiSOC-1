@@ -76,6 +76,18 @@ export interface RealtimeClaims {
 }
 
 /**
+ * Return an event's explicit tenant, or null when the producer omitted it.
+ *
+ * A missing tenant is not synonymous with the tenant named "default": routing
+ * it there exposes an unscoped event to every default-tenant subscriber.
+ */
+export function tenantForEvent(event: { tenant_id?: unknown }): string | null {
+  return typeof event.tenant_id === 'string' && event.tenant_id.length > 0
+    ? event.tenant_id
+    : null;
+}
+
+/**
  * Verify an HS256 realtime ticket. Returns the decoded claims on success, or
  * `null` if the token is malformed, has a bad signature, wrong audience, wrong
  * type, or is expired.
