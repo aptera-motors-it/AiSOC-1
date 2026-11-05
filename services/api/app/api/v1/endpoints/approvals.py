@@ -711,7 +711,9 @@ async def _resume_playbook_run(row: AgentApproval) -> None:
     try:
         async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
             response = await client.post(f"{base}/api/v1/playbooks/approvals/{row.id}/resume", headers=headers)
-    except httpx.HTTPError as exc:
+    except Exception as exc:
+        # httpx.InvalidURL (and kin) subclass Exception, not HTTPError; a bad
+        # AGENTS_SERVICE_URL must not turn a committed decision into a 500.
         logger.warning("Approval %s: decision not delivered to the agents service: %s", row.id, exc)
         return
     if response.status_code >= 400:
