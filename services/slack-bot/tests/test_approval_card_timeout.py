@@ -369,6 +369,24 @@ async def test_an_absurd_timeout_is_refused_before_slack_is_called() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("actions_url")
+async def test_a_timeout_without_an_action_id_is_refused_before_slack_is_called() -> None:
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://bot") as client:
+            response = await client.post(
+                "/internal/approval-card",
+                json={
+                    "action": {"action_type": "isolate_host", "target": "WKSTN-01"},
+                    "case": {"id": "case-9"},
+                    "timeout_seconds": 60,
+                },
+                headers={"X-AiSOC-Internal-Token": TOKEN},
+            )
+    assert response.status_code == 422
+    assert _slack_posts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("actions_url")
 async def test_a_late_approve_does_not_join_an_in_flight_timeout_reject() -> None:
     entered = threading.Event()
     release = threading.Event()

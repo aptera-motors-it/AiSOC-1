@@ -94,6 +94,14 @@ async def post_approval_card(
     if not _authorized(x_internal_token):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="internal token required")
 
+    action_id = str(body.action.get("id") or body.action.get("action_id") or "")
+    timeout_seconds = body.timeout_seconds or 0
+    if timeout_seconds > 0 and not action_id:
+        raise HTTPException(
+            status_code=422,
+            detail="action id required when timeout_seconds is set",
+        )
+
     settings = get_settings()
     channel = (body.channel or settings.SLACK_APPROVALS_CHANNEL).strip()
     if not channel:
@@ -141,8 +149,6 @@ async def post_approval_card(
         action_id=body.action.get("id"),
         channel=channel,
     )
-    action_id = str(body.action.get("id") or body.action.get("action_id") or "")
-    timeout_seconds = body.timeout_seconds or 0
     if action_id and timeout_seconds > 0:
         request.app.state.timeout_scheduler.schedule(
             action_id,
