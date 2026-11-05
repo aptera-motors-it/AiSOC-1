@@ -1,4 +1,9 @@
-"""Two delivery workers attempt one due row once."""
+"""Claim and error-body behaviour against real Postgres.
+
+FOR UPDATE SKIP LOCKED and the runtime role's RLS WITH CHECK are properties
+of the database. An HTTP error body Postgres cannot store must still leave
+the attempt recorded so the next due row in the same pass is sent.
+"""
 
 from __future__ import annotations
 
@@ -223,6 +228,13 @@ def _serve(status_code: int, body: bytes, content_type: str = "text/plain") -> t
     return server, thread
 
 
+def _host(server: _ReplyServer) -> str:
+    bound = server.server_address[0]
+    if isinstance(bound, str):
+        return bound
+    return bound.decode()
+
+
 async def _seed_due(owner, *, url: str, attempts: int, age_s: int) -> tuple[uuid.UUID, uuid.UUID]:
     tenant_id = uuid.uuid4()
     webhook_id = uuid.uuid4()
@@ -273,12 +285,12 @@ async def test_a_nul_error_body_is_recorded_and_the_next_row_is_sent(owner, monk
         monkeypatch.delenv(name, raising=False)
     bad, bad_thread = _serve(500, b"upstream\x00error")
     good, good_thread = _serve(200, b"ok")
-    bad_host, bad_port = bad.server_address[0], bad.server_address[1]
-    good_host, good_port = good.server_address[0], good.server_address[1]
-    bad_url_host = bad_host.decode() if isinstance(bad_host, bytes) else bad_host
-    good_url_host = good_host.decode() if isinstance(good_host, bytes) else good_host
-    poisoned_tenant, poisoned_id = await _seed_due(owner, url=f"http://{bad_url_host}:{bad_port}/bad", attempts=PRIOR_ATTEMPTS, age_s=10)
-    healthy_tenant, healthy_id = await _seed_due(owner, url=f"http://{good_url_host}:{good_port}/good", attempts=PRIOR_ATTEMPTS, age_s=5)
+    poisoned_tenant, poisoned_id = await _seed_due(
+        owner, url=f"http://{_host(bad)}:{bad.server_address[1]}/bad", attempts=PRIOR_ATTEMPTS, age_s=10
+    )
+    healthy_tenant, healthy_id = await _seed_due(
+        owner, url=f"http://{_host(good)}:{good.server_address[1]}/good", attempts=PRIOR_ATTEMPTS, age_s=5
+    )
     try:
         tally = await run_once()
         poisoned = (
@@ -309,13 +321,6 @@ async def test_a_nul_error_body_is_recorded_and_the_next_row_is_sent(owner, monk
         await _delete_tenant(owner, poisoned_tenant)
         await _delete_tenant(owner, healthy_tenant)
         await app_engine.dispose()
-
-
-def _host(server: _ReplyServer) -> str:
-    bound = server.server_address[0]
-    if isinstance(bound, str):
-        return bound
-    return bound.decode()
 
 
 @pytest.mark.asyncio

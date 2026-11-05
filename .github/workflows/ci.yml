@@ -1673,8 +1673,7 @@ jobs:
           SECRET_KEY: ci-dummy-secret-key-at-least-32bytes!
           DATABASE_URL: postgresql+asyncpg://x:x@localhost/x
         run: |
-          # This URL is a placeholder, so the live delivery file would skip
-          # and the job would stay green. The step below runs it on Postgres.
+          # Placeholder DATABASE_URL makes the live delivery file skip.
           $RUNNER_TEMP/.venv-api/bin/python -m pytest tests/ -v --tb=short \
             --ignore=tests/test_outbound_webhook_delivery_live.py
       - name: Start PostgreSQL with registry fallback

@@ -1036,10 +1036,9 @@ jobs:
           MSSP_ISOLATION_REQUIRED: '1'
         run: python -m pytest tests/test_identity_resolution_live.py -v --tb=short
 
-      # Two workers must claim one due row once, and an error body Postgres
-      # cannot store must still be recorded. SKIP LOCKED and the runtime
-      # role's row policy are properties of this database. The suite reads
-      # DATABASE_URL as aisoc_app and seeds through DATABASE_MIGRATION_URL.
+      # SKIP LOCKED and the runtime role's row policy are properties of this
+      # database. The suite reads DATABASE_URL as aisoc_app and seeds through
+      # DATABASE_MIGRATION_URL.
       - name: Two delivery workers attempt one due webhook once (live Postgres)
         working-directory: services/api
         env:
