@@ -47,8 +47,14 @@ var (
 	umbraTenant = uuid.MustParse("22222222-2222-4222-8222-222222222222")
 	ghostTenant = uuid.MustParse("33333333-3333-4333-8333-333333333333") // never seeded
 
-	acmeToken  = "aitnb_acme_push_token_aaaaaaaaaaaa"
-	umbraToken = "aitnb_umbra_push_token_bbbbbbbbbbb"
+	acmeToken        = "aitnb_acme_push_token_aaaaaaaaaaaa"
+	umbraToken       = "aitnb_umbra_push_token_bbbbbbbbbbb"
+	emptySecretToken = "aitnb_acme_nosecret_ffffffffffff"
+)
+
+const (
+	acmeHMAC  = "acme-test-hmac-secret"
+	umbraHMAC = "umbra-test-hmac-secret"
 )
 
 const testServiceToken = "svc-token-for-trusted-internal-callers"
@@ -125,9 +131,14 @@ func newAuthHandler(t *testing.T, serviceToken string) (*Handler, *capturingPubl
 	tokens := &fakeTokens{rows: map[string]*inbox.Token{
 		acmeToken: {
 			Token: acmeToken, TenantID: acmeTenant, TemplateID: ingestauth.PushTemplateID,
+			HMACSecret: acmeHMAC,
 		},
 		umbraToken: {
 			Token: umbraToken, TenantID: umbraTenant, TemplateID: ingestauth.PushTemplateID,
+			HMACSecret: umbraHMAC,
+		},
+		emptySecretToken: {
+			Token: emptySecretToken, TenantID: acmeTenant, TemplateID: ingestauth.PushTemplateID,
 		},
 		"aitnb_revoked_cccccccccccccccccccc": {
 			Token: "aitnb_revoked_cccccccccccccccccccc", TenantID: acmeTenant,
@@ -182,6 +193,14 @@ func push(t *testing.T, h *Handler, credential, declaredTenant string, opts ...f
 	}
 	if declaredTenant != "" {
 		req.Header.Set("X-Tenant-ID", declaredTenant)
+	}
+	// These two tokens are minted with a secret. Sign before options run so
+	// a test can still overwrite the header with a wrong signature.
+	switch credential {
+	case acmeToken:
+		signRequest(t, req, acmeHMAC)
+	case umbraToken:
+		signRequest(t, req, umbraHMAC)
 	}
 	for _, opt := range opts {
 		opt(req)
@@ -370,6 +389,32 @@ func TestIngest_TokenMintedForAnotherTemplateIsRefused(t *testing.T) {
 	}
 }
 
+// An empty hmac_secret used to skip verification, so the submission was
+// accepted with no signature at all — and a signature computed under the
+// empty key was accepted too, which anyone who can see the URL can produce.
+func TestIngest_EmptyHMACSecretIsRefused(t *testing.T) {
+	h, pub := newAuthHandler(t, "")
+
+	rec := push(t, h, emptySecretToken, acmeTenant.String())
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("a token with an empty HMAC secret was accepted (%d): %s", rec.Code, rec.Body)
+	}
+
+	forged := func(r *http.Request) {
+		body := readAll(t, r)
+		mac := hmac.New(sha256.New, nil)
+		mac.Write(body)
+		r.Header.Set("X-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+	}
+	rec = push(t, h, emptySecretToken, acmeTenant.String(), forged)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("a signature under an empty key was accepted (%d): %s", rec.Code, rec.Body)
+	}
+	if n := len(pub.published); n != 0 {
+		t.Fatalf("refused submissions still published %d event(s)", n)
+	}
+}
+
 func TestIngest_SignedTokenRequiresAMatchingSignature(t *testing.T) {
 	h, pub := newAuthHandler(t, "")
 	const signed = "aitnb_acme_signed_eeeeeeeeeeeeeeee"
@@ -400,6 +445,14 @@ func TestIngest_SignedTokenRequiresAMatchingSignature(t *testing.T) {
 	if got := pub.tenantsWritten(acmeTenant); got != 1 {
 		t.Fatalf("expected the signed push to land 1 event for Acme, got %d", got)
 	}
+}
+
+func signRequest(t *testing.T, r *http.Request, secret string) {
+	t.Helper()
+	body := readAll(t, r)
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	r.Header.Set("X-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
 }
 
 // readAll drains and restores a request body so a test option can sign it.

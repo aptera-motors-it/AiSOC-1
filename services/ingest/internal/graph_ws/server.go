@@ -1,12 +1,17 @@
 // HTTP upgrade handler for the graph_ws broadcaster (T1.4 — v8.0).
 //
-// The handler is intentionally minimal: tenant-scoped channels keyed
-// off the ?tenant_id=<id> query param, no auth (auth is enforced
-// by the Python API proxy at services/api/app/api/v1/endpoints/
-// graph_ws.py — this server is expected to listen on the internal
-// service network only). Each connection registers a Subscriber with
-// the Broadcaster and pumps envelopes from the bounded buffer to the
-// websocket until the client disconnects.
+// The socket used to subscribe to whatever ?tenant_id the query string
+// named, and left authentication to the Python proxy on the assumption
+// that this process only listens on an internal network. That is not a
+// boundary: anything that can open a TCP connection to the port could
+// read another tenant's stream. The upgrade runs the same ingest
+// authenticator as /v1/ingest and subscribes to the tenant that
+// credential covers. The query string is only a declaration, intersected
+// with the credential, and an anonymous handshake is refused.
+//
+// Each connection registers a Subscriber with the Broadcaster and pumps
+// envelopes from the bounded buffer to the websocket until the client
+// disconnects.
 //
 // We deliberately avoid pulling in github.com/gorilla/websocket or
 // github.com/coder/websocket here — every new transitive dep on the
@@ -26,6 +31,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/beenuar/aisoc/services/ingest/internal/ingestauth"
 )
 
 // wsHandshakeMagic is the fixed GUID from RFC 6455 §1.3 used to
@@ -41,11 +48,23 @@ const writeTimeout = 5 * time.Second
 // upgrade against the same Broadcaster.
 type Server struct {
 	broker *Broadcaster
+	auth   *ingestauth.Authenticator
 }
 
 // NewServer pairs a Broadcaster with an HTTP handler.
 func NewServer(broker *Broadcaster) *Server {
 	return &Server{broker: broker}
+}
+
+// SetAuthenticator is the credential check the upgrade runs before it
+// subscribes anyone. Nil refuses. A missing authenticator is a wiring
+// regression, not an anonymous socket. The process wires the same
+// authenticator /v1/ingest uses.
+func (s *Server) SetAuthenticator(a *ingestauth.Authenticator) {
+	if s == nil {
+		return
+	}
+	s.auth = a
 }
 
 // Handler returns an http.Handler that upgrades GET requests to a
@@ -63,15 +82,6 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	tenantID := strings.TrimSpace(r.URL.Query().Get("tenant_id"))
-	if tenantID == "" {
-		tenantID = strings.TrimSpace(r.Header.Get("X-Tenant-ID"))
-	}
-	if tenantID == "" {
-		http.Error(w, "tenant_id required", http.StatusBadRequest)
-		return
-	}
-
 	if !isWebSocketHandshake(r) {
 		http.Error(w, "websocket upgrade required", http.StatusBadRequest)
 		return
@@ -84,9 +94,18 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	// defect invisible in the first place. The endpoint that depends on the
 	// subscription is the right place to report on it, and 503 with the
 	// reason lets a caller retry or escalate instead of waiting forever.
+	// This stays ahead of the credential check: a detached source has
+	// nothing to subscribe to, and the reason is about the process, not
+	// about a tenant.
 	if health := s.broker.Health(); !health.Healthy() {
 		w.Header().Set("Retry-After", "30")
 		http.Error(w, "graph_ws unavailable: "+health.Reason(), http.StatusServiceUnavailable)
+		return
+	}
+
+	tenantID, code, msg := s.authorize(r)
+	if code != 0 {
+		http.Error(w, msg, code)
 		return
 	}
 
@@ -164,6 +183,35 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+// authorize returns the one tenant this connection may subscribe to.
+//
+// The query string is a declaration, the same way X-Tenant-ID is on
+// /v1/ingest: it is intersected with the credential and cannot name a
+// tenant the credential does not cover. A missing credential is refused
+// before that intersection, so an anonymous caller never gets a socket.
+func (s *Server) authorize(r *http.Request) (tenantID string, code int, msg string) {
+	if s == nil || s.auth == nil {
+		return "", http.StatusServiceUnavailable, "ingest authentication is not configured on this deployment"
+	}
+	identity, err := s.auth.Authenticate(r.Context(), r)
+	if err != nil {
+		var authErr *ingestauth.Error
+		if errors.As(err, &authErr) {
+			return "", authErr.Status, authErr.Msg
+		}
+		return "", http.StatusUnauthorized, "unrecognised ingest credential"
+	}
+	requested := strings.TrimSpace(r.URL.Query().Get("tenant_id"))
+	if requested == "" {
+		requested = s.auth.DeclaredTenant(r)
+	}
+	tenant, err := ingestauth.Resolve(identity.Principal, requested)
+	if err != nil {
+		return "", http.StatusForbidden, err.Error()
+	}
+	return tenant.String(), 0, ""
 }
 
 func isWebSocketHandshake(r *http.Request) bool {

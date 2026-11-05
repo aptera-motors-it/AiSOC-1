@@ -122,6 +122,18 @@ func (h *Handler) SetAuthenticator(a *ingestauth.Authenticator) {
 	h.auth = a
 }
 
+// Authenticator is the credential check wired into this handler.
+//
+// The graph websocket is a second surface on the same process. It uses
+// this authenticator rather than a second one, so the two routes cannot
+// drift about which credential is accepted.
+func (h *Handler) Authenticator() *ingestauth.Authenticator {
+	if h == nil {
+		return nil
+	}
+	return h.auth
+}
+
 // IngestRequest is the API payload for submitting events
 type IngestRequest struct {
 	ConnectorID   string                   `json:"connector_id"`

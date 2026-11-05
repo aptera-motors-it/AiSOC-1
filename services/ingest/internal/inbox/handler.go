@@ -23,18 +23,26 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// batchPublisher is the subset of *publisher.Publisher these routes call.
+// An interface so a request can be driven through the real handler without
+// a broker — the acceptance decision is which events were published, and a
+// test that stops at the signature check cannot see that.
+type batchPublisher interface {
+	PublishBatch(ctx context.Context, events []*normalizer.NormalizedEvent) error
+}
+
 // Handler serves the /v1/inbox/* push endpoints. It composes the token
 // resolver, template registry, and Kafka publisher into one HTTP-shaped
 // front door for any vendor that can post a webhook.
 //
-// The four routes share a common shape: resolve token → optionally
-// verify HMAC → parse body → run template → publish. Differences are
-// just in how we get to the "parse body" step (raw JSON, NDJSON, CEF
-// syslog text, email-relay JSON).
+// The four routes share a common shape: resolve token → verify HMAC →
+// parse body → run template → publish. Differences are just in how we
+// get to the "parse body" step (raw JSON, NDJSON, CEF syslog text,
+// email-relay JSON).
 type Handler struct {
 	store       *Store
 	registry    *Registry
-	pub         *publisher.Publisher
+	pub         batchPublisher
 	maxBodySize int64
 	limiter     *Limiter
 }
@@ -43,10 +51,17 @@ type Handler struct {
 // body — any vendor that paginates correctly stays well under the
 // default 10MiB; only buggy vendors push the limit.
 func NewHandler(store *Store, registry *Registry, pub *publisher.Publisher, maxBodySize int64) *Handler {
+	// A nil *Publisher must stay a nil interface. Assigning the typed nil
+	// makes a later nil check pass and then panics inside PublishBatch,
+	// which is a worse failure than the one the caller asked for.
+	var bp batchPublisher
+	if pub != nil {
+		bp = pub
+	}
 	return &Handler{
 		store:       store,
 		registry:    registry,
-		pub:         pub,
+		pub:         bp,
 		maxBodySize: maxBodySize,
 	}
 }
@@ -342,16 +357,23 @@ func (h *Handler) readBody(w http.ResponseWriter, r *http.Request, route, templa
 	return body, true
 }
 
-// verifyHMACOrFail enforces the optional HMAC-SHA256 signature header
-// when the token has hmac_secret set. We accept either:
+// verifyHMACOrFail requires an HMAC-SHA256 signature over the raw body.
+// Either header is accepted:
 //
 //	X-Signature: sha256=<hex>
 //	X-Hub-Signature-256: sha256=<hex>   (GitHub-style)
 //
-// Constant-time comparison protects against timing oracles.
+// An empty secret used to skip the check. The token is the URL, and the
+// URL is what a vendor configuration and an access log both keep, so
+// "optional" meant anyone who had seen the URL could submit. A signature
+// under the empty key is not a secret — it is computable by that same
+// anyone — so a blank secret is refused before the comparison.
 func (h *Handler) verifyHMACOrFail(w http.ResponseWriter, r *http.Request, route string, tok *Token, body []byte) bool {
-	if tok.HMACSecret == "" {
-		return true
+	if strings.TrimSpace(tok.HMACSecret) == "" {
+		inboxRequests.WithLabelValues(route, tok.TemplateID, "missing_signature").Inc()
+		writeErr(w, http.StatusUnauthorized,
+			"inbox: token has no HMAC secret; mint one with a secret and sign the body (X-Signature: sha256=<hex>)")
+		return false
 	}
 	provided := r.Header.Get("X-Signature")
 	if provided == "" {
