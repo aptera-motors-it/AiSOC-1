@@ -28,6 +28,7 @@ from typing import Any
 import httpx
 
 from app.playbook import pause as playbook_pause
+from app.security import peer_tokens
 
 from . import action_bridge, ask_model, idempotency, references, timeout_outcome, verification
 from .bounds import (
@@ -809,13 +810,15 @@ async def _emit(run_id: str, event_type: str, payload: dict, http: httpx.AsyncCl
 # ---------------------------------------------------------------------------
 
 
-async def _suspend_for_approval(pr: PlaybookRun, step: PlaybookStep, step_idx: int) -> Any:
+async def _suspend_for_approval(pr: PlaybookRun, step: PlaybookStep, step_idx: int, http: Any | None = None) -> Any:
     """Create the approval and persist where to resume.
 
     A pause with no approval has nothing for a human to decide against,
     and a human deciding against an approval with no pause wakes nothing.
-    If either cannot be written neither is, and the caller fails the step
-    closed.
+    The two rows are one statement. The API is told afterwards, and only
+    to fan the existing row out: it owns the channels and the requester
+    stamp, and a second insert would page somebody for an approval this
+    pause is not waiting on. A fan-out that fails leaves the pause.
     """
     tenant_id = str(pr.context.get("tenant_id") or pr.trigger_context.get("tenant_id") or "")
     if not tenant_id:
@@ -834,7 +837,7 @@ async def _suspend_for_approval(pr: PlaybookRun, step: PlaybookStep, step_idx: i
         logger.error("Approval step %s declares an unusable timeout outcome: %s", step.name, exc)
         return None
 
-    return await playbook_pause.suspend(
+    pause = await playbook_pause.suspend(
         tenant_id=tenant_id,
         run_id=pr.run_id,
         playbook_id=pr.playbook_id,
@@ -845,13 +848,24 @@ async def _suspend_for_approval(pr: PlaybookRun, step: PlaybookStep, step_idx: i
         step_results=pr.step_results,
         approval={
             "title": step.name or f"Approval for {pr.playbook_name}",
-            "summary": str(step.params.get("prompt") or step.params.get("reason") or ""),
+            "summary": str(step.params.get("prompt") or step.params.get("reason") or step.name or "Approval"),
             "requested_by": f"playbook:{pr.playbook_id}",
             "action": {"run_id": pr.run_id, "step_id": step.id},
         },
         ttl_hours=_approval_ttl(step),
         **declared_timeout.to_row(),
     )
+    if pause is None:
+        logger.error(
+            "Approval step %s could not open an approval; not suspending run %s",
+            step.name,
+            pr.run_id,
+        )
+        return None
+    approval_id = getattr(pause, "approval_id", None)
+    if approval_id:
+        await _create_approval(pr, step, tenant_id, http, str(approval_id))
+    return pause
 
 
 async def _suspend_for_wait(
@@ -925,6 +939,52 @@ def _approval_ttl(step: PlaybookStep) -> float | None:
         return float(raw) if raw is not None else None
     except (TypeError, ValueError):
         return None
+
+
+async def _create_approval(
+    pr: PlaybookRun,
+    step: PlaybookStep,
+    tenant_id: str,
+    http: Any | None,
+    approval_id: str,
+) -> None:
+    """Ask the API to fan out an approval this service has already stored.
+
+    Best-effort. The pause is already durable, and a channel that is down
+    must not take the approval with it. The body names the existing row
+    so the API stamps and notifies that row instead of inserting another.
+    """
+    try:
+        headers = peer_tokens.api_bearer_headers(tenant_id)
+    except peer_tokens.MissingPeerCredential as exc:
+        logger.warning("Approval step %s cannot fan out its approval: %s", step.name, exc)
+        return
+    api_url = os.getenv("AISOC_API_URL", "http://api:8000")
+    owns_client = http is None
+    client = http if http is not None else httpx.AsyncClient()
+    try:
+        response = await client.post(
+            f"{api_url}/api/v1/approvals",
+            headers=headers,
+            json={
+                "title": step.name or f"Approval for {pr.playbook_name}",
+                "summary": str(step.params.get("prompt") or step.params.get("reason") or step.name or "Approval"),
+                "requested_by": f"playbook:{pr.playbook_id}",
+                "action": {"run_id": pr.run_id, "step_id": step.id, "approval_id": approval_id},
+            },
+            timeout=10.0,
+        )
+        if response.status_code >= 400:
+            logger.warning(
+                "Approval fan-out refused: HTTP %s %s",
+                response.status_code,
+                response.text[:200],
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Approval fan-out failed: %s", exc)
+    finally:
+        if owns_client:
+            await client.aclose()
 
 
 async def deny_approval(*, approval_id: str, tenant_id: str, decided_by: str = "", comment: str = "") -> bool:
@@ -2134,7 +2194,7 @@ class PlaybookEngine:
                 # the requirement and an in-memory pause is lost by the
                 # thing most likely to interrupt a long approval.
                 if step.type == StepType.APPROVAL and not dry_run:
-                    pause = await _suspend_for_approval(pr, step, current_idx)
+                    pause = await _suspend_for_approval(pr, step, current_idx, http)
                     if pause is not None:
                         pr.status = RunStatus.PAUSED
                         pr.step_results.append(

@@ -118,18 +118,27 @@ def api_stub(monkeypatch: pytest.MonkeyPatch) -> Iterator[type[_ApiStub]]:
         thread.join(timeout=5)
 
 
+class _Pause:
+    """The shape ``_suspend_for_approval`` reads back off a stored pause."""
+
+    def __init__(self, approval_id: str) -> None:
+        self.approval_id = approval_id
+
+
 @pytest.fixture()
 def suspensions(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     """Every ``playbook_pause.suspend`` call, so "did it pause" is observable.
 
     The durable row needs Postgres; what this file is about is whether the
-    engine decides to write one at all, and with what approval id.
+    engine decides to write one at all, and with the approval beside it.
     """
     calls: list[dict[str, Any]] = []
 
-    async def _suspend(**kwargs: Any) -> str:
+    async def _suspend(**kwargs: Any) -> _Pause:
         calls.append(kwargs)
-        return "pause-0001"
+        nested = kwargs.get("approval") or {}
+        action = nested.get("action") or {}
+        return _Pause(str(action.get("approval_id") or kwargs.get("approval_id") or "approval-0001"))
 
     monkeypatch.setattr(playbook_pause, "suspend", _suspend)
     return calls
@@ -150,7 +159,10 @@ async def test_the_approval_is_created(api_stub: type[_ApiStub], suspensions: li
         await engine_module._suspend_for_approval(pr, step, 0, http)
 
     assert api_stub.received, "the engine never dialled the API"
-    assert suspensions and suspensions[0]["approval_id"] == "approval-0001"
+    assert suspensions, "the engine never wrote the pause"
+    approval = suspensions[0].get("approval") or {}
+    assert approval.get("action", {}).get("run_id") == pr.run_id
+    assert "approval_id" in api_stub.received[-1]["body"].get("action", {})
 
 
 @pytest.mark.asyncio
@@ -176,21 +188,46 @@ async def test_it_declares_the_tenant_on_the_header_the_api_reads(api_stub: type
 
 
 @pytest.mark.asyncio
-async def test_a_failed_approval_refuses_to_suspend(api_stub: type[_ApiStub], suspensions: list[dict[str, Any]]) -> None:
-    """The docstring's own claim, which the code did not keep.
+async def test_a_failed_approval_refuses_to_suspend(
+    api_stub: type[_ApiStub],
+    suspensions: list[dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pause that was not stored is not a pause, and nothing is paged.
 
-    A pause carrying ``approval_id=None`` is a run halted forever with nothing
-    for anyone to decide against — strictly worse than failing the step, which
-    at least surfaces.
+    The approval and the pause are one statement. When that statement
+    does not land, fanning out would page an analyst for a row that is
+    not there. A fan-out the API refuses is a different failure: the
+    row is already durable, and a channel being down must not unwind it.
     """
-    api_stub.granted = set()  # the API refuses the permission
+
+    async def _no_pause(**kwargs: Any) -> None:
+        suspensions.append(kwargs)
+        return None
+
+    monkeypatch.setattr(playbook_pause, "suspend", _no_pause)
 
     pr, step = _run()
     async with httpx.AsyncClient() as http:
         result = await engine_module._suspend_for_approval(pr, step, 0, http)
 
-    assert result is None, "the step must fail closed when no approval exists"
-    assert suspensions == [], "suspended with no approval for anyone to act on"
+    assert result is None, "the step must fail closed when the pause was not stored"
+    assert api_stub.received == [], "paged an approval the pause write did not store"
+
+    api_stub.granted = set()
+    api_stub.received = []
+    suspensions.clear()
+
+    async def _pause(**kwargs: Any) -> _Pause:
+        suspensions.append(kwargs)
+        return _Pause("approval-0001")
+
+    monkeypatch.setattr(playbook_pause, "suspend", _pause)
+    async with httpx.AsyncClient() as http:
+        kept = await engine_module._suspend_for_approval(pr, step, 0, http)
+
+    assert kept is not None, "a refused fan-out must not unwind a pause that was stored"
+    assert api_stub.received, "the refusal is the API's answer, so the engine did dial it"
 
 
 @pytest.mark.asyncio

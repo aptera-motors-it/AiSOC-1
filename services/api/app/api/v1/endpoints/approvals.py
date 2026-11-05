@@ -37,7 +37,7 @@ from typing import Annotated, Any, Literal
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, select, update
 
 from app.api.v1.deps import SERVICE_TENANT_HEADER, AuthUser, require_permission
 from app.core.config import settings
@@ -351,6 +351,57 @@ async def get_approval(
 # the service, and only this one verb. `/{id}/decide` deliberately still
 # requires `cases:write`: a service that can raise an approval must not be able
 # to answer it.
+async def _existing_playbook_approval(db: TenantDBSession, user: AuthUser, body: ApprovalCreateRequest) -> AgentApproval | None:
+    """The row a playbook step already wrote, when this call is its fan-out.
+
+    The id travels in ``action`` because that object is already the
+    caller's structured payload. A caller that is actually creating an
+    approval does not know the row's id yet and does not send one.
+    """
+    raw = (body.action or {}).get("approval_id")
+    if not raw:
+        return None
+    try:
+        approval_id = uuid.UUID(str(raw))
+    except ValueError:
+        return None
+    return (
+        await db.execute(
+            select(AgentApproval).where(
+                AgentApproval.id == approval_id,
+                AgentApproval.tenant_id == user.tenant_id,
+            )
+        )
+    ).scalar_one_or_none()
+
+
+async def _fan_out_existing(db: TenantDBSession, user: AuthUser, row: AgentApproval) -> ApprovalResponse:
+    """Stamp and notify an approval the playbook step has already stored.
+
+    The action column is the only one written. A decision can land
+    between the pause becoming visible and this call, and a whole-row
+    update would put that decision back to pending.
+    """
+    if row.status == "pending":
+        action = dict(row.action or {})
+        if _REQUESTER_KEY not in action:
+            action[_REQUESTER_KEY] = _requester_principal(user)
+        await _notify_realtime(row, event="approval_request")
+        delivery = await deliver_approval(row, await resolve_branding(db, user.tenant_id))
+        action["delivery"] = delivery.as_dict()
+        await db.execute(
+            update(AgentApproval)
+            .where(
+                AgentApproval.id == row.id,
+                AgentApproval.tenant_id == user.tenant_id,
+            )
+            .values(action=action)
+        )
+        await db.commit()
+        await db.refresh(row)
+    return ApprovalResponse.model_validate(row)
+
+
 @router.post("", response_model=ApprovalResponse, status_code=status.HTTP_201_CREATED)
 async def create_approval(
     body: ApprovalCreateRequest,
@@ -363,7 +414,16 @@ async def create_approval(
     requires human sign-off. We persist it, then fan-out a Web Push
     notification via the realtime service so the PWA buzzes the right
     on-call analyst.
+
+    A playbook step writes its approval in the same statement as the
+    pause, then calls here with that row's id inside ``action`` so the
+    fan-out and the requester stamp still happen. Creating a second row
+    would page an analyst for an approval the pause is not waiting on.
     """
+    existing = await _existing_playbook_approval(db, user, body)
+    if existing is not None:
+        return await _fan_out_existing(db, user, existing)
+
     row = AgentApproval(
         tenant_id=user.tenant_id,
         run_id=body.run_id,
