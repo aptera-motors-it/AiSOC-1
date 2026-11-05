@@ -1,11 +1,8 @@
-"""Infrastructure images in the root compose file must carry patch-level tags.
+"""Root-compose postgres, redis, and kafka-ui must use patch-level image tags.
 
-Floating tags such as ``postgres:16-alpine``, ``redis:7-alpine``, and
-``provectuslabs/kafka-ui:latest`` move on every upstream publish. A stack
-that pins only the major/minor line (or ``latest``) is not reproducible and
-cannot be reviewed for a known CVE level. The datastore services named in
-``docker-compose.yml`` are third-party images every operator pulls; they need
-explicit patch pins like the Confluent lines already use.
+Floating tags (``postgres:16-alpine``, ``redis:7-alpine``,
+``provectuslabs/kafka-ui:latest``) move on every upstream publish, so a stack
+that pins only a major/minor line is not reproducible.
 """
 
 from __future__ import annotations
@@ -18,7 +15,6 @@ import yaml
 REPO = pathlib.Path(__file__).resolve().parents[1]
 ROOT_COMPOSE = REPO / "docker-compose.yml"
 
-#: Services whose ``image:`` must name a patch-level tag, not a rolling alias.
 PINNED_INFRA_SERVICES: dict[str, re.Pattern[str]] = {
     "postgres": re.compile(r"^postgres:16\.\d+(?:\.\d+)?-alpine(?:3\.\d+)?$"),
     "redis": re.compile(r"^redis:7\.\d+\.\d+-alpine(?:3\.\d+)?$"),
@@ -57,7 +53,7 @@ class TestRootComposeInfraImagesArePatchPinned:
         offenders = _unpinned_infra_images(ROOT_COMPOSE)
         assert not offenders, "these infrastructure images must name a patch-level tag, not a rolling alias:\n  " + "\n  ".join(offenders)
 
-    def test_the_gate_catches_floating_tags_it_was_written_for(self, tmp_path: pathlib.Path) -> None:
+    def test_floating_tags_are_rejected(self, tmp_path: pathlib.Path) -> None:
         broken = tmp_path / "docker-compose.yml"
         broken.write_text(
             yaml.safe_dump(
