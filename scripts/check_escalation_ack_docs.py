@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """Escalation paging docs must name the only writer of ``aisoc_cases.acknowledged_at``.
 
-The ack-clock bridge stops paging when that column is set. For a time the
-README and ``bridge.py`` module docstring said the console's acknowledge
-action (and joining a war room) stopped the clock, but no console route writes
-the column — only the war-room channel **acknowledge** decision in
-``services/api/app/services/war_room.py`` does. Operators who believe console
-work stops Teams nagging will leave CRITICAL cases paging until someone clicks
-acknowledge in chat.
+The ack-clock bridge stops paging when that column is set. Operator docs once
+said the console acknowledge action (and joining a war room) stopped the clock,
+but no console route writes the column: only the war-room channel
+**acknowledge** decision in ``services/api/app/services/war_room.py`` does.
+Operators who believe console work stops Teams nagging will leave CRITICAL
+cases paging until someone clicks acknowledge in chat.
 
 This gate keeps the two operator-facing documents aligned with the code path
 and refuses a second runtime writer of the case ack clock.
@@ -31,7 +30,6 @@ README = Path("services/escalations/README.md")
 BRIDGE = Path("services/escalations/app/bridge.py")
 WAR_ROOM = Path("services/api/app/services/war_room.py")
 
-# Doc must not resurrect these claims (the defect that shipped).
 FORBIDDEN_DOC_PHRASES = (
     "that is the console",
     "the console's",
@@ -84,7 +82,6 @@ def _bridge_module_doc(root: Path) -> str:
 
 
 def _mentions_case_ack_write(body: str) -> bool:
-    """True when source looks like it writes ``aisoc_cases.acknowledged_at``."""
     if CASE_ACK_SET.search(body):
         return True
     if re.search(
@@ -114,23 +111,6 @@ def _read(root: Path, rel: Path) -> str:
 
 def _normalize_doc(text: str) -> str:
     return re.sub(r"\*+", "", text.lower())
-
-
-def _doc_section(text: str, heading: str) -> str:
-    """Return the bullet block under a markdown heading, or the whole file."""
-    marker = heading.lower()
-    lines: list[str] = []
-    in_section = False
-    for line in text.splitlines():
-        lower = line.lower()
-        if line.startswith("#") and marker in lower:
-            in_section = True
-            continue
-        if in_section and line.startswith("#"):
-            break
-        if in_section:
-            lines.append(line)
-    return "\n".join(lines) if lines else text
 
 
 def _gate_war_room_ack_path(source: str) -> list[Finding]:
@@ -212,18 +192,16 @@ def gate_escalation_ack_docs(root: Path) -> list[Finding]:
     for rel, text in ((README, readme), (BRIDGE, bridge_doc)):
         if not text:
             continue
-        scope = _doc_section(text, "what stops") if rel == README else text
-        lowered = _normalize_doc(scope)
         plain = _normalize_doc(text)
         for phrase in FORBIDDEN_DOC_PHRASES:
-            if phrase in lowered or phrase in plain:
+            if phrase in plain:
                 findings.append(
                     Finding(
                         str(rel),
                         f"still claims {phrase!r}; only the war-room acknowledge decision writes the ack clock",
                     )
                 )
-        if not WAR_ROOM_ACK.search(lowered) and not WAR_ROOM_ACK.search(plain):
+        if not WAR_ROOM_ACK.search(plain):
             findings.append(
                 Finding(
                     str(rel),
@@ -246,7 +224,7 @@ def gate_escalation_ack_docs(root: Path) -> list[Finding]:
                         "module docstring must say today only the war-room acknowledge decision writes it",
                     )
                 )
-        if ALT_ACK_WRITER.search(lowered) or ALT_ACK_WRITER.search(plain):
+        if ALT_ACK_WRITER.search(plain):
             findings.append(
                 Finding(
                     str(rel),
@@ -525,7 +503,7 @@ def main() -> int:
             print(f"  - {finding.render()}", file=sys.stderr)
         return 1
 
-    print("OK — escalation docs name the war-room acknowledge decision as the only case ack-clock writer.")
+    print("OK - escalation docs name the war-room acknowledge decision as the only case ack-clock writer.")
     return 0
 
 

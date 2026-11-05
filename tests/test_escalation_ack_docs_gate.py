@@ -1,9 +1,9 @@
-"""The escalation ack-clock docs gate must catch the drift that shipped.
+"""Scratch-tree pins for the escalation ack-clock docs gate.
 
-F60: README and ``bridge.py`` said console acknowledge stops Teams paging, but
-only the war-room channel acknowledge decision writes ``aisoc_cases.acknowledged_at``.
-A gate that only passes on the real tree after the fix is indistinguishable from
-no gate — these tests pin the comparison on scratch trees too.
+Operator docs once claimed console acknowledge stopped Teams paging; only the
+war-room channel acknowledge decision writes ``aisoc_cases.acknowledged_at``.
+A gate that only passes on the live tree is vacuous, so these tests use scratch
+trees too.
 """
 
 from __future__ import annotations
@@ -27,7 +27,6 @@ def _import_gate():
 
 
 def test_stale_console_ack_claim_is_refused(tmp_path: Path) -> None:
-    """The gate must refuse operator docs that resurrect the console-ack myth."""
     module = _import_gate()
     root = tmp_path
     stale_readme = module.GOOD_README.replace(
@@ -47,7 +46,6 @@ def test_stale_console_ack_claim_is_refused(tmp_path: Path) -> None:
 
 
 def test_the_live_tree_matches_the_ack_clock_writer() -> None:
-    """After the fix, production docs and code must agree."""
     module = _import_gate()
     assert module.gate_escalation_ack_docs(REPO_ROOT) == []
 
