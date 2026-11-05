@@ -52,7 +52,8 @@ EXCLUSIVE_README_WRITER = re.compile(
 )
 
 ALT_ACK_WRITER = re.compile(
-    r"console|clicking\s+acknowledge|acknowledge\s+button|joining\s+(?:the\s+)?(?:case'?s\s+)?war[- ]room|,\s*or\s+[^.\n]{0,100}\bwrite",
+    r"console(?:'s)?\s+acknowledge|clicking\s+acknowledge|acknowledge\s+button|"
+    r"joining\s+(?:the\s+)?(?:case'?s\s+)?war[- ]room|,\s*or\s+[^.\n]{0,100}\bwrite",
     re.IGNORECASE,
 )
 
@@ -62,7 +63,7 @@ MIGRATION_ACK_WRITE = re.compile(
 )
 
 CASE_ACK_SET = re.compile(
-    r"UPDATE\s+aisoc_cases\s+SET[^\n;]*acknowledged_at",
+    r"UPDATE\s+aisoc_cases\s+SET[\s\S]{0,200}?acknowledged_at\s*=",
     re.IGNORECASE,
 )
 
@@ -85,7 +86,7 @@ def _mentions_case_ack_write(body: str) -> bool:
     if CASE_ACK_SET.search(body):
         return True
     if re.search(
-        r"UPDATE[^\n]{0,160}aisoc_cases[^\n]{0,120}SET[^\n]{0,120}acknowledged_at",
+        r"UPDATE[\s\S]{0,160}?aisoc_cases[\s\S]{0,120}?SET[\s\S]{0,200}?acknowledged_at\s*=",
         body,
         re.IGNORECASE,
     ):
@@ -467,6 +468,47 @@ def _self_test() -> int:
         print(f"  {'PASS' if passed_noise else 'FAIL'}  status-only UPDATE is not a false-positive writer")
     finally:
         shutil.rmtree(noise, ignore_errors=True)
+
+    unrelated = Path(tempfile.mkdtemp(prefix="esc-ack-unrelated-console-"))
+    try:
+        _write_minimal_tree(
+            unrelated,
+            readme=(GOOD_README + "\nSee also the operator console for case assignment " + "(assignment does not stop paging).\n"),
+            bridge_doc=GOOD_BRIDGE_DOC,
+            war_room=WAR_ROOM_ACK_SNIPPET,
+        )
+        passed_unrelated = len(gate_escalation_ack_docs(unrelated)) == 0
+        ok &= passed_unrelated
+        print(f"  {'PASS' if passed_unrelated else 'FAIL'}  unrelated console mention is allowed")
+    finally:
+        shutil.rmtree(unrelated, ignore_errors=True)
+
+    multiline = Path(tempfile.mkdtemp(prefix="esc-ack-multiline-"))
+    try:
+        _write_minimal_tree(
+            multiline,
+            readme=GOOD_README,
+            bridge_doc=GOOD_BRIDGE_DOC,
+            war_room=WAR_ROOM_ACK_SNIPPET,
+        )
+        rogue = multiline / "services/api/app/cases_ml.py"
+        rogue.write_text(
+            "def ack():\n"
+            "    db.execute(\n"
+            '        """\n'
+            "        UPDATE aisoc_cases\n"
+            "        SET status = :s,\n"
+            "            acknowledged_at = :now\n"
+            "        WHERE id = :id\n"
+            '        """\n'
+            "    )\n",
+            encoding="utf-8",
+        )
+        caught_ml = bool(gate_escalation_ack_docs(multiline))
+        ok &= caught_ml
+        print(f"  {'PASS' if caught_ml else 'FAIL'}  multiline aisoc_cases ack UPDATE is refused")
+    finally:
+        shutil.rmtree(multiline, ignore_errors=True)
 
     empty = Path(tempfile.mkdtemp(prefix="esc-ack-empty-"))
     try:

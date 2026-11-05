@@ -83,3 +83,41 @@ def test_only_war_room_writes_the_case_ack_column() -> None:
         if module._mentions_case_ack_write(body):
             writers.append(rel)
     assert writers == ["services/api/app/services/war_room.py"]
+
+
+def test_unrelated_console_mention_is_not_an_ack_writer_claim(tmp_path: Path) -> None:
+    module = _import_gate()
+    module._write_minimal_tree(
+        tmp_path,
+        readme=(module.GOOD_README + "\nSee also the operator console for case assignment " + "(assignment does not stop paging).\n"),
+        bridge_doc=module.GOOD_BRIDGE_DOC,
+        war_room=module.WAR_ROOM_ACK_SNIPPET,
+    )
+    assert module.gate_escalation_ack_docs(tmp_path) == []
+
+
+def test_multiline_aisoc_cases_ack_update_is_a_writer(tmp_path: Path) -> None:
+    module = _import_gate()
+    module._write_minimal_tree(
+        tmp_path,
+        readme=module.GOOD_README,
+        bridge_doc=module.GOOD_BRIDGE_DOC,
+        war_room=module.WAR_ROOM_ACK_SNIPPET,
+    )
+    rogue = tmp_path / "services/api/app/cases_ml.py"
+    rogue.write_text(
+        "def ack():\n"
+        "    db.execute(\n"
+        '        """\n'
+        "        UPDATE aisoc_cases\n"
+        "        SET status = :s,\n"
+        "            acknowledged_at = :now\n"
+        "        WHERE id = :id\n"
+        '        """\n'
+        "    )\n",
+        encoding="utf-8",
+    )
+    findings = module.gate_escalation_ack_docs(tmp_path)
+    joined = " ".join(f.render() for f in findings)
+    assert "runtime writers" in joined
+    assert "cases_ml.py" in joined
