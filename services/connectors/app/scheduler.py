@@ -193,8 +193,6 @@ class ConnectorScheduler:
         self._fetches_in_flight: set[str] = set()
         self._fetches_idle = asyncio.Event()
         self._fetches_idle.set()
-        # Releases started because stop() is in progress. The idle event
-        # stays clear until this is back to zero.
         self._stop_releases = 0
         # Cache of {connector_id_str: last_seen_config_signature} so reloads
         # can detect when an instance's poll interval / config changed and
@@ -328,13 +326,11 @@ class ConnectorScheduler:
     async def _claim_connector_poll(self, connector_id: uuid.UUID, window_seconds: float, *, backfill: bool) -> bool:
         """Whether this replica may fetch the connector during this window.
 
-        The lease is taken even when leader election is off. Election
-        chooses who schedules; the lease chooses who fetches. A backfill
-        from the replica that already holds the window may fetch again.
-        The row lasts one poll interval from the claim, which is after the
-        tick started, so the next tick is still inside it. The holder
-        renews that row. Another replica cannot. A stop that lands during
-        the claim does not fetch; the caller releases the row.
+        Taken even when leader election is off: election chooses who
+        schedules; the lease chooses who fetches. A backfill from the
+        replica that already holds the window may fetch again. A stop
+        that lands during the claim does not fetch; the caller releases
+        the row.
         """
         if self._stopping:
             logger.info(
@@ -354,8 +350,6 @@ class ConnectorScheduler:
                 holder=self._holder,
                 lease=window_seconds,
             )
-            # The caller marks this poll in flight before the claim, so that
-            # set must not be what skips the holder's renew.
             if not await lease.acquire() and not await lease.renew():
                 logger.info(
                     "connector.scheduler.poll_skipped id=%s reason=connector_lease_held",
