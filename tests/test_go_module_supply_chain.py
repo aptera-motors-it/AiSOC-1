@@ -1,10 +1,9 @@
 """F68: first-party Go modules must not ship a vulnerable stdlib toolchain or x/net.
 
-The four modules under ``services/`` are what compose and CI build. ``go 1.26.0``
-without a ``toolchain`` line selects the runner's patch level; on the default
-1.26.0 toolchain ``govulncheck`` reports dozens of code-reachable stdlib issues.
-Pinning ``toolchain go1.26.10`` (and current ``golang.org/x/net`` on ingest) is
-the supply-chain fix this gate locks in.
+Without a ``toolchain`` line, ``go 1.26.0`` selects the runner's patch level.
+On go1.26.0, ``govulncheck`` reports code-reachable stdlib issues; this gate
+requires ``toolchain go1.26.10`` or newer, and ingest ``golang.org/x/net`` at
+least v0.62.0.
 """
 
 from __future__ import annotations
@@ -34,7 +33,7 @@ _AFFECTED_RE = re.compile(
 def _require_tool(name: str) -> str:
     path = shutil.which(name)
     if not path:
-        pytest.fail(f"{name} must be on PATH — this test runs the real scanner, not a stub")
+        pytest.fail(f"{name} must be on PATH (this test runs the real scanner, not a stub)")
     assert path is not None
     return path
 
@@ -79,9 +78,7 @@ def test_osv_scanner_reports_no_known_vulnerabilities(module_dir: str) -> None:
     assert "Uncalled vulnerabilities" not in combined, (
         f"osv-scanner --all-vulns reported uncalled vulnerabilities for {module_dir}:\n{combined}"
     )
-    assert "No issues found" in combined, (
-        f"osv-scanner --all-vulns must report a clean lockfile for {module_dir}:\n{combined}"
-    )
+    assert "No issues found" in combined, f"osv-scanner --all-vulns must report a clean lockfile for {module_dir}:\n{combined}"
 
 
 def test_ingest_pins_patched_golang_org_x_net() -> None:
