@@ -531,8 +531,7 @@ class FusedAlertTriageWorker:
                         partition=partition,
                         offset=offset,
                     )
-                    # A group with no commit restarts at the log end. Pin this
-                    # offset so the next poll reads the same alert.
+                    # auto_offset_reset=latest: a group with no commit starts at the log end.
                     if partition is not None and offset is not None and self._consumer is not None:
                         tp = TopicPartition(msg.topic, partition)
                         try:
@@ -555,8 +554,7 @@ class FusedAlertTriageWorker:
         """Triage one alert with bounded retries; dead-letter on exhaustion.
 
         Returns True when triage finished and False when the DLQ accepted
-        the alert. ``_DlqUnavailable`` means the publish did not happen,
-        and the caller must not commit.
+        the alert. Raises ``_DlqUnavailable`` when the publish did not happen.
         """
         last_error: str = ""
         stage = "triage"
