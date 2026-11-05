@@ -382,6 +382,17 @@ def test_docker_digest_action_is_not_flagged(tmp_path: Path) -> None:
     assert gate.check_workflow_action_pins(tmp_path) == []
 
 
+def test_docker_sha256_marker_without_digest_is_rejected(tmp_path: Path) -> None:
+    workflows = tmp_path / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "weak.yml").write_text(
+        "jobs:\n  j:\n    steps:\n      - uses: docker://alpine@sha256:notadigest\n",
+        encoding="utf-8",
+    )
+    problems = gate.check_workflow_action_pins(tmp_path)
+    assert any("weak.yml" in p for p in problems)
+
+
 def test_every_declared_exemption_carries_a_reason():
     """An exemption without a reason is a hole with a comment next to it."""
     for registry in (gate.PNPM_ACTION_EXEMPT, gate.UNLOCKED_INSTALL_EXEMPT, gate.EXPECTED_ESBUILD):

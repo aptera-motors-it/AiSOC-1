@@ -478,6 +478,7 @@ _JOB_CONTAINER = re.compile(r"^\s*image:\s*(?P<image>[\w./-]+:[\w.-]+)\s*$", re.
 _PNPM_ACTION = re.compile(r"uses:\s*pnpm/action-setup@\w+\s*#\s*(?P<version>v[\d.]+)")
 _USES_ACTION = re.compile(r"^\s*(?:-\s*)?uses:\s*(?P<ref>[^\s#]+)", re.MULTILINE)
 _ACTION_SHA_SUFFIX = re.compile(r"^[0-9a-f]{40}$")
+_DOCKER_DIGEST_SUFFIX = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 # `FROM node:20-alpine AS base`, `FROM golang:1.26-alpine`, `FROM python:3.11-slim`.
 _DOCKER_FROM = re.compile(
@@ -1924,16 +1925,15 @@ def _workflow_action_is_sha_pinned(ref: str) -> bool:
     ref = ref.strip("\"'")
     if ref.startswith("./"):
         return True
-    if ref.startswith("docker://") and "@sha256:" in ref:
-        return True
     if "@" not in ref:
         return False
     suffix = ref.rsplit("@", 1)[1]
+    if ref.startswith("docker://"):
+        return bool(_DOCKER_DIGEST_SUFFIX.match(suffix))
     return bool(_ACTION_SHA_SUFFIX.match(suffix))
 
 
 def check_workflow_action_pins(root: Path) -> list[str]:
-    """Third-party workflow actions pinned to a commit SHA, not a movable tag."""
     problems: list[str] = []
     workflows = root / ".github" / "workflows"
     if not workflows.is_dir():
