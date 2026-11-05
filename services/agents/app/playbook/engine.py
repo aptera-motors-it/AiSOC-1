@@ -813,11 +813,8 @@ async def _emit(run_id: str, event_type: str, payload: dict, http: httpx.AsyncCl
 async def _suspend_for_approval(pr: PlaybookRun, step: PlaybookStep, step_idx: int, http: Any | None = None) -> Any:
     """Create the approval and persist where to resume.
 
-    A pause with no approval has nothing for a human to decide against,
-    and a human deciding against an approval with no pause wakes nothing.
-    The two rows are one statement. The API is told afterwards, and only
-    to fan the existing row out: it owns the channels and the requester
-    stamp, and a second insert would page somebody for an approval this
+    The approval and its pause are one statement. The API is told afterwards
+    only to fan that row out; a second insert would page for an approval this
     pause is not waiting on. A fan-out that fails leaves the pause.
     """
     tenant_id = str(pr.context.get("tenant_id") or pr.trigger_context.get("tenant_id") or "")
@@ -950,9 +947,9 @@ async def _create_approval(
 ) -> None:
     """Ask the API to fan out an approval this service has already stored.
 
-    Best-effort. The pause is already durable, and a channel that is down
-    must not take the approval with it. The body names the existing row
-    so the API stamps and notifies that row instead of inserting another.
+    The pause is already durable; a channel that is down must not take it
+    with the approval. The body names the existing row so the API stamps
+    and notifies that row instead of inserting another.
     """
     try:
         headers = peer_tokens.api_bearer_headers(tenant_id)
@@ -1058,7 +1055,6 @@ async def resume_after_approval(
         )
         raise PlaybookDeleted(pause.playbook_id)
 
-    # The pause stored the step list before the approval step's entry was added.
     approval = {
         "step_id": pause.step_id,
         "name": next((step.name for step in playbook.steps if step.id == pause.step_id), pause.step_id),
@@ -1067,8 +1063,6 @@ async def resume_after_approval(
     }
     pause = replace(pause, step_results=[*pause.step_results, approval])
 
-    # What the shipped packs gate the approved action on:
-    # `steps.<approval>.outcome == 'approved'`.
     earlier = pause.run_context.get("steps")
     steps = {**(earlier if isinstance(earlier, dict) else {}), pause.step_id: {"outcome": "approved"}}
     return await PlaybookEngine().resume(playbook, pause, extra_context={"steps": steps})

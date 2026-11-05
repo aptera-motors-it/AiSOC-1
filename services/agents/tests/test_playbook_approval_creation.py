@@ -119,19 +119,13 @@ def api_stub(monkeypatch: pytest.MonkeyPatch) -> Iterator[type[_ApiStub]]:
 
 
 class _Pause:
-    """The shape ``_suspend_for_approval`` reads back off a stored pause."""
-
     def __init__(self, approval_id: str) -> None:
         self.approval_id = approval_id
 
 
 @pytest.fixture()
 def suspensions(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
-    """Every ``playbook_pause.suspend`` call, so "did it pause" is observable.
-
-    The durable row needs Postgres; what this file is about is whether the
-    engine decides to write one at all, and with the approval beside it.
-    """
+    """Every ``playbook_pause.suspend`` call, so "did it pause" is observable."""
     calls: list[dict[str, Any]] = []
 
     async def _suspend(**kwargs: Any) -> _Pause:
@@ -193,14 +187,6 @@ async def test_a_failed_approval_refuses_to_suspend(
     suspensions: list[dict[str, Any]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A pause that was not stored is not a pause, and nothing is paged.
-
-    The approval and the pause are one statement. When that statement
-    does not land, fanning out would page an analyst for a row that is
-    not there. A fan-out the API refuses is a different failure: the
-    row is already durable, and a channel being down must not unwind it.
-    """
-
     async def _no_pause(**kwargs: Any) -> None:
         suspensions.append(kwargs)
         return None

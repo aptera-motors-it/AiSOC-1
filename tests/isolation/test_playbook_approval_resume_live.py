@@ -643,8 +643,6 @@ async def _unsent_verification(agents: str, db: Any, tenant: str, *, gates: tupl
         assert started.status_code == 202, started.text
     run_id = started.json()["run_id"]
 
-    # The dispatch only previews, so the prompt fails after its pause was
-    # written and the pause stays answerable.
     failed = await _finished_run(agents, tenant, run_id)
     assert failed is not None and failed["status"] == "failed", f"the unsent prompt left the run {failed and failed['status']}"
     return {"playbook_id": playbook_id, "run_id": run_id, "token": await _resume_token(db, tenant, playbook_id, "verify")}
@@ -683,8 +681,6 @@ class TestADenialCancelsOnlyTheRunItStopped:
             return run if run and run["status"] == "paused" and run["step_results"][-1]["step_id"] == "second" else None
 
         assert await _poll(_at_second), "the approved run never recorded its second pause"
-        # Two decides that both read `pending` leave this row: the later write
-        # wins after the earlier one has already resumed the run.
         async with db.acquire() as conn:
             await conn.execute("UPDATE agent_approvals SET status = 'denied' WHERE id = $1", first["approval_id"])
         assert await _resume_directly(agents, first, _service(owner)) == 202

@@ -139,15 +139,10 @@ class _OwnedRun:
 # In-memory run store for Pillar-2 (swap for Redis/DB in production)
 _runs: dict[str, _OwnedRun] = {}
 
-#: Numbers each leg of a run — its start and every resume — as it begins. A
-#: resume begins only after the pause it continues was written, so a higher
-#: number is always a later point in the run.
 _legs = itertools.count()
 
 
 def _remember(tenant_id: str, run: PlaybookRun, leg: int) -> None:
-    # A pause can be decided before the leg that wrote it returns, so legs
-    # return out of order and an earlier leg's snapshot can arrive last.
     current = _runs.get(run.run_id)
     if current is not None and current.leg > leg:
         return
@@ -421,8 +416,6 @@ async def _resume_approval_in_background(approval_id: str, tenant_id: str, decis
         if run is not None:
             _remember(tenant_id, run, leg)
         return
-    # Two decides that both read the row pending can leave it denied after its
-    # pause resumed; only a denial that stopped the pause may cancel the run.
     if not await engine_module.deny_approval(approval_id=approval_id, tenant_id=tenant_id, decided_by=decided_by, comment=comment):
         return
     _end_stored(tenant_id, run_id, RunStatus.CANCELLED, "approval denied", leg)
@@ -432,9 +425,6 @@ def _end_stored(tenant_id: str, run_id: str, status: RunStatus, error: str, leg:
     owned = _runs.get(run_id)
     if owned is None or owned.tenant_id != tenant_id:
         return
-    # The stored record can be an earlier leg's in any status (a verification
-    # answered after its prompt failed to send leaves it failed), or a later
-    # leg's that _remember must keep, so end a copy.
     ended = copy.copy(owned.run)
     ended.status = status
     ended.error = error

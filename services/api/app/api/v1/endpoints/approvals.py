@@ -414,11 +414,6 @@ async def create_approval(
     requires human sign-off. We persist it, then fan-out a Web Push
     notification via the realtime service so the PWA buzzes the right
     on-call analyst.
-
-    A playbook step writes its approval in the same statement as the
-    pause, then calls here with that row's id inside ``action`` so the
-    fan-out and the requester stamp still happen. Creating a second row
-    would page an analyst for an approval the pause is not waiting on.
     """
     existing = await _existing_playbook_approval(db, user, body)
     if existing is not None:
