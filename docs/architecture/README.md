@@ -93,8 +93,8 @@ cannot drift from what the Go binary actually loads.
 independent: anything can consume the spine without ingest knowing about it.
 
 **4. Fusion consumes it and evaluates detections.**
-[`services/fusion`](../../services/fusion) runs the 2,535 executable rules
-against the event — 765 native and 1,770 imported Sigma rules, each of which
+[`services/fusion`](../../services/fusion) runs the 2,966 executable rules
+against the event — 1,196 native and 1,770 imported Sigma rules, each of which
 was replayed through its real connector and this engine and watched to fire
 before it was allowed into the compiled ruleset. Separately it decides whether the event is *promotable* —
 a vendor finding (OCSF category 2) or anything at severity ≥ high becomes an
@@ -133,7 +133,7 @@ alerts while the console showed it disabled — the worst shape a defect can
 have, because it tells the operator the problem is solved.
 
 It is an overlay rather than a per-tenant ruleset: the *difference* applied
-over one shared corpus, not N copies of 2,535 rules rebuilt whenever anyone
+over one shared corpus, not N copies of 2,966 rules rebuilt whenever anyone
 edits anything. Suppression is applied **after** the match so the dropped hit
 is logged with the tuning, its author and its reason — "no alert" with no
 explanation is indistinguishable from a rule that simply did not match. A
@@ -434,7 +434,7 @@ flowchart TD
     C --> E["OCSF-shaped envelope"]
     D --> E
     E --> F[("Kafka aisoc.raw_events")]
-    F --> G["Detection engine<br/>2,535 executable rules<br/>+ 76 windowed"]
+    F --> G["Detection engine<br/>2,966 executable rules<br/>+ 76 windowed"]
     F --> H{"Promotable?<br/>category 2, or severity >= high"}
     G -->|rule fires| I["Alert"]
     H -->|yes| I
@@ -455,14 +455,14 @@ One architecture, three profiles of it — not three architectures.
 
 | Profile | Command | Services | RAM | What you get |
 |---|---|---|---|---|
-| **core** | `make up` | 16 | ~8 GB | Ingest → detect → correlate → alert → triage → console, plus the LLM gateway, the local model behind it, the CISA KEV threat feed with its vector store, and the connector and response services the agent's vendor tools reach. |
-| **full** | `make up-full` | 22 | ~12 GB | Core plus event lake, entity graph, full-text search, enrichment, scheduled connectors. |
-| **demo** | `make up && make demo` | 16 | ~8 GB | Core plus clearly-labelled synthetic data. |
+| **core** | `make up` | 17 | ~8 GB | Ingest → detect → correlate → alert → triage → console, plus the LLM gateway, the local model behind it, the CISA KEV threat feed with its vector store, and the connector and response services the agent's vendor tools reach. |
+| **full** | `make up-full` | 23 | ~12 GB | Core plus event lake, entity graph, full-text search, enrichment, scheduled connectors. |
+| **demo** | `make up && make demo` | 17 | ~8 GB | Core plus clearly-labelled synthetic data. |
 
-`full` is 22 services, not the 30 published here previously: 30 is `full` plus
+`full` is 23 services, not the 30 published here previously: 30 is `full` plus
 the `monitoring`, `chatops`, `extras` and `osquery` profiles, which
-`make up-full` does not start. The CORE count is **16 long-running
-containers**; `ollama-pull` is a seventeenth that runs once and exits, and is
+`make up-full` does not start. The CORE count is **17 long-running
+containers**; `ollama-pull` is an eighteenth that runs once and exits, and is
 excluded because "long-running services" is the figure these documents
 publish.
 

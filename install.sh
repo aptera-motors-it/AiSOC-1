@@ -795,7 +795,7 @@ run_demo() {
     return 0
   fi
   section "Starting AiSOC (CORE profile)"
-  info "Starting the 16-service CORE stack. Validated against docker-compose.yml"
+  info "Starting the 17-service CORE stack. Validated against docker-compose.yml"
   info "by scripts/check_profile_service_counts.py, which refuses a figure here"
   info "that the compose file does not support."
   info ""

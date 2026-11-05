@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import uuid
 from datetime import datetime
 
@@ -36,7 +37,7 @@ async def send_alert(
     Returns True on success, False otherwise.
     """
     if not settings.alert_webhook_url:
-        LOG.info("No alert_webhook_url configured; skipping outbound alert.")
+        LOG.error("alert_webhook_url is empty; the honeytoken trip was not delivered.")
         return False
 
     # Require an explicit HMAC secret. Previously this defaulted to "changeme"
@@ -63,8 +64,15 @@ async def send_alert(
     payload_bytes = json.dumps(payload_dict).encode()
     signature = _sign_payload(payload_bytes, settings.alert_webhook_secret)
 
+    service_token = os.getenv("AISOC_SERVICE_TOKEN", "").strip()
+    if not service_token:
+        LOG.error("AISOC_SERVICE_TOKEN is empty; refusing to send a honeytoken alert the receiver cannot authenticate.")
+        return False
+
     headers = {
         "Content-Type": "application/json",
+        "Authorization": f"Bearer {service_token}",
+        "X-AiSOC-Tenant-ID": str(tenant_id),
         "X-AiSOC-Signature": f"sha256={signature}",
         "X-AiSOC-Event": "honeytoken.triggered",
     }

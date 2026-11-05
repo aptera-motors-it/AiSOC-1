@@ -252,7 +252,7 @@ Hardware: Apple M5 Max, 18 cores, 128 GiB host; Docker 29.5.2 in a 6-CPU /
 
 | Baseline | Result | Artefact |
 |---|---|---|
-| `make up` (CORE) | **PASS** -- 16 services healthy, administrator created | — |
+| `make up` (CORE) | **PASS** -- 17 services healthy, administrator created | — |
 | `make smoke` | **PASS 10/10 stages** -- event traversed ingest → Kafka → fusion → alert, severity and source attribution survived | — |
 | Behavioural injection suite | **19 passed.** Overall flip rate **0.2593**, unsafe-action rate **0.037** over 27 cases | `services/agents/tests/eval_data/behavioural_injection.json` |
 | Live-agent model matrix | **0 of 2 models measured** -- "no live LLM key configured", reported as *not measured* rather than zeros | — |
@@ -302,7 +302,7 @@ above. Phase 4.4 extends this harness and inherits the fix.
 
 ### D2 -- `make up-full` not captured on this host
 
-Deferred rather than claimed. The `full` profile is 22 services at ~12 GiB
+Deferred rather than claimed. The `full` profile is 23 services at ~12 GiB
 against a 15.6 GiB VM that is already running the 16 CORE services, and a
 baseline taken under memory pressure would describe the host rather than the
 stack. Recorded as unmeasured; Phase 4.5 (`helm install` brings up all of

@@ -633,6 +633,40 @@ class FusedAlertTriageWorker:
         """Whether the consume loop is currently iterating the subscription."""
         return self._attached
 
+    async def broker_reachable(self) -> bool:
+        """Ask the broker, instead of asking the loop whether it is still looping.
+
+        :attr:`attached` answers "am I consuming"; this answers "can I reach
+        the broker". They are different facts and only the second can describe
+        an outage. Under aiokafka the reconnect lives inside ``__anext__``, so
+        a stopped broker never ends the ``async for`` and the flag never
+        clears: a live pass measured this service answering **200** with
+        ``{"status": "ready"}`` at 35 s and again at 105 s into a Kafka outage
+        while its own log carried ``KafkaConnectionError: Connection at
+        kafka:29092 closed``, and fusion, ingest and realtime all answered 503
+        with a reason in the same window.
+
+        This service hosts ``FusedAlertTriageWorker``, so a replica reporting
+        ready while nothing can reach it is the worst case available: a load
+        balancer has no reason to route away from it and no fused alert gets
+        triaged.
+
+        Copied from ``FusionWorker.broker_reachable`` deliberately, down to
+        the metadata call — two services answering the same question two ways
+        makes a fleet-wide readiness answer unreadable.
+        ``fetch_all_metadata`` (which ``topics()`` drives) builds its own
+        ``ClusterMetadata``, so a probe cancelled by the caller's deadline
+        cannot corrupt the client's shared view of the cluster. The caller
+        (``app/_health.py``) bounds this at 1.5 s and treats a raise as "not
+        reachable", which is the honest reading: if asking whether the broker
+        is there is itself unanswerable, the answer is not yes.
+        """
+        consumer = self._consumer
+        if consumer is None:
+            return False
+        await consumer.topics()
+        return True
+
     async def stop(self) -> None:
         self._running = False
         self._attached = False
@@ -758,6 +792,7 @@ class FusedAlertTriageWorker:
         decision = governor.check(str(state.tenant_id), fingerprint)
 
         tier: str
+        verdict: str | None
         # None, not 0.0: a cached or deterministic verdict placed no LLM call,
         # and "no call was made" is a different fact from "the call was free".
         cost: CostSummary = CostSummary()
@@ -768,8 +803,18 @@ class FusedAlertTriageWorker:
         # happened.
         if decision.decision is Decision.DEDUPLICATED and decision.cached_verdict and writer.uses_dedup_cache:
             _METRICS["deduplicated"] += 1
-            verdict = decision.cached_verdict.get("verdict")
-            confidence = float(decision.cached_verdict.get("confidence", 0.0))
+            verdict = normalize_disposition(decision.cached_verdict.get("verdict"), default=NEEDS_REVIEW)
+            confidence = max(0.0, min(1.0, float(decision.cached_verdict.get("confidence") or 0.0)))
+            # Persistence and source writeback read the state, not these locals.
+            # A cached verdict never carries authorization to close this alert.
+            state.verdict = verdict
+            state.confidence = confidence
+            state.status = AgentStatus.RUNNING
+            state.confidence_basis = [
+                f"Cached prior assessment: {verdict}; confidence={confidence:.2f}. "
+                "The evidence fingerprint matched a previous assessment; no new model call was made. "
+                "This is not evidence of remediation or authorization to close the alert."
+            ]
             tier = "cached"
         else:
             cfg = await self._resolve_tenant_llm(state.tenant_id)

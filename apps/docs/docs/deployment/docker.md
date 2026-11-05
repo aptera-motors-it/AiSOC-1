@@ -147,8 +147,8 @@ matter:
   topic with no authentication of its own, so `--profile full` does not start
   it — ask for it by name with `--profile debug-ui`.
 
-CORE is 16 long-running services here, the same as development. `--profile full`
-is 21 rather than 22, the difference being `kafka-ui`.
+CORE is 17 long-running services here, the same as development. `--profile full`
+is 22 rather than 23, the difference being `kafka-ui`.
 
 ### Required variables
 

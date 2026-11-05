@@ -48,8 +48,8 @@ AiSOC/
 │   ├── aisoc-sandbox/    # Offline 30-second simulator (PyPI: aisoc-sandbox — published)
 │   └── aisoc-detections/ # Python detection-authoring framework (PyPI: aisoc-detections — published)
 ├── detections/           # Detection rules as YAML. A *projection* of the compiled
-│                         # ruleset, not the engine's input: 6,991 rules on disk,
-│                         # 2,511 executable. (More YAML files than that live here —
+│                         # ruleset, not the engine's input: 7,407 rules on disk,
+│                         # 2,966 executable. (More YAML files than that live here —
 │                         # the surplus are response playbooks, not rules.) Recount with
 │                         # scripts/generate_corpus_stats.py rather than trusting this line.
 ├── hunts/                # Hunt-as-Code YAML definitions (hypothesis + indicators + schedule)
@@ -95,8 +95,8 @@ services.
 why the gateway without a model behind it could not do AI triage at all.
 `connectors` and `actions` are CORE too: a default install has to be able to
 *pull* from a vendor as well as receive a push, and the investigation agent's
-vendor tools have to reach something. CORE is 16 long-running services and
-`full` is 22 long-running services; both are enforced against `docker-compose.yml` by
+vendor tools have to reach something. CORE is 17 long-running services and
+`full` is 23 long-running services; both are enforced against `docker-compose.yml` by
 [`scripts/check_profile_service_counts.py`](https://github.com/beenuar/AiSOC/blob/main/scripts/check_profile_service_counts.py),
 so this table cannot drift from the compose file without failing CI.
 
@@ -115,7 +115,7 @@ so this table cannot drift from the compose file without failing CI.
 | `connectors` | Python | 8003 | 8088 | core | Scheduled vendor polling, credential vault, federated query translators |
 | `enrichment` | Go | 8082 | 8080 | full | IOC enrichment fan-out (VT, AbuseIPDB, GreyNoise) |
 | `ueba` | Python | 8004 | 8007 | full | User and entity behaviour analytics |
-| `honeytokens` | Python | 8005 | 8008 | extras | Honeytoken lifecycle and webhook alerting |
+| `honeytokens` | Python | 8005 | 8008 | core | Honeytoken lifecycle and webhook alerting |
 | `purple-team` | Python | 8006 | 8006 | extras | Atomic Red Team, Caldera, ATT&CK heatmap, detection drift |
 | `osquery-tls` | Python | 9001 | 8091 | osquery | osquery TLS server — enrol nodes, distribute packs, stream telemetry |
 | `slack-bot` | Python | 8089 | 8009 | chatops | ChatOps approvals and the `/aisoc` slash command |

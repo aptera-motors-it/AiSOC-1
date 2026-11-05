@@ -13,14 +13,14 @@ tree disagree, **the tree is right and this file is a bug**.
 ## Get it running
 
 ```bash
-make up        # CORE profile: 16 long-running services, ~8 GB memory, ~20 GB disk
+make up        # CORE profile: 17 long-running services, ~8 GB memory, ~20 GB disk
 make doctor    # what is up, what is not, and what to do about it
 make smoke     # the golden pipeline, eight stages, end to end
 ```
 
 `make up` generates real secrets into `.env`, creates an administrator and
 prints its password once. There is no step where you hand-edit a compose file.
-`make up-full` adds the rest (21 services, ~12 GB) and switches on the lake
+`make up-full` adds the rest (22 services, ~12 GB) and switches on the lake
 writer and the entity graph.
 
 A first run shows real data with no credentials configured: the CISA Known
@@ -94,10 +94,10 @@ of these regenerates:
 
 | Figure | Current | Command |
 | --- | --- | --- |
-| Executable detection rules | 2,535 of 7,015 on disk | `python3 scripts/generate_corpus_stats.py --check` |
+| Executable detection rules | 2,966 of 7,407 on disk | `python3 scripts/generate_corpus_stats.py --check` |
 | Rules that cannot fire | 2 | `python3 scripts/check_detection_fields.py` |
-| Connectors | 87 | `python3 scripts/generate_connector_count.py --check` |
-| Services per profile | CORE 16, full 21 | `python3 scripts/check_profile_service_counts.py` |
+| Connectors | 91 | `python3 scripts/generate_connector_count.py --check` |
+| Services per profile | CORE 16, full 22 (21 under the production overlay) | `python3 scripts/check_profile_service_counts.py` |
 | Claims with a gate behind them | 299 rows | `python3 scripts/check_claim_gate_matrix.py` |
 
 "Executable" means the rule was replayed through its real connector and the real

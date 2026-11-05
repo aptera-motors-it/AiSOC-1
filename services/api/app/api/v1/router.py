@@ -46,6 +46,7 @@ from app.api.v1.endpoints import (
     graph,
     graph_ws,
     health,
+    honeytoken_alerts,
     hunt_reports,
     hunts,
     identity_graph,
@@ -87,6 +88,7 @@ from app.api.v1.endpoints import (
     replay,
     report_builder,
     reports,
+    response_schedule,
     retro_hunts,
     rule_tuning,
     sandbox,
@@ -104,6 +106,7 @@ from app.api.v1.endpoints import (
     tenants,
     threat_intel,
     translation,
+    triage_questions,
     usage,
     verification_policies,
     waitlist,
@@ -297,6 +300,8 @@ api_router.include_router(feedback.router)
 
 # Configurable autonomy guardrails — three-tier per-action confidence (Tier 1.3)
 api_router.include_router(autonomy_policy.router)
+api_router.include_router(response_schedule.router)
+api_router.include_router(triage_questions.router)
 
 # Business Context Rules — Track 3, T3.5 (v8.0 parallel team plan).
 # YAML rule engine that mutates fused alerts (severity bump, route, suppress,
@@ -402,6 +407,7 @@ api_router.include_router(agents.router)
 # URLs the wizard's "Push (any vendor)" card hands out. Vendor traffic
 # itself terminates at services/ingest, which resolves the token to a
 # tenant + template_id and reuses the existing OCSF normalizer.
+api_router.include_router(honeytoken_alerts.router)
 api_router.include_router(inbox.router)
 
 # Bidirectional ITSM webhook receiver (Workstream 8 of AI Stack plan).
