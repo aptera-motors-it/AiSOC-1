@@ -92,9 +92,6 @@ WRITTEN_STATUSES: Final[tuple[str, ...]] = (
     *RESOLVED_STATUSES,
 )
 
-#: Statuses ``PATCH /alerts`` will store. This is `WRITTEN_STATUSES`: every
-#: value a writer in this repository puts in `alerts.status`, and nothing
-#: else. An unknown value is a 422 and the row is left unchanged.
 AlertStatus = Literal[
     "new",
     "triaging",

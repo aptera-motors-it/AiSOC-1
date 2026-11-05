@@ -1115,9 +1115,7 @@ async def update_alert(
         # `is_resolved` rather than a fourth copy of the terminal set: the
         # copy that was here omitted `fp` and `dismissed`, so an alert moved
         # to either kept a null `resolved_at` and every duration measured
-        # from it silently excluded the row. A status that is not finished
-        # clears `resolved_at`, so a reopened alert is not still measured
-        # as closed.
+        # from it silently excluded the row.
         updates["resolved_at"] = datetime.now(UTC) if is_resolved(request.status) else None
     if request.priority is not None:
         updates["priority"] = request.priority

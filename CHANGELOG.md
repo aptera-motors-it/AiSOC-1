@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`PATCH /api/v1/alerts/{id}` stores only a known status.** `status` was
   any string. It is now the written vocabulary: `new`, `triaging`, `triaged`,
   `investigating`, `in_progress`, `escalated`, `snoozed`, `resolved`,
-  `closed`, `false_positive`, `fp` or `dismissed`. Any other value returns
+  `closed`, `false_positive`, `fp`, `dismissed`. Any other value returns
   422 and the row is left unchanged. A finished status sets `resolved_at`;
   a later patch to a status that is not finished clears it.
 

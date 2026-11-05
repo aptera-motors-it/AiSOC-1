@@ -1,4 +1,4 @@
-# Alert status — through the real app and real Postgres.
+# Alert status: through the real app and real Postgres.
 #
 # PATCH /api/v1/alerts/{id} stored any string as status. An unknown value was
 # written, a false positive stayed in the unresolved list count, and reopening
@@ -31,7 +31,7 @@ jobs:
     timeout-minutes: 20
 
     env:
-      # aisoc-db-role: owner — the suite creates a tenant, a user and an alert, which the DML-only runtime role cannot
+      # aisoc-db-role: owner; the suite creates a tenant, a user and an alert, which the DML-only runtime role cannot
       DATABASE_URL: postgresql+asyncpg://aisoc:aisoc_ci_only@localhost:5432/aisoc
       DATABASE_MIGRATION_URL: postgresql+asyncpg://aisoc:aisoc_ci_only@localhost:5432/aisoc
       PGPASSWORD: aisoc_ci_only
