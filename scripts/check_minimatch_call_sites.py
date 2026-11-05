@@ -13,7 +13,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gate_toolkit import repo_root, self_test_main
 
 _SCRIPT = Path(__file__).resolve().parent / "check_minimatch_call_sites.js"
-_GLOB_MODULES = "node_modules/.pnpm/glob@7.2.3/node_modules"
 
 
 def run_check(root: Path, modules_dir: Path | None = None) -> tuple[int, str]:

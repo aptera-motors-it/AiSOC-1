@@ -2,26 +2,22 @@
 """Fail when the root pnpm lockfile resolves known-vulnerable minimatch or deepmerge.
 
 The root ``pnpm-lock.yaml`` is what ``apps/web``, ``apps/docs``, and the rest of
-the workspace install from. ``security_audit.py`` audits every pnpm install root
-and only fails on high/critical findings, so moderate ``minimatch`` and low
-``deepmerge`` advisories on the root lockfile can sit as warnings forever while
-Dependabot and ``pnpm audit`` still name them on every push.
+the workspace install from. Sibling ``security_audit.py`` only fails on
+high/critical findings, so moderate ``minimatch`` and low ``deepmerge``
+advisories can remain green there.
 
-This gate is narrower and stricter than ``security_audit.py`` for two packages it
-can actually move without breaking the tree:
+Constraints this gate encodes:
 
-* **minimatch** — refuse GHSA-g3hv-75wg-m249 on **every** resolved copy below
-  11.0.1 (including legacy 3.x on the ``apps/docs`` → ``serve-handler`` path and
-  5.x under OpenAPI tooling). A workspace CommonJS facade
-  (``packages/minimatch-cjs-compat``, wired with ``pnpm.overrides.minimatch``)
-  delegates to registry ``minimatch@11.0.4`` while keeping ``require('minimatch')``
-  callable for glob@7, serve-handler, and eslint-plugin-react.
+* **minimatch** — refuse GHSA-g3hv-75wg-m249 on every resolved copy below
+  11.0.1. Registry ``minimatch@11`` is not a callable CommonJS
+  ``require('minimatch')`` for glob@7, serve-handler, and eslint-plugin-react;
+  the workspace facade ``packages/minimatch-cjs-compat`` (via
+  ``pnpm.overrides.minimatch``) wraps ``minimatch@11.0.4`` for those callers.
 * **deepmerge** — refuse versions below 4.2.0 (no ``__proto__`` merge guard).
-  Do **not** pin 4.1.2 to silence GHSA-gcqx-w48m-w2h4: that downgrade removes
-  the guard added in 4.2.0. Keep 4.3.1 (or newer when upstream ships). The
-  advisory is low severity with patched versions ``<0.0.0`` — no npm fix yet;
-  ``pnpm audit`` legitimately exits 1 on that finding until a patched release
-  lands. No pnpm audit ignore and no override exception for it.
+  Do not pin 4.1.2 for GHSA-gcqx-w48m-w2h4: that release drops the 4.2.0+
+  guard. Keep 4.3.1 (or newer when upstream ships). npm lists patched versions
+  as ``<0.0.0``; ``pnpm audit`` exits 1 on that low finding until a patched
+  release exists. No audit ignore for it.
 
 Package keys using registry tarballs or quoted paths are parsed the same as
 ``/pkg@version:`` entries. ``apps/mobile`` is out of scope.
@@ -92,7 +88,7 @@ def findings_for_lockfile(text: str) -> list[str]:
     problems: list[str] = []
     resolved = parse_pnpm_lock_versions(text)
     if not resolved:
-        return ["pnpm-lock.yaml contains no resolved package entries — nothing was scanned"]
+        return ["pnpm-lock.yaml contains no resolved package entries; nothing was scanned"]
 
     for line in _minimatch_problems(set(resolved.get("minimatch", []))):
         problems.append(line)
@@ -102,7 +98,7 @@ def findings_for_lockfile(text: str) -> list[str]:
         if _lt(parsed, _DEEPMERGE_GUARD_FLOOR):
             problems.append(
                 f"deepmerge@{version} is below 4.2.0 and lacks the __proto__ merge guard; "
-                "do not pin 4.1.2 to silence GHSA-gcqx-w48m-w2h4 — keep 4.2.0+ instead"
+                "do not pin 4.1.2 to silence GHSA-gcqx-w48m-w2h4; keep 4.2.0+ instead"
             )
 
     return problems
@@ -111,7 +107,7 @@ def findings_for_lockfile(text: str) -> list[str]:
 def check_root_lockfile(root: Path) -> list[str]:
     lockfile = root / "pnpm-lock.yaml"
     if not lockfile.is_file():
-        return [f"missing {lockfile.relative_to(root)} — the web workspace lockfile was not scanned"]
+        return [f"missing {lockfile.relative_to(root)}; the web workspace lockfile was not scanned"]
     return findings_for_lockfile(lockfile.read_text(encoding="utf-8"))
 
 
@@ -133,7 +129,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"check_pnpm_web_lockfile: {line}", file=sys.stderr)
         return 1
 
-    print("check_pnpm_web_lockfile: OK — root pnpm-lock.yaml has no known-vulnerable minimatch/deepmerge")
+    print("check_pnpm_web_lockfile: OK; root pnpm-lock.yaml has no known-vulnerable minimatch/deepmerge")
     return 0
 
 

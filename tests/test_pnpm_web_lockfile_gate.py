@@ -1,13 +1,3 @@
-"""The root pnpm lockfile gate must catch minimatch and deepmerge drift.
-
-``pnpm audit`` on the root workspace still reddened every push with moderate
-``minimatch`` and low ``deepmerge`` advisories while ``security_audit.py`` only
-failed on high/critical findings. The gate below reads resolved versions in
-``pnpm-lock.yaml`` and fails closed on vulnerable ``minimatch`` copies and on
-``deepmerge`` pins below 4.2.0 (the unsafe downgrade that removes the merge
-guard).
-"""
-
 from __future__ import annotations
 
 import importlib.util
