@@ -51,9 +51,9 @@ never landed. Simply moving the write after the database would have swapped
 one race for another — two workers both crossing the threshold before either
 had written anything — so the claim is taken atomically up front and only its
 *resolution* waits for the database. A worker that dies mid-handoff releases
-nothing, so the claim belongs to the event rather than the worker: the
-re-delivery of that record takes it back, and the lease ages out for any
-other event.
+nothing. The claim belongs to the event rather than the worker, so the
+re-delivery of that record takes it back; the lease ages out for any other
+event.
 
 Event time, late arrival and backfill
 -------------------------------------
@@ -201,9 +201,9 @@ FIRE_CLAIM_SECONDS = 60
 #: the claim's lease.
 FIRED_CONFIRMED = "1"
 
-#: Promote this worker's claim to the window-long marker, and only this
-#: worker's. A plain SET would overwrite a claim another worker took after
-#: ours expired, confirming an alert that worker has not persisted yet.
+#: Promote this event's claim to the window-long marker, bare or resumed. A
+#: plain SET would overwrite a claim another event took after ours expired,
+#: confirming an alert that event has not persisted yet.
 _CONFIRM_IF_OWNER = """
 local held = redis.call('get', KEYS[1])
 if held == ARGV[1] or held == 'r:' .. ARGV[1] then
@@ -212,14 +212,10 @@ end
 return 0
 """
 
-#: Take the fire slot when it is free or already this event's, with a fresh
-#: lease either way. The owner is the event, not the delivery: a worker that
-#: dies before confirming leaves its claim behind, and the re-delivery of that
-#: record is the only chance to recover the alert before the consumer commits
-#: past it. That re-delivery can arrive late in the lease, so it starts a new
-#: one. A resumed claim is stored as ``r:<identity>`` because the first
-#: delivery may still be alive and about to confirm: release matches only the
-#: bare identity, so no delivery can free a claim another one resumed.
+#: Take the fire slot when free or already held by this event, with a fresh
+#: lease either way. The owner is the event, not the delivery. A resumed
+#: claim is ``r:<identity>``: release matches only the bare identity, so no
+#: delivery can free a claim another delivery resumed.
 _CLAIM_FOR_EVENT = """
 local held = redis.call('get', KEYS[1])
 if not held then
@@ -798,7 +794,7 @@ class WindowedDetectionEngine:
     ) -> tuple[str, str] | None:
         """Record this observation and, on a threshold crossing, claim the fire.
 
-        Returns ``(claim_key, claim_token)`` for the worker that owns the
+        Returns ``(claim_key, claim_token)`` for the event that owns the
         fire, or ``None``. Owning the claim is a promise to call
         :meth:`confirm` or :meth:`release`.
         """
