@@ -212,16 +212,15 @@ class UEBAKafkaConsumer:
                 return False
             return True
 
-        # A group with no commit resumes at the log end. Pin the fetched
-        # offset first. A rejected pin is stored on the next attempt and the
-        # loop stops, so a restart reads that record. If it still cannot be
-        # stored, this record is scored or dead-lettered before stopping.
+        # With auto_offset_reset=latest, a fresh group has no commit and would
+        # resume at the log end after a crash. Commit this record's offset
+        # (not +1) before handling so a restart re-reads it.
         pinned: set[TopicPartition] = set()
 
         async def handle(msg: Any, tp: TopicPartition) -> str:
             try:
                 await self._process_message(msg.value, producer)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001 — dead-letter or stop; do not raise out of the loop
                 if not await self._handler_failed(msg, exc):
                     return "stop"
             else:
