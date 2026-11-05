@@ -22,6 +22,7 @@ variable "public_access_cidrs" {
     error_message = "Each public access CIDR must be /16 or more specific; 0.0.0.0/0 and overly broad ranges are not allowed."
   }
 }
+
 variable "node_groups" {
   type = map(object({
     instance_types = list(string)

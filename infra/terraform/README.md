@@ -117,7 +117,8 @@ contract.
 | `environment` | `prod` | One of `dev`, `staging`, `prod`. Drives the `aisoc-${environment}` name prefix. |
 | `vpc_cidr` | `10.0.0.0/16` | Pick something that doesn't collide with your peering. |
 | `eks_cluster_version` | `1.28` | Bump in lockstep with addon compatibility. |
-| `eks_public_access_cidrs` | *(required when public access is on)* | CIDR blocks that may reach the EKS public API (/16 or more specific). Set `eks_endpoint_public_access = true` and list CIDRs in `.tfvars`. |
+| `eks_endpoint_public_access` | `false` | When true, the control plane is reachable outside the VPC; pair with `eks_public_access_cidrs`. |
+| `eks_public_access_cidrs` | `[]` | CIDR blocks that may reach the EKS public API when public access is on. Each entry must be /16 or more specific. |
 | `rds_instance_class` | `db.r6g.large` | Down-size to `db.t4g.medium` for dev. |
 | `redis_node_type` | `cache.r6g.large` | `cache.t4g.medium` for dev. |
 | `kafka_instance_type` | `kafka.m5.large` | `kafka.t3.small` for dev (3 brokers minimum). |
