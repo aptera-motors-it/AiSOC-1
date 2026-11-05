@@ -234,6 +234,14 @@ async def _route_action_decision(
     action_id = button_value.split("|", 1)[0].strip()
     suspended: SuspendedDeadline | None = None
     if timeout_scheduler is not None and event_action_id in {APPROVE_ACTION_ID, DENY_ACTION_ID} and action_id:
+        if timeout_scheduler.claimed_by_timeout(action_id):
+            await respond(
+                {
+                    "response_type": "ephemeral",
+                    "text": "⏱️ This approval already timed out.",
+                }
+            )
+            return
         suspended = timeout_scheduler.suspend(action_id)
 
     try:

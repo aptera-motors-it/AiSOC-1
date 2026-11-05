@@ -88,6 +88,35 @@ async def test_recover_fires_overdue_timer_promptly():
     assert fired == ["act-5"]
 
 
+async def test_a_stale_resume_does_not_rearm_after_a_later_suspend():
+    store = InMemoryTimerStore()
+    fired: list[str] = []
+
+    async def _reject(action_id: str) -> dict:
+        fired.append(action_id)
+        return {"ok": True}
+
+    sched = ApprovalTimeoutScheduler(approve_fn=_noop, reject_fn=_reject, store=store)
+    sched.schedule("act-stale", timeout_seconds=0.05, safe_default="rejected", case_id="c")
+    await asyncio.sleep(0)
+    try:
+        first = sched.suspend("act-stale")
+        assert first is not None
+        await asyncio.sleep(0.08)
+        sched.schedule("act-stale", timeout_seconds=60, safe_default="rejected", case_id="c")
+        await asyncio.sleep(0)
+        second = sched.suspend("act-stale")
+        assert second is not None
+        assert sched.pending == 0
+        sched.resume(first)
+        await asyncio.sleep(0.05)
+        assert fired == []
+        assert sched.pending == 0
+        assert [row.action_id for row in await store.list_pending()] == ["act-stale"]
+    finally:
+        await sched.aclose()
+
+
 async def test_suspend_leaves_the_timer_row():
     store = InMemoryTimerStore()
     sched = _scheduler(store)
@@ -103,6 +132,26 @@ async def test_suspend_leaves_the_timer_row():
         await asyncio.sleep(0)
         assert [row.action_id for row in await store.list_pending()] == ["act-9"]
         assert sched.pending == 1
+    finally:
+        await sched.aclose()
+
+
+async def test_a_superseded_timer_wake_does_not_call_actions():
+    store = InMemoryTimerStore()
+    fired: list[str] = []
+
+    async def _reject(action_id: str) -> dict:
+        fired.append(action_id)
+        return {"ok": True}
+
+    sched = ApprovalTimeoutScheduler(approve_fn=_noop, reject_fn=_reject, store=store)
+    sched.schedule("act-old", timeout_seconds=0.05, safe_default="rejected", case_id="c")
+    await asyncio.sleep(0)
+    try:
+        sched.schedule("act-old", timeout_seconds=60, safe_default="rejected", case_id="c")
+        await asyncio.sleep(0.08)
+        assert fired == []
+        assert [row.action_id for row in await store.list_pending()] == ["act-old"]
     finally:
         await sched.aclose()
 

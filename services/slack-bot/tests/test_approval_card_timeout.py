@@ -1,5 +1,3 @@
-"""An undecided Slack approval times out after its card is posted."""
-
 from __future__ import annotations
 
 import asyncio
@@ -41,6 +39,8 @@ class _Actions(BaseHTTPRequestHandler):
     approve_entered: threading.Event | None = None
     release_approve: threading.Event | None = None
     approve_done: threading.Event | None = None
+    reject_entered: threading.Event | None = None
+    release_reject: threading.Event | None = None
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler method name
         length = int(self.headers.get("Content-Length") or 0)
@@ -55,6 +55,13 @@ class _Actions(BaseHTTPRequestHandler):
                 release.wait(5)
             elif type(self).hold_approve_seconds > 0:
                 time.sleep(type(self).hold_approve_seconds)
+        elif self.path.endswith("/reject"):
+            entered = type(self).reject_entered
+            if entered is not None:
+                entered.set()
+            release = type(self).release_reject
+            if release is not None:
+                release.wait(5)
         status_code = type(self).approve_status if self.path.endswith("/approve") else 200
         payload = json.dumps({"id": ACTION_ID, "status": "ok"}).encode()
         self.send_response(status_code)
@@ -79,6 +86,8 @@ def actions_url(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     _Actions.approve_entered = None
     _Actions.release_approve = None
     _Actions.approve_done = None
+    _Actions.reject_entered = None
+    _Actions.release_reject = None
     _slack_posts.clear()
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Actions)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -356,3 +365,32 @@ async def test_an_absurd_timeout_is_refused_before_slack_is_called() -> None:
             )
     assert response.status_code == 422
     assert _slack_posts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("actions_url")
+async def test_a_late_approve_does_not_join_an_in_flight_timeout_reject() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    _Actions.reject_entered = entered
+    _Actions.release_reject = release
+    try:
+        async with app.router.lifespan_context(app):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://bot") as client:
+                await _post_card(client)
+                assert await asyncio.to_thread(entered.wait, 5)
+                click = await client.post(
+                    "/slack/events",
+                    content=_click("aisoc_action_approve"),
+                    headers={"content-type": "application/x-www-form-urlencoded"},
+                )
+                assert click.status_code == 200
+                await asyncio.sleep(0.2)
+                assert _paths() == [f"/api/v1/actions/{ACTION_ID}/reject"]
+                release.set()
+                await asyncio.sleep(0.2)
+    finally:
+        release.set()
+
+    assert _paths() == [f"/api/v1/actions/{ACTION_ID}/reject"]
+    assert _reject_bodies() == [b""]

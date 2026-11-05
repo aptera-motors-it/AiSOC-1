@@ -94,6 +94,8 @@ class ApprovalTimeoutScheduler:
         self._records: dict[str, TimerRecord] = {}
         self._epoch: dict[str, int] = {}
         self._open_epoch: dict[str, int] = {}
+        # Set once a woken timer claims the decision, before the actions HTTP call.
+        self._claimed_by_timeout: set[str] = set()
 
     @property
     def pending(self) -> int:
@@ -123,6 +125,7 @@ class ApprovalTimeoutScheduler:
             existing.cancel()
         self._epoch[action_id] = self._epoch.get(action_id, 0) + 1
         self._open_epoch.pop(action_id, None)
+        self._claimed_by_timeout.discard(action_id)
 
         # Phase B3 — persist the pending timer so a restart can recover it.
         # Best-effort: a store failure never blocks arming the in-memory timer.
@@ -142,8 +145,11 @@ class ApprovalTimeoutScheduler:
                 await asyncio.sleep(timeout_seconds)
             except asyncio.CancelledError:
                 return
-            if self._records.get(action_id) is record:
-                del self._records[action_id]
+            # Stale wake after schedule/cancel/suspend replaced this generation.
+            if self._records.get(action_id) is not record:
+                return
+            del self._records[action_id]
+            self._claimed_by_timeout.add(action_id)
             # The timer fired — drop the durable row so recovery won't re-arm it.
             with contextlib.suppress(Exception):
                 await self._store.delete(action_id)
@@ -205,6 +211,7 @@ class ApprovalTimeoutScheduler:
         self._epoch[action_id] = self._epoch.get(action_id, 0) + 1
         self._open_epoch.pop(action_id, None)
         self._records.pop(action_id, None)
+        self._claimed_by_timeout.discard(action_id)
         asyncio.create_task(self._store.delete(action_id))  # noqa: RUF006 — fire-and-forget
 
         existing = self._timers.pop(action_id, None)
@@ -213,8 +220,14 @@ class ApprovalTimeoutScheduler:
         existing.cancel()
         return True
 
+    def claimed_by_timeout(self, action_id: str) -> bool:
+        """True once the woken timer has claimed the decision (before actions HTTP)."""
+        return action_id in self._claimed_by_timeout
+
     def suspend(self, action_id: str) -> SuspendedDeadline | None:
         """Leave the durable row; cancel only the in-memory sleep."""
+        if action_id in self._claimed_by_timeout:
+            return None
         record = self._records.get(action_id)
         task = self._timers.get(action_id)
         if record is None or task is None or task.done():
@@ -295,3 +308,4 @@ class ApprovalTimeoutScheduler:
         self._records.clear()
         self._epoch.clear()
         self._open_epoch.clear()
+        self._claimed_by_timeout.clear()
