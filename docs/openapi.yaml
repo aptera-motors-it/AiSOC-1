@@ -25039,7 +25039,7 @@ components:
             type: object
           - type: 'null'
           title: Suppress When
-          description: Field values that suppress this rule, stored as suppression_config.suppress_when.
+          description: Field values that suppress matching events for this rule.
       type: object
       required:
       - action

@@ -197,7 +197,7 @@ class ApplyTuningRequest(BaseModel):
     )
     suppress_when: dict[str, list[str]] | None = Field(
         default=None,
-        description="Field values that suppress this rule, stored as suppression_config.suppress_when.",
+        description="Field values that suppress matching events for this rule.",
     )
 
     @field_validator("note", "suppression_reason", "suppress_when")

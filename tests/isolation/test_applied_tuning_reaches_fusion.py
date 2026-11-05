@@ -158,13 +158,6 @@ async def db() -> AsyncIterator[AsyncSession]:
 
 
 class _BothReadBeforeWrite:
-    """Hold the first apply after its read until the second has also read.
-
-    A row lock stops the second read. Seeing that wait lets the first apply
-    commit, which is the serialization the lock is there to provide. The
-    lost update is an assertion on the stored hosts, not a timed-out request.
-    """
-
     def __init__(self) -> None:
         self._arrived = 0
         self._both_read = asyncio.Event()
