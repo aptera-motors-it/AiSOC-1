@@ -52,7 +52,7 @@ SafeDefault = Literal["rejected", "approved"]
 
 @dataclass(frozen=True)
 class SuspendedDeadline:
-    """One click's hold on a deadline. ``epoch`` is the generation it suspended."""
+    """Suspend token; ``epoch`` must still be the open generation for resume."""
 
     record: TimerRecord
     epoch: int
@@ -214,7 +214,7 @@ class ApprovalTimeoutScheduler:
         return True
 
     def suspend(self, action_id: str) -> SuspendedDeadline | None:
-        """Stop the in-memory sleep and return its record. The store row stays."""
+        """Leave the durable row; cancel only the in-memory sleep."""
         record = self._records.get(action_id)
         task = self._timers.get(action_id)
         if record is None or task is None or task.done():
@@ -226,7 +226,7 @@ class ApprovalTimeoutScheduler:
         return SuspendedDeadline(record, epoch)
 
     def resume(self, suspended: SuspendedDeadline) -> asyncio.Task[None] | None:
-        """Arm the time left unless this click's suspend is no longer current."""
+        """Re-arm remaining time only while this suspend is still the open generation."""
         action_id = suspended.record.action_id
         if self._open_epoch.get(action_id) != suspended.epoch:
             return None
@@ -293,3 +293,5 @@ class ApprovalTimeoutScheduler:
                 _ = await task
         self._timers.clear()
         self._records.clear()
+        self._epoch.clear()
+        self._open_epoch.clear()
