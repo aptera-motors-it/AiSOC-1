@@ -243,7 +243,9 @@ class UEBAKafkaConsumer:
                     if current is None and not await commit_position(tp, msg.offset):
                         if await commit_position(tp, msg.offset):
                             break
-                        await handle(msg, tp)
+                        outcome = await handle(msg, tp)
+                        if outcome == "stop":
+                            await commit_position(tp, msg.offset)
                         break
                 outcome = await handle(msg, tp)
                 if outcome == "stop":
