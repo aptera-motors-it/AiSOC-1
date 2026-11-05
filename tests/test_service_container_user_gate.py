@@ -1,9 +1,4 @@
-"""F69: first-party service containers must not run as root.
-
-The behavioural half is ``scripts/check_service_container_user.py``, which
-reads every ``services/*/Dockerfile`` and requires a non-root ``USER`` in the
-runtime stage. This module invokes that gate the way CI would.
-"""
+"""CI entry for ``scripts/check_service_container_user.py``."""
 
 from __future__ import annotations
 
@@ -27,7 +22,6 @@ def _load_gate():
 
 
 def test_service_dockerfiles_declare_non_root_user() -> None:
-    """No service image may run as uid 0 by default."""
     gate = _load_gate()
     findings = gate.scan(REPO)
     assert not findings, "\n".join(f"{rel}: {info.stage}" for rel, info in findings)

@@ -3,24 +3,22 @@
 
 Why this exists
 ---------------
-Sixteen ``services/*/Dockerfile`` files shipped with no ``USER`` directive, so
-every published service container started as uid 0. A Dockerfile that never
-names a user is not an accident waiting for compose to fix it — it is the
-runtime default.
+A ``services/*/Dockerfile`` with no ``USER`` starts the published container as
+uid 0. Compose cannot paper over that default.
 
 What it checks
 --------------
-Every ``services/*/Dockerfile`` is parsed stage by stage. The **last** ``FROM``
-is the runtime image; the effective user is the last ``USER`` in that stage, or
+Every ``services/*/Dockerfile`` is parsed stage by stage. The last ``FROM`` is
+the runtime image; the effective user is the last ``USER`` in that stage, or
 root when there is none. Any ``USER`` whose uid is ``0`` or ``root`` (including
-quoted forms and ``USER root:nogroup``) is treated as root. A ``USER`` value
-containing ``$`` is a finding because the gate cannot verify the runtime uid.
+quoted forms, empty user halves like ``USER :0``, and ``USER root:nogroup``) is
+treated as root. A ``USER`` value containing ``$`` is a finding because the gate
+cannot verify the runtime uid.
 
 Optional ``--probe SERVICE`` builds the image compose would build for one
-service and runs ``id -u`` inside it. That is the observation half: a
-Dockerfile can declare ``USER`` and still be overridden at run time, which this
-does not check; it does catch a declaration that never made it into the built
-image.
+service and runs ``id -u`` inside it. A Dockerfile can declare ``USER`` and
+still be overridden at run time (this gate does not check overrides); the probe
+catches a declaration that never made it into the built image.
 
 Usage
 -----
@@ -76,7 +74,6 @@ _COPY_OR_RUN = re.compile(r"^(COPY|RUN)\s+", re.IGNORECASE)
 
 
 def _heredoc_delimiter(instruction: str) -> str | None:
-    """Return the heredoc delimiter when ``instruction`` is COPY/RUN with ``<<``."""
     if not _COPY_OR_RUN.match(instruction):
         return None
     match = _HEREDOC_REDIRECT.search(instruction)
@@ -86,7 +83,6 @@ def _heredoc_delimiter(instruction: str) -> str | None:
 
 
 def _logical_instruction_lines(text: str) -> list[str]:
-    """Dockerfile lines merged for ``\\`` continuations; heredoc bodies omitted."""
     logical: list[str] = []
     pending = ""
     in_heredoc = False
@@ -100,10 +96,9 @@ def _logical_instruction_lines(text: str) -> list[str]:
         if pending:
             stripped = pending + stripped
             pending = ""
-        while stripped.endswith("\\"):
+        if stripped.endswith("\\"):
             pending = stripped[:-1].rstrip() + " "
-            stripped = ""
-            break
+            continue
         if not stripped:
             continue
         delim = _heredoc_delimiter(stripped)
@@ -123,6 +118,8 @@ def _runs_as_root(user_spec: str | None) -> bool:
     if not user_spec:
         return True
     uid_part = _uid_part(user_spec)
+    if not uid_part:
+        return True
     if uid_part.lower() == "root":
         return True
     try:
@@ -296,6 +293,15 @@ def self_test() -> int:
 
     single_quoted = effective_runtime_user("FROM alpine:3.19\nUSER '0'\nCMD []\n")
     record("USER '0' is treated as root", single_quoted.user is None)
+
+    empty_quoted = effective_runtime_user('FROM alpine:3.19\nUSER ""\nCMD []\n')
+    record('USER "" is treated as root', empty_quoted.user is None)
+
+    group_only = effective_runtime_user("FROM alpine:3.19\nUSER :0\nCMD []\n")
+    record("USER :0 (empty user half) is treated as root", group_only.user is None)
+
+    group_only_root = effective_runtime_user("FROM alpine:3.19\nUSER :root\nCMD []\n")
+    record("USER :root (empty user half) is treated as root", group_only_root.user is None)
 
     quoted_root = effective_runtime_user('FROM alpine:3.19\nUSER "root"\nCMD []\n')
     record('USER "root" is treated as root', quoted_root.user is None)
