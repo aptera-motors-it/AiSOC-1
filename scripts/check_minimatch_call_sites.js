@@ -2,9 +2,9 @@
 'use strict';
 
 /**
- * Exercise minimatch consumers that break when registry minimatch@11 is required
- * without a glob@7-compatible Minimatch.set (serve-handler, eslint-plugin-react,
- * glob.sync wildcards, rimraf glob patterns).
+ * Legacy require('minimatch') callers (glob@7, rimraf@3, serve-handler,
+ * eslint-plugin-react, eslint-plugin-import) expect a callable CJS export and a
+ * Minimatch.set shape registry minimatch@11 does not provide.
  *
  * Usage: node scripts/check_minimatch_call_sites.js [--modules-dir PATH]
  */
@@ -16,38 +16,6 @@ const { Writable } = require('stream');
 
 const repoRoot = path.join(__dirname, '..');
 
-const defaultModulePaths = {
-  glob: path.join(repoRoot, 'node_modules/.pnpm/glob@7.2.3/node_modules'),
-  rimraf: path.join(repoRoot, 'node_modules/.pnpm/rimraf@3.0.2/node_modules'),
-  serveHandler: path.join(repoRoot, 'node_modules/.pnpm/serve-handler@6.1.7/node_modules'),
-  eslintReact: path.join(
-    repoRoot,
-    'node_modules/.pnpm',
-    ...(() => {
-      const base = path.join(repoRoot, 'node_modules/.pnpm');
-      const { readdirSync } = fs;
-      const name = readdirSync(base).find((entry) => entry.startsWith('eslint-plugin-react@'));
-      if (!name) {
-        throw new Error('eslint-plugin-react is not installed');
-      }
-      return [name, 'node_modules'];
-    })(),
-  ),
-  eslintImport: path.join(
-    repoRoot,
-    'node_modules/.pnpm',
-    ...(() => {
-      const base = path.join(repoRoot, 'node_modules/.pnpm');
-      const { readdirSync } = fs;
-      const name = readdirSync(base).find((entry) => entry.startsWith('eslint-plugin-import@'));
-      if (!name) {
-        throw new Error('eslint-plugin-import is not installed');
-      }
-      return [name, 'node_modules'];
-    })(),
-  ),
-};
-
 const modulesDir = (() => {
   const idx = process.argv.indexOf('--modules-dir');
   if (idx !== -1 && process.argv[idx + 1]) {
@@ -55,6 +23,33 @@ const modulesDir = (() => {
   }
   return null;
 })();
+
+function pnpmPackageModules(prefix) {
+  const base = path.join(repoRoot, 'node_modules/.pnpm');
+  const name = fs.readdirSync(base).find((entry) => entry.startsWith(prefix));
+  if (!name) {
+    throw new Error(`${prefix.replace(/@$/, '')} is not installed`);
+  }
+  return path.join(base, name, 'node_modules');
+}
+
+const defaultModulePaths = {
+  get glob() {
+    return path.join(repoRoot, 'node_modules/.pnpm/glob@7.2.3/node_modules');
+  },
+  get rimraf() {
+    return path.join(repoRoot, 'node_modules/.pnpm/rimraf@3.0.2/node_modules');
+  },
+  get serveHandler() {
+    return path.join(repoRoot, 'node_modules/.pnpm/serve-handler@6.1.7/node_modules');
+  },
+  get eslintReact() {
+    return pnpmPackageModules('eslint-plugin-react@');
+  },
+  get eslintImport() {
+    return pnpmPackageModules('eslint-plugin-import@');
+  },
+};
 
 function resolveFrom(name, searchPaths) {
   const paths = modulesDir
@@ -71,7 +66,8 @@ function assert(condition, message) {
 }
 
 function checkGlobSyncWildcards() {
-  const glob = resolveFrom('glob', [defaultModulePaths.glob]);
+  const paths = modulesDir ? null : [defaultModulePaths.glob];
+  const glob = resolveFrom('glob', paths);
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'aisoc-glob-'));
   fs.writeFileSync(path.join(tmp, 'a.json'), '{}');
   fs.writeFileSync(path.join(tmp, 'b.txt'), 'x');
@@ -95,7 +91,10 @@ function checkGlobSyncWildcards() {
 }
 
 function checkRimrafWithGlobPattern() {
-  const rimraf = resolveFrom('rimraf', [defaultModulePaths.rimraf, defaultModulePaths.glob]);
+  const rimraf = resolveFrom(
+    'rimraf',
+    modulesDir ? null : [defaultModulePaths.rimraf, defaultModulePaths.glob],
+  );
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'aisoc-rimraf-glob-'));
   fs.writeFileSync(path.join(tmp, 'keep.json'), '{}');
   fs.writeFileSync(path.join(tmp, 'drop.txt'), 'x');
@@ -119,7 +118,8 @@ function checkRimrafWithGlobPattern() {
 }
 
 async function checkServeHandlerHeaders() {
-  const handler = resolveFrom('serve-handler', [defaultModulePaths.serveHandler]);
+  const paths = modulesDir ? null : [defaultModulePaths.serveHandler];
+  const handler = resolveFrom('serve-handler', paths);
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'aisoc-serve-'));
   fs.writeFileSync(path.join(tmp, 'index.html'), '<html></html>');
   const captured = {};
@@ -160,7 +160,9 @@ async function checkServeHandlerHeaders() {
 }
 
 function checkEslintReactNoDangerRule() {
-  const eslintPaths = [defaultModulePaths.eslintReact, defaultModulePaths.glob];
+  const eslintPaths = modulesDir
+    ? null
+    : [defaultModulePaths.eslintReact, defaultModulePaths.glob];
   const { RuleTester } = resolveFrom('eslint', eslintPaths);
   const rule = resolveFrom('eslint-plugin-react/lib/rules/no-danger', eslintPaths);
   const ruleTester = new RuleTester({
@@ -181,7 +183,9 @@ function checkEslintReactNoDangerRule() {
 }
 
 function checkEslintImportNoInternalModulesMakeRe() {
-  const importPaths = [defaultModulePaths.eslintImport, defaultModulePaths.glob];
+  const importPaths = modulesDir
+    ? null
+    : [defaultModulePaths.eslintImport, defaultModulePaths.glob];
   const minimatch = resolveFrom('minimatch', importPaths);
   assert(typeof minimatch.makeRe === 'function', 'minimatch.makeRe must be a function');
   const re = minimatch.makeRe('packages/**/internal/**');
