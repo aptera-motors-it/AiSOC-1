@@ -108,10 +108,8 @@ def test_eks_module_wires_public_access_cidrs_and_rejects_open_internet():
     variables_tf = (EKS_MODULE / "variables.tf").read_text()
     assert "public_access_cidrs" in main_tf
     assert "public_access_cidrs" in variables_tf
-    assert "0.0.0.0/0" in variables_tf
-    assert "tonumber(element(split" in variables_tf
-    assert ">= 16" in variables_tf
-    assert "precondition" in main_tf
+    assert any('c != "0.0.0.0/0"' in line and "tonumber(element(split" in line and ">= 16" in line for line in variables_tf.splitlines())
+    assert any("!var.endpoint_public_access || length(var.public_access_cidrs) > 0" in line for line in main_tf.splitlines())
     assert "endpoint_public_access" in variables_tf
-    assert 'default     = false' in variables_tf
+    assert "default     = false" in variables_tf
     assert "default     = []" in variables_tf
