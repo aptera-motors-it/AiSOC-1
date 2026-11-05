@@ -2101,9 +2101,6 @@ class PlaybookEngine:
         resume_run_id: str | None = None,
         resume_results: list[dict[str, Any]] | None = None,
     ) -> PlaybookRun:
-        # A caller's run id is kept. A resumed run stays one run in the
-        # realtime stream and the ledger, and an alert-triggered run keeps
-        # the id that a redelivery of the same alert looks up.
         pr = PlaybookRun(playbook, trigger_context, run_id=resume_run_id)
         if resume_results:
             pr.step_results = list(resume_results)

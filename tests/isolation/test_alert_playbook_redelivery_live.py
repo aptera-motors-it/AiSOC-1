@@ -296,8 +296,6 @@ async def _crash_and_redeliver(brokers: str, group: str, topic: str, partition: 
 async def test_a_redelivered_alert_does_not_start_its_playbook_again(live_service, receiver, tenant) -> None:  # noqa: ANN001
     delivery = await _deliver(tenant, "high")
 
-    # The first delivery has to have run the playbook to its approval, or
-    # the assertions after the redelivery hold for a run that never started.
     assert receiver.enriched == [_SOURCE_IP], receiver.calls
     assert receiver.calls.count("/api/v1/approvals") == 1, receiver.calls
     pauses = await _pauses(tenant)
