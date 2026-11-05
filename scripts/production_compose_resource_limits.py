@@ -1,16 +1,12 @@
 """Per-service memory and pid ceilings for the production compose overlay.
 
-The README deployment-profile table (`README.md`, same figures in
-`apps/docs/docs/architecture.md`) publishes **~8 GB** for CORE and **~12 GB**
-for `full`. Those totals are measured budgets, not per-container guesses. This
-module holds the per-service ceilings the overlay must declare so a runaway
-process cannot consume the whole VM: limits follow `docker-compose.yml`
-``mem_limit`` where the base file already measured one, Helm
-``resources.limits.memory`` for application services on a single host, and the
-architecture page's ollama note (~3 GiB while answering → 4 GiB cap).
+README profile budgets (~8 GB CORE, ~12 GB full) are measured totals. These
+ceilings follow base-compose ``mem_limit`` where present, Helm single-host
+``resources.limits.memory`` for app services, and the architecture page's
+ollama note (~3 GiB while answering → 4 GiB cap).
 
-``pids_limit`` is expressed as ``deploy.resources.limits.pids`` so Compose v2.29+
-does not reject the project for conflicting pid keys.
+Pid ceilings use ``deploy.resources.limits.pids`` because Compose v2.29+
+rejects top-level ``pids_limit`` alongside deploy memory limits.
 """
 
 from __future__ import annotations
@@ -23,7 +19,6 @@ class ProdBounds(NamedTuple):
     pids_limit: int
 
 
-# Keys are service names in docker-compose.yml / docker-compose.prod.yml.
 PRODUCTION_SERVICE_BOUNDS: dict[str, ProdBounds] = {
     "preflight-secrets": ProdBounds("256M", 256),
     "postgres": ProdBounds("1G", 1024),
@@ -62,7 +57,3 @@ PRODUCTION_SERVICE_BOUNDS: dict[str, ProdBounds] = {
     "ueba": ProdBounds("2G", 512),
     "grafana": ProdBounds("512M", 512),
 }
-
-
-def bounds_for(service: str) -> ProdBounds | None:
-    return PRODUCTION_SERVICE_BOUNDS.get(service)

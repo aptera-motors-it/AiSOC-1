@@ -614,14 +614,10 @@ def _service_bounds(service: dict) -> tuple[int | None, int | None]:
 
 
 class TestProductionOverlayBoundsMemoryAndPids:
-    """F70: the prod overlay must cap memory and pids per service.
+    """F70: every prod-overlay service must declare memory and pid ceilings.
 
-    The README profile table publishes ~8 GB for CORE and ~12 GB for full; without
-    per-container ceilings one OOM takes the VM. Limits are declared in
-    ``docker-compose.prod.yml`` and checked against
-    ``scripts/production_compose_resource_limits.py``, which derives them from
-    the base compose ``mem_limit`` values, Helm single-host limits, and the
-    measured ollama footprint documented beside that table.
+    Without per-container limits one OOM takes the host. Values must match
+    ``scripts/production_compose_resource_limits.py``.
     """
 
     def test_every_overlay_service_declares_bounds(self, prod: dict) -> None:
@@ -648,7 +644,6 @@ class TestProductionOverlayBoundsMemoryAndPids:
         )
 
     def test_docker_compose_config_shows_the_same_limits(self) -> None:
-        """When Docker is present, ``docker compose config`` is what the daemon applies."""
         if shutil.which("docker") is None:
             pytest.skip("docker not installed")
         env = os.environ.copy()
@@ -681,7 +676,7 @@ class TestProductionOverlayBoundsMemoryAndPids:
                 "debug-ui",
             )
         )
-        result = subprocess.run(  # noqa: S603
+        result = subprocess.run(  # noqa: S603 - fixed argv, no shell
             [
                 "docker",
                 "compose",
