@@ -54,6 +54,7 @@ import { platform } from "node:os";
 
 const ROOT = join(__dirname, "..");
 const COMPOSE_FILE = join(ROOT, "infra/compose/docker-compose.demo.yml");
+const ENV_FILE = join(ROOT, ".env");
 const STARTED_AT = Date.now();
 
 // Per-phase timing for the v1.0 ≤5-min acceptance gate. Each step()
@@ -251,6 +252,21 @@ function tryRun(cmd: string): string | null {
   } catch {
     return null;
   }
+}
+
+function composeArgs(args: string[]): string[] {
+  // The compose file lives in infra/compose, so that directory is the project
+  // directory and the repository-root .env is not loaded unless named.
+  return ["compose", "--env-file", ENV_FILE, "-f", COMPOSE_FILE, ...args];
+}
+
+function ensureGeneratedEnv(): boolean {
+  const code = runStream("python3", ["scripts/ensure_env.py"]);
+  if (code !== 0) {
+    console.error(c.red("could not generate .env; the demo compose requires those secrets."));
+    return false;
+  }
+  return true;
 }
 
 function runStream(cmd: string, args: string[], env: NodeJS.ProcessEnv = {}): number {
@@ -595,7 +611,7 @@ function pullImages(flags: Flags): boolean {
     return true;
   }
   step(2, 7, `Pulling prebuilt images from ghcr.io (tag: ${flags.tag})`);
-  const code = runStream("docker", ["compose", "-f", COMPOSE_FILE, "pull"], {
+  const code = runStream("docker", composeArgs(["pull"]), {
     AISOC_TAG: flags.tag,
   });
   if (code !== 0) {
@@ -630,7 +646,7 @@ async function startStack(flags: Flags): Promise<boolean> {
   // surfaced in the script's own output instead of buried in a docker
   // compose error wall. Module-level so the rest of the script can read
   // the resolved values without threading them through every signature.
-  const args = ["compose", "-f", COMPOSE_FILE, "up", "-d"];
+  const args = composeArgs(["up", "-d"]);
   if (flags.rebuild) args.push("--build");
 
   const maxAttempts = 3;
@@ -739,17 +755,14 @@ function seedData(flags: Flags): boolean {
   // no-op as long as INC-RT-001 etc. already exist; in --demo-quick mode
   // _purge_demo_quick wipes the four DEMO-* cases before reseeding so
   // re-running this command is a clean reset rather than a duplicate.
-  const seedArgs = [
-    "compose",
-    "-f",
-    COMPOSE_FILE,
+  const seedArgs = composeArgs([
     "exec",
     "-T",
     "api",
     "python",
     "-m",
     "app.scripts.seed_demo",
-  ];
+  ]);
   if (flags.demoQuick) {
     seedArgs.push("--demo-quick");
     if (flags.clock) {
@@ -902,8 +915,8 @@ ${c.bold(c.green("AiSOC demo is up."))}
 
 ${c.dim("Useful commands:")}
   pnpm aisoc:doctor                           ${c.dim("# health check")}
-  docker compose -f infra/compose/docker-compose.demo.yml logs -f api
-  docker compose -f infra/compose/docker-compose.demo.yml down -v   ${c.dim("# stop & wipe demo data")}
+  docker compose --env-file .env -f infra/compose/docker-compose.demo.yml logs -f api
+  docker compose --env-file .env -f infra/compose/docker-compose.demo.yml down -v   ${c.dim("# stop & wipe demo data")}
 
 ${c.bold("Total elapsed:")} ${c.green(elapsed())}
 `);
@@ -1234,6 +1247,7 @@ async function main() {
       )
   );
 
+  if (!ensureGeneratedEnv()) process.exit(1);
   if (!checkDocker()) process.exit(1);
   if (!pullImages(flags)) process.exit(1);
   if (!(await startStack(flags))) process.exit(1);

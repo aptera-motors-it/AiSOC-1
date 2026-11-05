@@ -2,8 +2,8 @@
 title: "AiSOC Technical Guide"
 subtitle: "Install, operate and integrate — on a workstation and on a server"
 author: "AiSOC project"
-version: "v1.2"
-date: "2026-10-31"
+version: "v1.3"
+date: "2026-11-05"
 license: "MIT (same as the AiSOC project)"
 abstract: |
   A complete operator's guide to AiSOC: installing it on a laptop and on a
@@ -57,7 +57,7 @@ connector / ingest API
         ├──────────► graph writer ──► Neo4j       (entity graph)
         │
         ▼
-    fusion  ──────── 2,530 executable detection rules, your tenant's tuning,
+    fusion  ──────── 2,966 executable detection rules, your tenant's tuning,
         │            correlation into alerts
         ▼
    Postgres ──────── the alert, the case, the audit chain
@@ -134,17 +134,20 @@ curl -s localhost:8000/api/v1/llm/runtime -H "Authorization: Bearer $TOKEN"
 docker compose exec ollama ollama ps     # SIZE and the GPU/CPU split
 ```
 
-Five answers, and **not loaded right now** is one of them: Ollama unloads after
-a few minutes idle, so an empty answer means nobody has asked it anything yet.
-That is not the same as CPU, and reporting CPU there would be a guess about the
-exact thing you are deciding on.
+**Not loaded right now** is one of the answers: Ollama unloads after a few
+minutes idle, so an empty answer means nobody has asked it anything yet. That
+is not the same as CPU, and reporting CPU there would be a guess about the
+exact thing you are deciding on. It is also not the same as having no model at
+all, which is why `no_model` is its own answer — a first run whose one-time
+download failed needs `docker compose run --rm ollama-pull`, not a triage.
 
 | `placement` | Means |
 |---|---|
 | `gpu` | the whole model is in VRAM |
 | `partial` | split; `detail` says what fraction, which explains the latency |
 | `cpu` | entirely on the CPU |
-| `unknown` | nothing loaded, so it cannot say |
+| `no_model` | Ollama holds no model at all — the one-time download never completed |
+| `unknown` | a model exists but none is loaded, so it cannot say where one would run |
 | `unreachable` | nothing answered — expected on a hosted-provider deployment |
 
 ---
@@ -242,7 +245,7 @@ you re-run it. Git, Docker Desktop, Node, pnpm and Python 3 are the
 prerequisites it installs; Python is on that list because three steps of the
 install are Python programs.
 
-It generates `.env`'s fifteen secrets with the same generator `make up` uses
+It generates `.env`'s twenty-one secrets with the same generator `make up` uses
 and resolves port conflicts the same way — both repaired in v20.2.0, when a
 fresh Windows install could not boot at all: the template it used to copy
 ships `ENVIRONMENT=production` with its secrets empty, which is exactly the
@@ -613,7 +616,7 @@ investigation.*
 
 ## 6. The REST API
 
-**518 operations across 417 paths.** The specification is
+**662 operations across 535 paths.** The specification is
 `docs/openapi.yaml` in the repository, regenerated on every change and gated
 against breaking changes in CI.
 

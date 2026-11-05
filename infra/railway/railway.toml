@@ -62,9 +62,11 @@ restartPolicyMaxRetries = 10
 #   - startCommand would re-run migrations + seed on *every* container
 #     restart, which is wasteful and racy under multiple replicas.
 #
-# Idempotency: services/api/app/scripts/seed_demo.py short-circuits when
-# the demo tenant already exists, so re-running on every deploy (which
-# is what Railway does) is cheap.
+# Idempotency: the demo user's password is written only when the row is
+# created. A later deploy does not put the published password back.
+# SECRET_KEY is not set in this file. A published default is replaced with
+# a per-process key so this deploy still starts. Set one in the service
+# variables before running more than one replica.
 preDeployCommand = "alembic upgrade head && python -m app.scripts.seed_demo"
 
 # Service-level env. The actual secrets (DATABASE_URL, REDIS_URL) are

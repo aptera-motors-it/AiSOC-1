@@ -88,12 +88,12 @@ docker compose logs -f threatintel
 | Realtime | `curl http://localhost:8086/health` |
 | Web Console | `curl -I http://localhost:3000` |
 | Postgres | `docker exec aisoc-postgres pg_isready -U aisoc` |
-| Redis | `docker exec aisoc-redis redis-cli -a redis_dev_secret ping` |
+| Redis | `docker exec aisoc-redis redis-cli -a "$(sed -n 's/^REDIS_PASSWORD=//p' .env)" ping` |
 | Kafka | `docker exec aisoc-kafka kafka-broker-api-versions --bootstrap-server localhost:9092` |
-| OpenSearch | `curl http://localhost:9200` |
+| OpenSearch | `curl -k -u "admin:$(sed -n 's/^OPENSEARCH_INITIAL_ADMIN_PASSWORD=//p' .env)" https://localhost:9200` |
 | Qdrant | `curl http://localhost:6333/healthz` |
 | ClickHouse | `curl http://localhost:8123/ping` |
-| Neo4j | open `http://localhost:7474` (login `neo4j` / `neo4j_dev_secret`) |
+| Neo4j | open `http://localhost:7474` (login `neo4j` / the `NEO4J_PASSWORD` from `.env`) |
 
 A first-time success of every endpoint is the gate before you proceed.
 
@@ -287,10 +287,10 @@ Topics created by the stack:
 docker exec -it aisoc-postgres psql -U aisoc
 
 # ClickHouse shell
-docker exec -it aisoc-clickhouse clickhouse-client -u aisoc --password clickhouse_dev_secret
+docker exec -it aisoc-clickhouse clickhouse-client -u aisoc --password "$(sed -n 's/^CLICKHOUSE_PASSWORD=//p' .env | tail -1)"
 
 # Neo4j cypher shell
-docker exec -it aisoc-neo4j cypher-shell -u neo4j -p neo4j_dev_secret
+docker exec -it aisoc-neo4j cypher-shell -u neo4j -p "$(sed -n 's/^NEO4J_PASSWORD=//p' .env | tail -1)"
 ```
 
 ### 6.5 Run database migrations

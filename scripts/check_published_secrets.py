@@ -123,6 +123,24 @@ NOT_A_CREDENTIAL = frozenset(
 MIN_HARVEST_LEN = 6
 ALWAYS_HARVEST = frozenset({"admin", "aisoc", "changeme", "password", "secret"})
 
+#: Compose defaults this repository used to substitute when a secret was unset.
+#: They are no longer written into the compose files — a stack with the
+#: variable unset now refuses to start — and they stay on the refused list
+#: because an existing ``.env`` and the git history still contain them.
+#: ``check-env`` compares values exactly, so ``admin`` is safe here; a workflow
+#: scan that searches for the substring is not, and does not use this map.
+RETIRED_PUBLISHED_DEFAULTS: dict[str, str] = {
+    "POSTGRES_PASSWORD": "aisoc_dev_secret",
+    "AISOC_APP_DB_PASSWORD": "aisoc_app_dev_secret",
+    "REDIS_PASSWORD": "redis_dev_secret",
+    "CLICKHOUSE_PASSWORD": "clickhouse_dev_secret",
+    "NEO4J_PASSWORD": "neo4j_dev_secret",
+    "SECRET_KEY": "dev_secret_key_change_in_production",
+    "LITELLM_MASTER_KEY": "sk-aisoc-local",
+    "GRAFANA_ADMIN_PASSWORD": "admin",
+    "AISOC_OSQUERY_TLS_ENROLL_SECRET": "change-me-in-production",
+}
+
 
 def _dotenv_pairs(text: str) -> Iterable[tuple[str, str]]:
     for raw in text.splitlines():
@@ -225,6 +243,16 @@ def published_literals(root: Path | None = None) -> dict[str, str]:
             harvested = _url_password(value) if URL_NAME_RE.search(name) else (value if SECRET_NAME_RE.search(name) else None)
             if harvested and _harvestable(harvested):
                 found.setdefault(harvested, f".env.example {name}")
+
+    # These left the compose files. They are still published in git history
+    # and in existing ``.env`` files, so a tree that has the compose sources
+    # keeps refusing them. An empty mount harvests nothing and must still
+    # refuse to report a clean environment; adding the constants
+    # unconditionally would make that mount look fine.
+    if found or any(path.exists() for path in compose_files(root)) or example.exists():
+        for name, value in RETIRED_PUBLISHED_DEFAULTS.items():
+            if _harvestable(value):
+                found.setdefault(value, f"retired compose default for {name}")
 
     for value in _insecure_secret_key_defaults(root):
         if _harvestable(value):

@@ -21,9 +21,9 @@ What is asserted
 ----------------
 Any workflow that runs `scripts/ensure_env.py` is in a world where every
 `GENERATED` value is random. Such a workflow must not also contain the
-literal that variable used to ship as. The literals are read from git
-history's `.env.example`? No — they are read from the compose defaults,
-which is where they still live, so this stays true as those move.
+literal that variable used to ship as. The literals are the compose defaults that remain, plus the retired
+defaults ``check_published_secrets`` still refuses after they leave the
+compose files.
 
 Unaffected workflows are not scanned: `upgrade-test.yml` provisions its own
 Postgres with its own password and never runs the generator, and a value it
@@ -57,16 +57,28 @@ def _load(name: str):
 ensure_env = _load("ensure_env")
 check_published_secrets = _load("check_published_secrets")
 
-#: `${VAR:-literal}` in `docker-compose.yml`, which is where the value a
-#: variable used to ship as still lives.
+#: `${VAR:-literal}` in `docker-compose.yml`, for any default that is still there.
 _DEFAULT_RE = re.compile(r"\$\{([A-Z0-9_]+):-([^}]+)\}")
 
 
 def _former_literals() -> dict[str, str]:
-    """`variable -> the compose default`, for the variables first run generates."""
+    """`variable -> a published value the generator replaces`.
+
+    Compose no longer supplies these. They stay on the list so a workflow
+    that runs the generator cannot fall back to the string it used to write
+    when `.env` has no line. Values shorter than the harvest minimum are
+    exact-matched by the production preflight and are not substring-scanned
+    here: ``admin`` appears in ordinary workflow text.
+    """
     text = (REPO / "docker-compose.yml").read_text(encoding="utf-8")
-    defaults = dict(_DEFAULT_RE.findall(text))
-    return {name: value for name, value in defaults.items() if name in ensure_env.GENERATED and value.strip()}
+    defaults = {name: value for name, value in _DEFAULT_RE.findall(text) if name in ensure_env.GENERATED and value.strip()}
+    retired = {
+        name: value
+        for name, value in check_published_secrets.RETIRED_PUBLISHED_DEFAULTS.items()
+        if name in ensure_env.GENERATED and len(value) >= check_published_secrets.MIN_HARVEST_LEN
+    }
+    retired.update(defaults)
+    return retired
 
 
 def _workflows_running_the_generator() -> list[pathlib.Path]:

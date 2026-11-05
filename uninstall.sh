@@ -154,7 +154,11 @@ stop_demo_stack() {
   if [ -z "$REPO_ROOT" ]; then return 0; fi
 
   info "Stopping AiSOC demo stack and removing its volumes..."
-  ( cd "$REPO_ROOT" && docker compose -f infra/compose/docker-compose.demo.yml down -v --remove-orphans ) \
+  env_file_args=()
+  if [ -f "$REPO_ROOT/.env" ]; then
+    env_file_args=(--env-file "$REPO_ROOT/.env")
+  fi
+  ( cd "$REPO_ROOT" && docker compose "${env_file_args[@]}" -f infra/compose/docker-compose.demo.yml down -v --remove-orphans ) \
     || warn "compose down exited non-zero; some resources may not have been cleaned up."
   ok "Demo stack stopped, named volumes deleted."
 }

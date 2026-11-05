@@ -569,3 +569,30 @@ class TestAPublishedValueCannotSatisfyAGuard:
         overlay = set(_services(PROD))
         missing = sorted(set(_services(DEV)) - overlay - {checker.PREFLIGHT_SERVICE})
         assert not missing, f"defined in docker-compose.yml and not restated here, so ungated: {missing}"
+
+
+# A secret-shaped interpolation with a non-empty default is the value a
+# deployment gets when that variable is unset. Compose then starts the
+# service on a string anyone can read in this file.
+_SECRET_DEFAULT = re.compile(r"\$\{([A-Z0-9_]*(?:PASSWORD|SECRET|TOKEN|_KEY)[A-Z0-9_]*):-([^}]*)\}")
+
+
+def test_the_base_compose_does_not_default_a_secret() -> None:
+    hits = [(name, default) for name, default in _SECRET_DEFAULT.findall(DEV.read_text(encoding="utf-8")) if default.strip()]
+    assert not hits, (
+        "docker-compose.yml starts these on a published default when the variable is unset:\n  "
+        + "\n  ".join(f"{name}={default}" for name, default in hits)
+        + "\n\nRequire the variable (`${NAME:?set NAME}`) and generate it in scripts/ensure_env.py."
+    )
+
+
+def test_kafka_ui_requires_a_login() -> None:
+    """The topic browser is on the full profile and bound to a host port.
+
+    With no auth env, any request to that port is served. The login has to be
+    in the service definition, which is what `docker compose config` interpolates.
+    """
+    env = dict(_env_items(_services(DEV)["kafka-ui"]))
+    assert env.get("AUTH_TYPE") == "LOGIN_FORM", f"kafka-ui AUTH_TYPE is {env.get('AUTH_TYPE')!r}; an unauthenticated UI is served"
+    password = env.get("SPRING_SECURITY_USER_PASSWORD", "")
+    assert ":?" in password, f"kafka-ui password is {password!r}; an unset variable must not start the UI"

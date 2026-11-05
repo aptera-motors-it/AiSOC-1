@@ -7,6 +7,7 @@ MIT License
 import ipaddress
 import logging
 import os
+import secrets
 import warnings
 from functools import lru_cache
 from typing import Any, Final
@@ -920,6 +921,57 @@ class Settings(BaseSettings):
         return v
 
     @model_validator(mode="after")
+    def _refuse_a_published_signing_key_on_a_deployed_demo(self) -> "Settings":
+        """Never let a key anyone can read sign a session (GHSA-m57m-6p4p-cq6p).
+
+        ``enforce_secure_defaults`` refuses an insecure default at boot, but
+        only when ``ENVIRONMENT=production``. ``infra/railway/railway.toml``
+        sets ``ENVIRONMENT = "demo"`` and never sets ``SECRET_KEY``, so the
+        documented one-click deploy came up on the internet signing tokens
+        with ``change-me-in-production-at-least-32-chars`` — a string in this
+        repository's front matter, good for a forged session as any tenant in
+        any role.
+
+        ``demo`` is the only member of ``DEV_ENVIRONMENTS`` that denotes a
+        *deployed* environment: ``development``, ``dev``, ``local`` and
+        ``test`` are on somebody's machine, where the placeholder is the
+        documented value and a per-process key would break every local flow
+        that signs something and reads it back. So the substitution is scoped
+        to ``demo`` alone, and the local environments are pinned untouched by
+        test.
+
+        Substitution rather than refusal, deliberately. Refusing is what
+        production does and is the obvious symmetry, but it would break the
+        one-click deploy for everyone following the documented path — and a
+        security default that breaks the documented path is one that gets
+        patched out downstream. Production keeps the louder answer, because a
+        production deployment that cannot keep a session across a restart is
+        a worse problem than one that will not start.
+
+        The cost is real and is said out loud rather than discovered: the key
+        lives for this process only, so sessions do not survive a restart,
+        and a demo running more than one replica needs a ``SECRET_KEY`` of
+        its own or the replicas will reject each other's tokens.
+        """
+        if _normalize_env(self.ENVIRONMENT) != "demo":
+            return self
+        if self.SECRET_KEY not in INSECURE_SECRET_KEY_DEFAULTS:
+            return self
+        # `object.__setattr__` is not needed — Settings is not frozen — but
+        # the assignment must not re-enter validation, which `model_config`
+        # already avoids by not setting `validate_assignment`.
+        self.SECRET_KEY = secrets.token_urlsafe(48)
+        # The module-level logger is created inside warn_if_insecure_defaults
+        # rather than at import, so this one is resolved by name here.
+        logging.getLogger("aisoc.config").error(
+            "insecure_default: SECRET_KEY was a published placeholder on a deployed demo. "
+            "A per-process key was generated so no token is signed with a value anyone can read. "
+            "Consequence: sessions end at the next restart, and a demo with more than one replica "
+            "must set SECRET_KEY itself or the replicas will reject each other's tokens."
+        )
+        return self
+
+    @model_validator(mode="after")
     def _reconcile_env_aliases(self) -> "Settings":
         """Keep ``ENV`` and ``ENVIRONMENT`` consistent.
 
@@ -1175,22 +1227,35 @@ class InsecureProductionDefaultsError(RuntimeError):
     """Raised at boot when insecure defaults remain in a production deploy."""
 
 
+def _refuses_insecure_defaults(env: str | None) -> bool:
+    """Environments that must not serve with a published secret still in place.
+
+    ``production`` was the original gate. ``demo`` is included for every
+    insecure default that is still present when this runs. A published
+    ``SECRET_KEY`` is not one of them: the model validator above replaces
+    it with a per-process key so the documented demo deploy still starts.
+    """
+    return (env or "").strip().lower() in {"production", "demo"}
+
+
 def enforce_secure_defaults(s: Settings | None = None) -> list[str]:
-    """Warn everywhere; **hard-fail the boot** in production (Phase 2).
+    """Warn everywhere; **hard-fail the boot** in production and demo.
 
-    ``warn_if_insecure_defaults`` only warns, which means a production deploy
-    can silently start with ``changeme``/placeholder secrets. This wrapper is
+    ``warn_if_insecure_defaults`` only warns, which means a deploy can
+    silently start with ``changeme``/placeholder secrets. This wrapper is
     the boot-time gate: it emits the same warnings and then, if
-    ``ENVIRONMENT=production`` and any insecure default remains, raises so the
-    container crash-loops loudly instead of serving with a known-bad secret.
+    ``ENVIRONMENT`` is ``production`` or ``demo`` and any insecure default
+    remains, raises so the container crash-loops loudly instead of serving
+    with a known-bad secret.
 
-    Returns the (empty, in a healthy prod) list of messages so callers/tests
+    Returns the (empty, in a healthy boot) list of messages so callers/tests
     can assert on it.
     """
     s = s or settings
     msgs = warn_if_insecure_defaults(s)
-    if is_production(s.ENVIRONMENT) and msgs:
-        raise InsecureProductionDefaultsError("Refusing to boot in production with insecure defaults:\n  - " + "\n  - ".join(msgs))
+    if _refuses_insecure_defaults(s.ENVIRONMENT) and msgs:
+        label = (s.ENVIRONMENT or "").strip().lower()
+        raise InsecureProductionDefaultsError(f"Refusing to boot in {label} with insecure defaults:\n  - " + "\n  - ".join(msgs))
     return msgs
 
 

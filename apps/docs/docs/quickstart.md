@@ -14,7 +14,7 @@ make smoke
 ```
 
 There is deliberately no `cp .env.example .env` step. `make up` creates
-`.env` itself and **generates the fifteen secrets in it** — copying the
+`.env` itself and **generates the twenty-one secrets in it** — copying the
 template by hand leaves those empty, and the API refuses to start in
 production on empty secrets.
 
@@ -89,10 +89,9 @@ cd AiSOC
 
 That is the whole of it — there is no file to copy and nothing to edit.
 `make up` runs `scripts/ensure_env.py`, which creates `.env` from the
-template and fills its **fifteen** generated secrets with real random
-values: the credential vault key, the session signing key, five
-service-to-service credentials, the realtime and metrics tokens, and four
-datastore passwords. `make env` does only that step, if you want to look
+template and fills its **twenty-one** generated secrets with real random
+values: the session and vault keys, the service tokens, and the datastore
+and admin passwords. `make env` does only that step, if you want to look
 before you start.
 
 The history here is the reason the step is gone rather than merely
@@ -447,7 +446,7 @@ The same services as Path A and B, driven through `aisoc <verb>` instead of
 ```bash
 git clone https://github.com/beenuar/AiSOC.git
 cd AiSOC
-make env      # creates .env and generates its fifteen secrets
+make env      # creates .env and generates its twenty-one secrets
 
 python -m venv .venv && source .venv/bin/activate
 pip install -e packages/aisoc-cli

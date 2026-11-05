@@ -8,6 +8,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -67,11 +68,26 @@ export async function runUp(flags: UpFlags, log: (s: string) => void = console.l
 
   const dir = await mkdtemp(join(tmpdir(), "aisoc-up-"));
   const file = join(dir, "docker-compose.demo.yml");
+  const envFile = join(dir, ".env");
   await writeFile(file, composeText, "utf8");
+  // The bundle refuses to start on a missing password. This directory is the
+  // compose project directory, so the file written here is what it loads.
+  const secret = () => randomBytes(24).toString("hex");
+  await writeFile(
+    envFile,
+    [
+      `POSTGRES_PASSWORD=${secret()}`,
+      `AISOC_APP_DB_PASSWORD=${secret()}`,
+      `REDIS_PASSWORD=${secret()}`,
+      `SECRET_KEY=${secret()}`,
+      "",
+    ].join("\n"),
+    "utf8"
+  );
   log(pc.dim(`Compose bundle written to ${file}`));
   log(pc.bold("Booting the AiSOC demo stack (this can take a few minutes on first pull)…"));
 
-  const code = await run("docker", ["compose", "-f", file, "up", "-d"], dir);
+  const code = await run("docker", ["compose", "--env-file", envFile, "-f", file, "up", "-d"], dir);
   if (code !== 0) {
     log(pc.red("docker compose up failed. See the output above."));
     return code;
@@ -80,7 +96,7 @@ export async function runUp(flags: UpFlags, log: (s: string) => void = console.l
   log("");
   log(pc.green("✓ AiSOC demo stack is starting."));
   log("  Console:     " + pc.cyan("http://localhost:3000/cases/INC-RT-001?tab=ledger"));
-  log("  Stop it:     " + pc.dim(`docker compose -f ${file} down -v`));
+  log("  Stop it:     " + pc.dim(`docker compose --env-file ${envFile} -f ${file} down -v`));
   log("");
   return 0;
 }

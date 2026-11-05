@@ -740,10 +740,10 @@ ensure_repo() {
 # ─── Step 6: .env bootstrap ──────────────────────────────────────────────────
 
 ensure_env_file() {
-  # infra/compose/docker-compose.demo.yml hardcodes its own dev passwords (see SECURITY NOTE
-  # in that file), so .env isn't actually load-bearing for the demo. But
-  # several apps and scripts do read .env, so we make sure it exists with
-  # the example defaults to avoid spurious "key not found" warnings.
+  # infra/compose/docker-compose.demo.yml refuses to start without the
+  # passwords this writes, and it does not load the repository-root .env
+  # unless the caller passes --env-file. Several apps and scripts read
+  # .env as well.
   #
   # A plain `cp` is what this used to do, and a plain `cp` is what broke the
   # vault: `.env.example` shipped a non-empty placeholder for

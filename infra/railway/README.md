@@ -69,7 +69,14 @@ add:
 DATABASE_URL=${{ Postgres.DATABASE_URL }}
 REDIS_URL=${{ Redis.REDIS_URL }}
 JWT_SECRET=<generate a random 32-char string>
+SECRET_KEY=<generate a random 32-char string>
 ```
+
+`ENVIRONMENT` is `demo`. A published `SECRET_KEY` is replaced with a
+per-process key at boot, so the documented deploy still starts; sessions
+then end at every restart, and more than one replica needs a key you
+generate. Do not commit one into `railway.toml`. The database URL has to
+require TLS as well; a cleartext URL is refused.
 
 Railway auto-redeploys when variables change. The api will run Alembic
 migrations on the next boot and become healthy.
@@ -143,8 +150,9 @@ The api service runs `alembic upgrade head && python -m
 app.scripts.seed_demo` on every deploy via Railway's `releaseCommand`,
 so the canonical 15 incidents (including the in-flight LockBit 3.0
 ransomware investigation `INC-RT-001`) are present before the new
-instance accepts traffic. The seeder is idempotent — re-running against
-an already-seeded database is a cheap no-op.
+instance accepts traffic. The seeder is idempotent. The demo password is
+written only when the user row is created; a later deploy does not put
+`aisoc-demo` back onto an account whose password was changed.
 
 If you ever need to re-seed manually, open the api service's shell in
 Railway and run:
@@ -185,6 +193,32 @@ startCommand = "python -m app.scripts.seed_demo"
 ```
 
 Or skip it for personal evaluation deploys.
+
+## Session signing key
+
+`railway.toml` sets `ENVIRONMENT = "demo"` and does not set `SECRET_KEY`,
+because a value written here would be one every reader of this repository
+could use to forge a session on your deployment. That is what used to happen:
+the published default was accepted on a `demo` boot, so any Railway deploy
+following this guide signed its tokens with a string anyone can read
+(GHSA-m57m-6p4p-cq6p).
+
+The API now generates a signing key per process when the environment is
+`demo` and no real `SECRET_KEY` is configured, and says so at boot. Two
+consequences worth knowing:
+
+- **Sessions end at every restart or redeploy.** Sign in again; nothing else
+  is affected, and the demo reseeds on deploy anyway.
+- **More than one replica needs a real key.** Each replica would generate its
+  own, so a token minted by one is rejected by the next. Set `SECRET_KEY` in
+  the Railway dashboard (any 32+ random characters, e.g.
+  `python -c "import secrets; print(secrets.token_urlsafe(48))"`) before
+  scaling the api service past one instance.
+
+Set `SECRET_KEY` for any deployment you intend to keep, and set
+`ENVIRONMENT=production` once it stops being a demo — production refuses to
+boot on a placeholder rather than generating one, which is the right answer
+when sessions have to survive a restart.
 
 ## Troubleshooting
 

@@ -112,7 +112,6 @@ DELIBERATE_DEFAULTS: dict[str, str] = {
     "OPENSEARCH_URL": "a URL",
     "QDRANT_URL": "a URL",
     "OPENAI_MODEL": "a logical task alias the gateway defines",
-    "LITELLM_MASTER_KEY": "the local gateway's own key; the gateway is in-network only",
     "LLM_GATEWAY_URL": "the compose hostname of the gateway",
     "AISOC_LITELLM_REQUEST_TIMEOUT": (
         "a duration in seconds, and the value the gateway actually runs with. It "
@@ -250,7 +249,10 @@ _COUNTED_IN_PROSE = (
     ("apps/docs/docs/deployment/docker.md", "generates the {word} secrets the stack needs"),
 )
 
-_NUMBER_WORDS = ("zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen").split()
+_NUMBER_WORDS = (
+    "zero one two three four five six seven eight nine ten eleven twelve "
+    "thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty twenty-one"
+).split()
 
 
 def test_the_published_count_is_the_real_count() -> None:
@@ -312,3 +314,39 @@ def test_ensure_env_replaces_a_placeholder_it_finds(tmp_path: Path) -> None:
 def test_the_checker_refuses_a_file_that_is_not_there(tmp_path: Path) -> None:
     """A gate that reports OK over a tree it never opened is worse than none."""
     assert check_env_placeholders.main([str(tmp_path / "nope.env")]) == 1
+
+
+#: What `make env` must not leave in `.env`. Each is a value this repository
+#: publishes, so a stack that starts with it can be entered by anyone who
+#: has read the tree.
+_PUBLISHED_CREDENTIALS = {
+    "LITELLM_MASTER_KEY": "sk-aisoc-local",
+    "NEO4J_PASSWORD": "neo4j_dev_secret",
+    "GRAFANA_ADMIN_PASSWORD": "admin",
+    "KAFKA_UI_PASSWORD": "",
+    "OPENSEARCH_INITIAL_ADMIN_PASSWORD": "",
+    "AISOC_OSQUERY_TLS_ENROLL_SECRET": "change-me-in-production",
+}
+
+
+def test_make_env_does_not_leave_a_published_credential(tmp_path: Path) -> None:
+    """The generator, on a clean copy of the template, not a reading of it.
+
+    `docker compose config` prints whatever this writes. A key that stays at
+    the published literal, or is missing so compose substitutes one, is the
+    credential the reproduction logs in with.
+    """
+    env = tmp_path / ".env"
+    assert ensure_env.main(["--env", str(env), "--example", str(ENV_EXAMPLE)]) == 0
+    values = {name: value.strip() for _lineno, name, value in check_env_placeholders.parse_env(env.read_text(encoding="utf-8"))}
+    missing = []
+    published = []
+    for key, banned in _PUBLISHED_CREDENTIALS.items():
+        value = values.get(key, "")
+        if not value:
+            missing.append(key)
+            continue
+        if banned and value == banned:
+            published.append(f"{key}={value}")
+    assert not missing, f"ensure_env left these unset, so compose falls back to a published default: {missing}"
+    assert not published, f"ensure_env kept a value published in this repository: {published}"
