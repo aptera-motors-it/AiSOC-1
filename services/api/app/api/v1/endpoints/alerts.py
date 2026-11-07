@@ -36,7 +36,7 @@ from app.services.alert_rail import (
     RelatedEntity,
     build_rail_envelope,
 )
-from app.services.alert_status import is_unresolved
+from app.services.alert_status import AlertStatus, is_resolved, is_unresolved, unresolved_filter
 from app.services.audit import emit_audit
 from app.services.event_sanitiser import (
     SubmitPayloadTooLarge,
@@ -261,7 +261,7 @@ class AlertUpdateRequest(BaseModel):
     #: nothing in the response body distinguishes the two.
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
-    status: str | None = None
+    status: AlertStatus | None = None
     priority: int | None = None
     tags: list[str] | None = None
     # The queue UI releases alerts with {"assignee": null}; accept both the
@@ -944,9 +944,7 @@ async def get_alert_stats(
 
     # Critical open
     crit_result = await db.execute(
-        select(func.count())
-        .select_from(Alert)
-        .where(and_(tenant_filter, Alert.severity == "critical", Alert.status.in_(["new", "triaging", "in_progress"])))
+        select(func.count()).select_from(Alert).where(and_(tenant_filter, Alert.severity == "critical", unresolved_filter(Alert.status)))
     )
     critical_open = crit_result.scalar_one()
 
@@ -1114,8 +1112,11 @@ async def update_alert(
     updates: dict = {}
     if request.status is not None:
         updates["status"] = request.status
-        if request.status in ("resolved", "false_positive", "closed"):
-            updates["resolved_at"] = datetime.now(UTC)
+        # `is_resolved` rather than a fourth copy of the terminal set: the
+        # copy that was here omitted `fp` and `dismissed`, so an alert moved
+        # to either kept a null `resolved_at` and every duration measured
+        # from it silently excluded the row.
+        updates["resolved_at"] = datetime.now(UTC) if is_resolved(request.status) else None
     if request.priority is not None:
         updates["priority"] = request.priority
     if request.tags is not None:
