@@ -17,10 +17,11 @@ Dedup and nag state live in a JSON file so restarts never double-send.
 
 Two deliberate semantics, stated so nobody infers better ones:
 
-* **"Acknowledged" means `acknowledged_at` was written** — today the console's
-  acknowledge action and a war-room join write it (`war_room.py` stamps it
-  with COALESCE). A case merely being edited, assigned or moved along the
-  status ladder does NOT stop the clock; that is the point of an ack clock.
+* **"Acknowledged" means `acknowledged_at` was written** — today only the
+  war-room **acknowledge** decision writes it
+  (`services/api/app/services/war_room.py` stamps it with COALESCE). A case
+  merely being edited, assigned or moved along the status ladder does NOT stop
+  the clock; that is the point of an ack clock.
 * **The sweep is deployment-wide, not per-tenant.** Every tenant's
   unacknowledged cases escalate to the one operator-configured webhook,
   because this bridge is a deployment-level pager, not a tenant notification
