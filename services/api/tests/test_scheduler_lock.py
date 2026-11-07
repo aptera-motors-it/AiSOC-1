@@ -69,7 +69,7 @@ async def test_scheduler_lock_not_acquired_skips_job(monkeypatch: pytest.MonkeyP
 
 
 @pytest.mark.asyncio
-async def test_scheduler_lock_backend_unavailable_fails_open(
+async def test_scheduler_lock_backend_unavailable_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -86,6 +86,6 @@ async def test_scheduler_lock_backend_unavailable_fails_open(
             if should_run:
                 ran = True
 
-    assert ran is True
+    assert ran is False
     assert "scheduler_lock.backend_unavailable" in caplog.text
     assert "phase=acquire" in caplog.text
