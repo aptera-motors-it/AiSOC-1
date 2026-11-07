@@ -34,6 +34,7 @@ __all__ = [
     "WORKING_STATUSES",
     "is_open",
     "is_terminal",
+    "status_transition_ok",
 ]
 
 NEW: Final[str] = "new"
@@ -68,6 +69,10 @@ WORKING_STATUSES: Final[tuple[str, ...]] = (TRIAGED, INVESTIGATING, CONTAINED)
 #: state that writes `closed_at`, which every duration metric reads.
 CLOSED_STATUSES: Final[tuple[str, ...]] = (CLOSED,)
 TERMINAL_STATUSES: Final[tuple[str, ...]] = CLOSED_STATUSES
+
+
+def status_transition_ok(current: str, target: str) -> bool:
+    return target in TRANSITIONS.get(current, set())
 
 
 def is_open(status: str | None) -> bool:

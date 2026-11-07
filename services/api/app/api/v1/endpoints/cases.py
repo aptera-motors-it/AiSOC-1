@@ -55,7 +55,7 @@ from app.models.investigation import (
     InvestigationEvent,
     InvestigationRun,
 )
-from app.services import case_orchestration, case_status, evidence_custody
+from app.services import alert_status, case_orchestration, case_status, evidence_custody
 from app.services.audit import emit_audit
 from app.services.branding.resolver import resolve_branding
 from app.services.case_fanout import (
@@ -168,7 +168,7 @@ def _status_transition_ok(current: str, target: str) -> bool:
     """Upstream's canonical gate: every move must be a declared edge in
     `case_status.TRANSITIONS`. Backwards moves and undeclared skips are
     rejected; reopening goes through the explicit reopen action."""
-    return target in _TRANSITIONS.get(current, set())
+    return case_status.status_transition_ok(current, target)
 
 
 #: The canonical ladder, in order, for the forward-walk used by the
@@ -180,7 +180,14 @@ _LADDER = list(case_status.ALL_STATUSES)
 # alert to 'investigating'. Terminal states (resolved/false_positive/closed)
 # and an already-running alert are deliberately excluded: a re-run must never
 # drag history backwards.
-_ALERT_OPEN_STATUSES: tuple[str, ...] = ("new", "triaged", "triaging")
+#
+# Read from `alert_status` rather than retyped. This was the *second*
+# hand-written copy of the alert vocabulary and the one that happened to be
+# right about `triaged` while the canonical tuple was wrong, so the dashboard
+# and the case workbench disagreed about whether an auto-triaged alert was
+# still open. Two declarations of one vocabulary is the defect; which of them
+# is correct is luck.
+_ALERT_OPEN_STATUSES: tuple[str, ...] = alert_status.PRE_INVESTIGATION_STATUSES
 
 
 def _forward_to_investigating_ok(current: str) -> bool:
