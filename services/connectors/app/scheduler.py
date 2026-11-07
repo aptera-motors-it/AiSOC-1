@@ -49,6 +49,7 @@ Design rationale
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -72,7 +73,7 @@ from app.db.connector_repo import (
 )
 from app.db.engine import get_engine
 from app.ingest_client import IngestClient, IngestClientError
-from app.leader_lease import LeaderLease, election_enabled
+from app.leader_lease import LeaderLease, election_enabled, unique_holder_identity
 from app.pipeline import (
     apply_filter_rules,
     compute_fingerprint,
@@ -110,6 +111,12 @@ _DEFAULT_POLL_INTERVAL_S = 300
 # either the source API (too short) or render polling pointless (too long).
 _MIN_POLL_INTERVAL_S = 30
 _MAX_POLL_INTERVAL_S = 86400  # 24 hours
+
+# The chart's terminationGracePeriodSeconds is 60. A fetch that never
+# returns must not hold shutdown for the whole of that. The lease is left
+# to expire; releasing it here would let the other replica fetch while
+# this one is still inside fetch_alerts.
+_STOP_IN_FLIGHT_WAIT_S = 20.0
 
 # Workstream 5: backfill-on-outage tunables.
 #
@@ -177,10 +184,28 @@ class ConnectorScheduler:
         # None when leader election is off, which is the default and
         # means this replica always schedules.
         self._lease: LeaderLease | None = None
+        # release() matches this string. Two schedulers in one process share
+        # a hostname, and one stop must not expire the other's row.
+        self._holder = unique_holder_identity()
+        self._stopping = False
+        self._poll_claims: dict[str, datetime] = {}
+        self._connector_leases: dict[str, LeaderLease] = {}
+        self._fetches_in_flight: set[str] = set()
+        self._fetches_idle = asyncio.Event()
+        self._fetches_idle.set()
+        self._stop_releases = 0
         # Cache of {connector_id_str: last_seen_config_signature} so reloads
         # can detect when an instance's poll interval / config changed and
         # need its job rescheduled, vs leaving an unchanged job alone.
         self._known_signatures: dict[str, str] = {}
+        # Last patch-window promotion sweep's outcome, so a failing sweep is
+        # visible somewhere an operator looks rather than only in a log line.
+        # The upsert in that sweep raised on every tenant on every deployment
+        # for its whole life and the only symptom was `logger.exception` —
+        # nothing on /readyz, no counter, no metric. ``None`` means the sweep
+        # has not run yet, which is not the same as having run cleanly.
+        self._promotion_failures: dict[str, str] = {}
+        self._promotion_last_error: str | None = None
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -208,13 +233,6 @@ class ConnectorScheduler:
                 logger.error("connector.scheduler.vault_unavailable: %s", exc)
                 raise
 
-        # Parity 6.8. Without an election, two replicas each add one job
-        # per connector instance and every vendor is polled twice on every
-        # cycle — which on a rate-limited API is worse than duplication,
-        # because the second replica's poll is what gets throttled and a
-        # throttled connector looks identical to one whose credentials
-        # expired. Off by default: a single-replica deployment gains
-        # nothing from an election and gains a new way to fail to start.
         if election_enabled():
             self._lease = LeaderLease(self._engine)
             if not await self._lease.acquire():
@@ -305,6 +323,52 @@ class ConnectorScheduler:
         """
         return self._lease is None or self._lease.held
 
+    async def _claim_connector_poll(self, connector_id: uuid.UUID, window_seconds: float, *, backfill: bool) -> bool:
+        """Whether this replica may fetch the connector during this window.
+
+        Taken even when leader election is off: election chooses who
+        schedules; the lease chooses who fetches. A backfill from the
+        replica that already holds the window may fetch again. A stop
+        that lands during the claim does not fetch; the caller releases
+        the row.
+        """
+        if self._stopping:
+            logger.info(
+                "connector.scheduler.poll_skipped id=%s reason=scheduler_stopping",
+                connector_id,
+            )
+            return False
+        key = str(connector_id)
+        now = datetime.now(UTC)
+        held_until = self._poll_claims.get(key)
+        if backfill and held_until is not None and held_until > now:
+            return True
+        try:
+            lease = LeaderLease(
+                self._engine,
+                scope=f"connector-poll:{key}",
+                holder=self._holder,
+                lease=window_seconds,
+            )
+            if not await lease.acquire() and not await lease.renew():
+                logger.info(
+                    "connector.scheduler.poll_skipped id=%s reason=connector_lease_held",
+                    connector_id,
+                )
+                return False
+        except Exception:
+            logger.exception("connector.scheduler.lease_failed id=%s", connector_id)
+            return False
+        self._connector_leases[key] = lease
+        self._poll_claims[key] = now + timedelta(seconds=window_seconds)
+        if self._stopping:
+            logger.info(
+                "connector.scheduler.poll_skipped id=%s reason=stopped_during_claim",
+                connector_id,
+            )
+            return False
+        return True
+
     async def _maintain_lease(self) -> None:
         """Renew the lease, or try to take one.
 
@@ -328,17 +392,62 @@ class ConnectorScheduler:
 
     async def stop(self) -> None:
         """Stop the scheduler and release resources."""
+        self._stopping = True
         if self._scheduler is not None:
-            # ``wait=False`` so we don't block shutdown waiting for an
-            # in-flight poll to finish; the next start picks up where we
-            # left off (record_poll_success has already been written for
-            # successful polls before this point).
             self._scheduler.shutdown(wait=False)
             self._scheduler = None
+        await self._release_connector_leases()
+        await self._wait_for_inflight_release()
         if self._ingest_client is not None:
             await self._ingest_client.aclose()
         self._known_signatures.clear()
         logger.info("connector.scheduler.stopped")
+
+    async def _release_connector_leases(self) -> None:
+        releasable = [key for key in self._connector_leases if key not in self._fetches_in_flight]
+        leases: list[LeaderLease] = []
+        for key in releasable:
+            lease = self._connector_leases.pop(key, None)
+            self._poll_claims.pop(key, None)
+            if lease is not None:
+                leases.append(lease)
+        for lease in leases:
+            await lease.release()
+
+    async def _wait_for_inflight_release(self) -> None:
+        """Wait until in-flight fetches have released, but not past shutdown.
+
+        The lifespan disposes the engine when stop() returns. A fetch that
+        is still inside fetch_alerts releases after it returns, and that
+        write has to finish first. One that never returns must not hold
+        the process until the grace period kills it. Leaving that lease
+        to expire avoids a second fetch while the first is still running.
+        """
+        try:
+            await asyncio.wait_for(self._fetches_idle.wait(), _STOP_IN_FLIGHT_WAIT_S)
+        except TimeoutError:
+            logger.warning(
+                "connector.scheduler.stop_fetch_timeout wait_seconds=%s in_flight=%s",
+                _STOP_IN_FLIGHT_WAIT_S,
+                sorted(self._fetches_in_flight),
+            )
+
+    async def _finish_inflight(self, key: str) -> None:
+        """Drop one fetch from the in-flight set and, during stop, release.
+
+        The idle event wakes stop() only after every release this stop
+        started has finished. Setting it as soon as the set is empty lets
+        one task wake the waiter while another task is still inside release().
+        """
+        self._fetches_in_flight.discard(key)
+        if self._stopping:
+            self._stop_releases += 1
+            try:
+                await self._release_connector_leases()
+            finally:
+                self._stop_releases -= 1
+        if not self._fetches_in_flight and self._stop_releases == 0:
+            self._fetches_idle.set()
 
     # ------------------------------------------------------------------ reload
 
@@ -623,20 +732,41 @@ class ConnectorScheduler:
             )
         else:
             since_seconds = _coerce_poll_interval(target.connector_config)
-        try:
-            raw_events = await connector.fetch_alerts(since_seconds=since_seconds)
-        except Exception:
-            logger.exception(
-                "connector.scheduler.fetch_failed id=%s type=%s",
+        # Count this poll before the claim. stop() waits on the idle event,
+        # and a claim blocked on the lease row has to keep that event clear
+        # or shutdown returns and this replica still fetches.
+        inflight_key = str(connector_id)
+        if inflight_key in self._fetches_in_flight:
+            logger.info(
+                "connector.scheduler.poll_skipped id=%s reason=fetch_already_in_flight",
                 connector_id,
-                target.connector_type,
             )
-            # A fetch that raised part-way may already have staged handles for
-            # the batches it did read. None of it reached ingest, so none of
-            # it may be acknowledged.
-            self._discard_acknowledgements(connector, connector_id, reason="fetch_failed", staged=0)
-            await self._record_failure(target.id)
             return
+        self._fetches_in_flight.add(inflight_key)
+        self._fetches_idle.clear()
+        try:
+            if not await self._claim_connector_poll(
+                connector_id,
+                float(_coerce_poll_interval(target.connector_config)),
+                backfill=backfill_seconds is not None,
+            ):
+                return
+            try:
+                raw_events = await connector.fetch_alerts(since_seconds=since_seconds)
+            except Exception:
+                logger.exception(
+                    "connector.scheduler.fetch_failed id=%s type=%s",
+                    connector_id,
+                    target.connector_type,
+                )
+                # A fetch that raised part-way may already have staged handles for
+                # the batches it did read. None of it reached ingest, so none of
+                # it may be acknowledged.
+                self._discard_acknowledgements(connector, connector_id, reason="fetch_failed", staged=0)
+                await self._record_failure(target.id)
+                return
+        finally:
+            await self._finish_inflight(inflight_key)
 
         # A scanner's findings are asset state, not events. The alert path
         # above carries neither the asset nor the CVE a vulnerability row
@@ -1278,18 +1408,33 @@ class ConnectorScheduler:
         try:
             async with self._engine.connect() as conn:
                 tenants = (await conn.execute(text("SELECT DISTINCT tenant_id FROM connectors WHERE is_enabled"))).scalars().all()
-        except Exception:  # pragma: no cover
+        except Exception as exc:
+            # Recorded under its own key rather than against a tenant, because
+            # this handler returns *before* the per-tenant loop: a sweep that
+            # cannot even list tenants would otherwise leave the failure map
+            # empty and read as a clean sweep.
+            self._promotion_failures["<tenant enumeration>"] = f"{type(exc).__name__}: {exc}"[:300]
+            self._promotion_last_error = f"{type(exc).__name__}: {exc}"[:300]
             logger.exception("connector.scheduler.promotion_tenant_enum_failed")
             return
+        else:
+            self._promotion_failures.pop("<tenant enumeration>", None)
 
         for tenant_id in tenants:
             try:
                 async with self._engine.begin() as conn:
-                    # The connector role reads with current_tenant_id() NULL;
-                    # bind it per statement so the RLS policies on
-                    # asset_vulnerabilities / alerts apply to this tenant.
+                    # Bind the tenant so the RLS policies on
+                    # asset_vulnerabilities / alerts apply to this sweep.
+                    #
+                    # The setting is `app.current_tenant_id`, which is what
+                    # `current_tenant_id()` reads. This said `aisoc.tenant_id`,
+                    # a name no policy consults, so the bind did nothing and
+                    # every statement here passed on the policies' permissive
+                    # `OR current_tenant_id() IS NULL` arm instead — a comment
+                    # asserting a property the code did not have, over a sweep
+                    # that writes to `alerts`.
                     await conn.execute(
-                        text("SELECT set_config('aisoc.tenant_id', :tid, true)"),
+                        text("SELECT set_config('app.current_tenant_id', :tid, true)"),
                         {"tid": str(tenant_id)},
                     )
                     overdue = (await conn.execute(text(MARK_OVERDUE_SQL), {"tenant_id": tenant_id})).rowcount
@@ -1350,9 +1495,45 @@ class ConnectorScheduler:
                         promoted,
                         resolved,
                     )
-            except Exception:
-                # One tenant's failure must not stop the others' sweep.
+            except Exception as exc:
+                # One tenant's failure must not stop the others' sweep — but
+                # it must not vanish into the log either. This sweep is the
+                # only path from `asset_vulnerabilities` back into the alert
+                # queue, it runs every six hours, and when its upsert raised
+                # on every tenant the sole observable was this line. Record it
+                # so `/readyz` reports a degraded sweep with the reason.
+                self._promotion_failures[str(tenant_id)] = f"{type(exc).__name__}: {exc}"[:300]
+                self._promotion_last_error = f"{type(exc).__name__}: {exc}"[:300]
                 logger.exception("connector.scheduler.vuln_promotion_failed tenant=%s", tenant_id)
+            else:
+                self._promotion_failures.pop(str(tenant_id), None)
+
+        if not self._promotion_failures:
+            self._promotion_last_error = None
+
+    def promotion_sweep_healthy(self) -> bool:
+        """Whether the last patch-window sweep got through every tenant.
+
+        Registered on ``/readyz`` as a **non-required** dependency, so a
+        failing six-hourly background sweep reports ``ready_degraded`` with
+        the reason instead of pulling the connector API's front door out of
+        the load balancer. The same reasoning ingest applies to its opt-in
+        WebSocket: failing readiness over an auxiliary job drops the traffic
+        that still works in order to flag the job that does not.
+
+        True before the first sweep. That is the one dishonest-looking answer
+        here and it is deliberate: the alternative is a brand-new deployment
+        reporting degraded for up to six hours for no reason. "Has not run
+        yet" is reported as the empty failure map rather than as a verdict.
+        """
+        return not self._promotion_failures
+
+    def promotion_sweep_detail(self) -> dict[str, Any]:
+        """The sweep's last outcome, for an operator reading the body."""
+        return {
+            "tenants_failing": sorted(self._promotion_failures),
+            "last_error": self._promotion_last_error,
+        }
 
     async def _record_failure(self, connector_id: uuid.UUID) -> None:
         if self._engine is None:  # pragma: no cover
