@@ -80,4 +80,7 @@ EXPOSE 8004
 # wrapper stays in the process tree: `sh -c` with a single command execs it,
 # and `_migrate` hands over with `os.execvp`, so uvicorn ends up as PID 1 and
 # receives SIGTERM directly rather than through a parent that would swallow it.
+RUN chown -R nobody:nogroup /app
+USER nobody
+
 CMD ["sh", "-c", "python -m app._migrate -- uvicorn app.main:app --host 0.0.0.0 --port 8004"]

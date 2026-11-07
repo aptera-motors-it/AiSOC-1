@@ -19,4 +19,7 @@ COPY --from=builder /enrichment-service .
 
 EXPOSE 8082
 
+RUN addgroup -S aisoc && adduser -S aisoc -G aisoc && chown -R aisoc:aisoc /app
+USER aisoc
+
 CMD ["./enrichment-service"]

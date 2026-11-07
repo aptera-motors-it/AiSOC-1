@@ -34,6 +34,7 @@ RUN pip install --no-cache-dir --require-hashes -r /requirements.txt
 COPY pyproject.toml poetry.lock ./
 COPY app/ ./app/
 
+RUN chown -R nobody:nogroup /app
 USER nobody
 
 # `python -m app` runs app/__main__.py, which the module-reachability gate

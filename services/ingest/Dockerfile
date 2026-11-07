@@ -16,4 +16,7 @@ COPY --from=builder /ingest-service .
 
 EXPOSE 8080
 
+RUN addgroup -S aisoc && adduser -S aisoc -G aisoc && chown -R aisoc:aisoc /app
+USER aisoc
+
 CMD ["./ingest-service"]

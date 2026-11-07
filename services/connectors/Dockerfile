@@ -62,4 +62,7 @@ COPY app/ ./app/
 EXPOSE 8087
 
 # Dual-stack entrypoint (IPv6 + IPv4-mapped). See app/scripts/serve.py.
+RUN chown -R nobody:nogroup /app
+USER nobody
+
 CMD ["python", "-m", "app.scripts.serve"]

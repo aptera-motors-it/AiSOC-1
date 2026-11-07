@@ -36,5 +36,8 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 COPY --from=builder /app/dist ./dist
+RUN addgroup -g 10001 -S aisoc && adduser -u 10001 -S aisoc -G aisoc && chown -R aisoc:aisoc /app
+USER aisoc
+
 EXPOSE 8086
 CMD ["node", "dist/index.js"]
