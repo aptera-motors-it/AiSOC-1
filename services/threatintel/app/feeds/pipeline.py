@@ -67,16 +67,17 @@ class ThreatIntelPipeline:
             return {"total": 0, "new": 0, "duplicate": 0}
 
         # --- Dedup via Bloom filter ---
-        new_iocs: list[dict[str, Any]] = []
+        unseen: dict[str, dict[str, Any]] = {}
         duplicates = 0
 
         for ioc in iocs:
             bloom_key = f"{ioc.get('type', '?')}:{ioc.get('value', '?')}"
-            if await self._bloom.contains(bloom_key):
+            if bloom_key in unseen or await self._bloom.contains(bloom_key):
                 duplicates += 1
             else:
-                await self._bloom.add(bloom_key)
-                new_iocs.append(ioc)
+                unseen[bloom_key] = ioc
+
+        new_iocs = list(unseen.values())
 
         logger.info(
             "IOC dedup complete",
@@ -140,9 +141,11 @@ class ThreatIntelPipeline:
             unavailable=unavailable or None,
         )
 
-        # --- Emit Kafka events ---
-        if self._kafka:
-            await self._emit_kafka_events(new_iocs, event_type="NEW_IOC", source=source)
+        if sinks["qdrant"] is not None:
+            for bloom_key in unseen:
+                await self._bloom.add(bloom_key)
+            if self._kafka:
+                await self._emit_kafka_events(new_iocs, event_type="NEW_IOC", source=source)
 
         return {
             "total": len(iocs),
