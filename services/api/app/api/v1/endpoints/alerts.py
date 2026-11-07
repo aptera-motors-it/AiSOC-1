@@ -13,7 +13,7 @@ from sqlalchemy import and_, func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.api.v1.deps import AuthUser, DBSession, require_permission
-from app.db.rls import TenantDBSession
+from app.db.rls import TenantDBSession, set_rls_context
 from app.models.alert import Alert
 from app.services.alert_bulk_close import (
     DEFAULT_MAX_COUNT,
@@ -36,7 +36,7 @@ from app.services.alert_rail import (
     RelatedEntity,
     build_rail_envelope,
 )
-from app.services.alert_status import is_unresolved
+from app.services.alert_status import is_resolved, is_unresolved, unresolved_filter
 from app.services.audit import emit_audit
 from app.services.event_sanitiser import (
     SubmitPayloadTooLarge,
@@ -44,6 +44,7 @@ from app.services.event_sanitiser import (
 )
 from app.services.narrative_loader import build_narrative
 from app.services.narrative_projection import project_alert_to_narrative_inputs
+from app.services.outbound_webhooks import enqueue_event
 from app.services.timestamp_bounds import coerce_with_bounds, now_utc
 
 logger = logging.getLogger(__name__)
@@ -944,9 +945,7 @@ async def get_alert_stats(
 
     # Critical open
     crit_result = await db.execute(
-        select(func.count())
-        .select_from(Alert)
-        .where(and_(tenant_filter, Alert.severity == "critical", Alert.status.in_(["new", "triaging", "in_progress"])))
+        select(func.count()).select_from(Alert).where(and_(tenant_filter, Alert.severity == "critical", unresolved_filter(Alert.status)))
     )
     critical_open = crit_result.scalar_one()
 
@@ -1111,10 +1110,15 @@ async def update_alert(
     if alert is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Alert not found")
 
+    previous_status = alert.status
     updates: dict = {}
     if request.status is not None:
         updates["status"] = request.status
-        if request.status in ("resolved", "false_positive", "closed"):
+        # `is_resolved` rather than a fourth copy of the terminal set: the
+        # copy that was here omitted `fp` and `dismissed`, so an alert moved
+        # to either kept a null `resolved_at` and every duration measured
+        # from it silently excluded the row.
+        if is_resolved(request.status):
             updates["resolved_at"] = datetime.now(UTC)
     if request.priority is not None:
         updates["priority"] = request.priority
@@ -1164,6 +1168,18 @@ async def update_alert(
             changes=changes,
             request=http_request,
         )
+        if request.status is not None and request.status != previous_status:
+            await set_rls_context(db, current_user.tenant_id)
+            await enqueue_event(
+                db,
+                tenant_id=current_user.tenant_id,
+                event_type="alert.status_changed",
+                payload={
+                    "alert_id": str(alert_id),
+                    "from_status": previous_status,
+                    "to_status": request.status,
+                },
+            )
         await db.commit()
         await db.refresh(alert)
 

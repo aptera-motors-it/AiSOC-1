@@ -50,12 +50,13 @@ from sqlalchemy import select, text
 
 from app.api.v1.deps import AuthUser, DBSession, require_permission
 from app.core.logging import safe_log_value
+from app.db.rls import set_rls_context
 from app.models.investigation import (
     InvestigationArtifact,
     InvestigationEvent,
     InvestigationRun,
 )
-from app.services import case_orchestration, case_status, evidence_custody
+from app.services import alert_status, case_orchestration, case_status, evidence_custody
 from app.services.audit import emit_audit
 from app.services.branding.resolver import resolve_branding
 from app.services.case_fanout import (
@@ -67,6 +68,7 @@ from app.services.case_postmortem import build_case_postmortem
 from app.services.case_postmortem_html import render_case_postmortem_html
 from app.services.case_summary import build_case_summary
 from app.services.case_summary_html import render_case_summary_html
+from app.services.outbound_webhooks import enqueue_event
 from app.services.semantic_memory import remember_closed_case
 
 logger = logging.getLogger(__name__)
@@ -180,7 +182,14 @@ _LADDER = list(case_status.ALL_STATUSES)
 # alert to 'investigating'. Terminal states (resolved/false_positive/closed)
 # and an already-running alert are deliberately excluded: a re-run must never
 # drag history backwards.
-_ALERT_OPEN_STATUSES: tuple[str, ...] = ("new", "triaged", "triaging")
+#
+# Read from `alert_status` rather than retyped. This was the *second*
+# hand-written copy of the alert vocabulary and the one that happened to be
+# right about `triaged` while the canonical tuple was wrong, so the dashboard
+# and the case workbench disagreed about whether an auto-triaged alert was
+# still open. Two declarations of one vocabulary is the defect; which of them
+# is correct is luck.
+_ALERT_OPEN_STATUSES: tuple[str, ...] = alert_status.PRE_INVESTIGATION_STATUSES
 
 
 def _forward_to_investigating_ok(current: str) -> bool:
@@ -842,6 +851,18 @@ async def update_case(
                 action="case_closed" if body.status == "closed" else "status_changed",
                 item=body.status,
                 detail={"to": body.status},
+            )
+        if body.status and body.status != existing.status:
+            await set_rls_context(db, user.tenant_id)
+            await enqueue_event(
+                db,
+                tenant_id=user.tenant_id,
+                event_type="case.status_changed",
+                payload={
+                    "case_id": str(cid),
+                    "from_status": existing.status,
+                    "to_status": body.status,
+                },
             )
         await db.commit()
     except Exception as exc:
