@@ -48,6 +48,26 @@ variable "eks_cluster_version" {
   default     = "1.28"
 }
 
+variable "eks_endpoint_public_access" {
+  description = "Whether the EKS control plane is reachable from outside the VPC."
+  type        = bool
+  default     = false
+}
+
+variable "eks_public_access_cidrs" {
+  description = "CIDR blocks allowed to reach the EKS public API when eks_endpoint_public_access is true."
+  type        = list(string)
+  default     = []
+  validation {
+    condition = alltrue([
+      for c in var.eks_public_access_cidrs : (
+        c != "0.0.0.0/0" && tonumber(element(split("/", c), 1)) >= 16
+      )
+    ])
+    error_message = "Each EKS public access CIDR must be /16 or more specific; 0.0.0.0/0 and overly broad ranges are not allowed."
+  }
+}
+
 variable "rds_instance_class" {
   description = "RDS PostgreSQL instance class"
   type        = string

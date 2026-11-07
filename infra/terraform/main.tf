@@ -85,6 +85,9 @@ module "eks" {
   private_subnet_ids = module.vpc.private_subnet_ids
   cluster_version    = var.eks_cluster_version
 
+  endpoint_public_access = var.eks_endpoint_public_access
+  public_access_cidrs    = var.eks_public_access_cidrs
+
   node_groups = {
     general = {
       instance_types = ["m6i.xlarge"]
