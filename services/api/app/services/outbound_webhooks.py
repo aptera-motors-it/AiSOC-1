@@ -186,6 +186,15 @@ def _body(delivery: OutboundDelivery) -> bytes:
     return json.dumps(envelope, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
 
 
+def _http_error_body(response: httpx.Response) -> str:
+    try:
+        text = response.text
+    except (AssertionError, TypeError, UnicodeError, LookupError):
+        text = response.content.decode("utf-8", errors="replace")
+    text = text.replace("\x00", "").encode("utf-8", errors="replace").decode("utf-8")
+    return text[:200]
+
+
 async def attempt_delivery(
     delivery: OutboundDelivery,
     webhook: OutboundWebhook,
@@ -252,7 +261,7 @@ async def attempt_delivery(
         delivery.last_error = ""
         return delivery
 
-    delivery.last_error = f"HTTP {response.status_code}: {response.text[:200]}"
+    delivery.last_error = f"HTTP {response.status_code}: {_http_error_body(response)}"
     retryable = response.status_code >= 500 or response.status_code in _RETRYABLE_CLIENT_STATUSES
     if not retryable:
         # Understood and refused. Six identical refusals would be six
@@ -284,6 +293,7 @@ async def due_deliveries(db: AsyncSession, *, limit: int = 50) -> list[tuple[Out
                 .where(OutboundDelivery.next_attempt_at <= datetime.now(UTC))
                 .order_by(OutboundDelivery.next_attempt_at)
                 .limit(limit)
+                .with_for_update(skip_locked=True, of=OutboundDelivery)
             )
         )
         .tuples()
