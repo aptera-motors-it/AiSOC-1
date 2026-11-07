@@ -41,6 +41,16 @@ type EventPublisher interface {
 	Ready(ctx context.Context) error
 }
 
+type partialPublishError interface {
+	AcceptedEvents() []*normalizer.NormalizedEvent
+}
+
+const graphProjectionTimeout = 30 * time.Second
+
+func graphProjectionContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), graphProjectionTimeout)
+}
+
 // SnapshotApplier mirrors *config_snapshot.Snapshotter.Apply. Defined as
 // an interface so the handler can be unit-tested without standing up a
 // real provider/cache pair, and so a nil applier is a clean "T1.2
@@ -95,10 +105,6 @@ func (h *Handler) RegisterSubscription(name string, probe func() SubscriptionSta
 
 // SetGraphWriter wires in the graph projection writer. nil disables graph
 // fan-out — the rest of the pipeline behaves identically.
-//
-// The fan-out is intentional: the graph writer runs concurrently with the
-// fusion publish, and a failure / queue-full in the graph writer must NOT
-// block the fusion path (T1.1 acceptance criterion).
 func (h *Handler) SetGraphWriter(g GraphWriter) {
 	h.graph = g
 }
@@ -228,12 +234,20 @@ func (h *Handler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(normalized) > 0 {
-		// Fan-out graph writer (T1.1, v8.0). Runs concurrently with fusion
-		// publish. A failure in WriteEvent never propagates here — the
-		// writer drops the event onto an internal queue with backpressure
-		// handled by drop-and-metric, so this loop is non-blocking.
+		published := normalized
+		publishErr := h.pub.PublishBatch(r.Context(), normalized)
+		if publishErr != nil {
+			published = nil
+			var partial partialPublishError
+			if errors.As(publishErr, &partial) {
+				published = partial.AcceptedEvents()
+			}
+		}
+
 		if h.graph != nil {
-			for _, ev := range normalized {
+			projectionCtx, cancel := graphProjectionContext(r.Context())
+			defer cancel()
+			for _, ev := range published {
 				gev := graph.ExtractFromOCSF(ev.ID, ev.TenantID, req.ConnectorType, ev.OcsfEvent)
 				if gev == nil {
 					continue
@@ -243,16 +257,15 @@ func (h *Handler) IngestEvents(w http.ResponseWriter, r *http.Request) {
 				// logged + skipped; the rest of the projection still
 				// flushes through WriteEvent below.
 				if h.snapshot != nil {
-					h.snapshot.Apply(r.Context(), gev)
+					h.snapshot.Apply(projectionCtx, gev)
 				}
 				// WriteEvent is non-blocking; ctx is only used to honor
 				// shutdown. We deliberately don't wait on it.
-				_ = h.graph.WriteEvent(r.Context(), gev)
+				_ = h.graph.WriteEvent(projectionCtx, gev)
 			}
 		}
-
-		if err := h.pub.PublishBatch(r.Context(), normalized); err != nil {
-			log.Error().Err(err).Str("tenant_id", tenantID).Msg("Failed to publish batch")
+		if publishErr != nil {
+			log.Error().Err(publishErr).Str("tenant_id", tenantID).Msg("Failed to publish batch")
 			writeError(w, http.StatusInternalServerError, "failed to publish events")
 			return
 		}

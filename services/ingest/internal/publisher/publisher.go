@@ -4,6 +4,7 @@ package publisher
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -24,6 +25,29 @@ type Publisher struct {
 	vulnWriter  *kafka.Writer // dedicated writer for VULNERABILITY_MATCH topic
 	graphWriter *kafka.Writer // dedicated writer for security.graph_updates (T1.1, v8.0)
 	cfg         *config.Config
+}
+
+const detachedPublishTimeout = 30 * time.Second
+
+func detachedPublishContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), detachedPublishTimeout)
+}
+
+type PartialPublishError struct {
+	err      error
+	accepted []*normalizer.NormalizedEvent
+}
+
+func (e *PartialPublishError) Error() string {
+	return e.err.Error()
+}
+
+func (e *PartialPublishError) Unwrap() error {
+	return e.err
+}
+
+func (e *PartialPublishError) AcceptedEvents() []*normalizer.NormalizedEvent {
+	return e.accepted
 }
 
 // New creates a new Kafka publisher
@@ -282,12 +306,14 @@ func (p *Publisher) PublishBatch(ctx context.Context, events []*normalizer.Norma
 	}
 
 	msgs := make([]kafka.Message, 0, len(events))
+	publishable := make([]*normalizer.NormalizedEvent, 0, len(events))
 	for _, event := range events {
 		data, err := json.Marshal(event)
 		if err != nil {
 			log.Warn().Err(err).Str("event_id", event.ID).Msg("Skipping event due to marshal error")
 			continue
 		}
+		publishable = append(publishable, event)
 		msgs = append(msgs, kafka.Message{
 			Key:   partitionKey(event),
 			Value: data,
@@ -300,8 +326,24 @@ func (p *Publisher) PublishBatch(ctx context.Context, events []*normalizer.Norma
 		})
 	}
 
-	if err := p.writer.WriteMessages(ctx, msgs...); err != nil {
-		return fmt.Errorf("kafka batch publish failed: %w", err)
+	publishCtx, cancel := detachedPublishContext(ctx)
+	defer cancel()
+	if err := p.writer.WriteMessages(publishCtx, msgs...); err != nil {
+		wrapped := fmt.Errorf("kafka batch publish failed: %w", err)
+		writeErrors, ok := err.(kafka.WriteErrors)
+		if !ok {
+			return wrapped
+		}
+		accepted := make([]*normalizer.NormalizedEvent, 0, len(publishable)-writeErrors.Count())
+		for i, writeErr := range writeErrors {
+			if writeErr == nil || errors.Is(writeErr, kafka.NotEnoughReplicasAfterAppend) {
+				accepted = append(accepted, publishable[i])
+			}
+		}
+		if len(accepted) == 0 {
+			return wrapped
+		}
+		return &PartialPublishError{err: wrapped, accepted: accepted}
 	}
 
 	log.Info().Int("count", len(msgs)).Msg("Batch published to Kafka")
