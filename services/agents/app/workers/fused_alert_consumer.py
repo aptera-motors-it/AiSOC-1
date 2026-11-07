@@ -377,6 +377,10 @@ def _is_terminal_request_error(exc: BaseException) -> bool:
     return False
 
 
+class _DlqUnavailable(Exception):
+    pass
+
+
 class FusedAlertTriageWorker:
     """Consumes ``aisoc.alerts.fused`` and auto-triages each alert (copilot)."""
 
@@ -439,7 +443,7 @@ class FusedAlertTriageWorker:
         self._lanes = EntityLanes(entity_concurrency)
 
     async def start(self) -> None:
-        from aiokafka import AIOKafkaConsumer  # noqa: PLC0415 — optional dep, only at runtime
+        from aiokafka import AIOKafkaConsumer, TopicPartition  # noqa: PLC0415 — optional dep, only at runtime
 
         self._consumer = AIOKafkaConsumer(
             self._topic,
@@ -471,12 +475,6 @@ class FusedAlertTriageWorker:
                 # inference and persistence replays the alert instead of losing
                 # it, and offsets advance only on durable completion (issue #571).
                 #
-                # ``_process_with_retry`` catches and dead-letters rather than
-                # raising, which is the reason this loop survives a poison
-                # alert. The guard is here as well because that is a property
-                # of another method: the loop must not depend on a callee
-                # staying total, which is exactly how the ueba consumer came
-                # to have no ``except`` on its only handler.
                 # Parity 6.9. Triage is an LLM call, so this stage spends
                 # almost all of its time waiting; it used to wait one alert
                 # at a time. Alerts about *different* entities now run
@@ -489,10 +487,14 @@ class FusedAlertTriageWorker:
                 payload = msg.value if isinstance(msg.value, dict) else {}
                 partition = getattr(msg, "partition", None)
                 offset = getattr(msg, "offset", None)
+                hold_commit = False
 
                 async def _handle(value=msg.value, partition=partition, offset=offset) -> None:
+                    nonlocal hold_commit
                     try:
                         await self._process_with_retry(value)
+                    except _DlqUnavailable:
+                        hold_commit = True
                     except Exception as exc:  # noqa: BLE001 — one alert must not end the subscription
                         _METRICS["errors"] += 1
                         logger.error(
@@ -520,16 +522,24 @@ class FusedAlertTriageWorker:
                 # done — correct, and wasteful every single time.
                 window_full = self._lanes.in_flight >= self._lanes.limit
                 window_old = (time.monotonic() - last_commit) >= _COMMIT_WINDOW_SECONDS
-                if window_full or window_old:
-                    await self._lanes.drain()
-                    last_commit = time.monotonic()
-                    try:
-                        await self._consumer.commit()
-                    except Exception as commit_exc:  # noqa: BLE001 — reprocess on restart
-                        logger.warning("auto_triage_worker.commit_failed", error=str(commit_exc))
-                    continue
-
                 await self._lanes.drain()
+                if window_full or window_old:
+                    last_commit = time.monotonic()
+                if hold_commit:
+                    logger.error(
+                        "auto_triage_worker.offset_held",
+                        partition=partition,
+                        offset=offset,
+                    )
+                    # auto_offset_reset=latest: a group with no commit starts at the log end.
+                    if partition is not None and offset is not None and self._consumer is not None:
+                        tp = TopicPartition(msg.topic, partition)
+                        try:
+                            if await self._consumer.committed(tp) is None:
+                                await self._consumer.commit({tp: offset})
+                        except Exception as pin_exc:  # noqa: BLE001 — reprocess on restart
+                            logger.warning("auto_triage_worker.offset_pin_failed", error=str(pin_exc))
+                    raise _DlqUnavailable(f"dlq publish failed at offset {offset}")
                 try:
                     await self._consumer.commit()
                 except Exception as commit_exc:  # noqa: BLE001 — reprocess on restart
@@ -543,8 +553,8 @@ class FusedAlertTriageWorker:
     async def _process_with_retry(self, message: Any) -> bool:
         """Triage one alert with bounded retries; dead-letter on exhaustion.
 
-        Returns True on durable success, False if the message was dead-lettered.
-        Either way the caller commits (a poison alert must not wedge the loop).
+        Returns True when triage finished and False when the DLQ accepted
+        the alert. Raises ``_DlqUnavailable`` when the publish did not happen.
         """
         last_error: str = ""
         stage = "triage"
@@ -593,7 +603,7 @@ class FusedAlertTriageWorker:
             )
             await self._producer.start()
             return self._producer
-        except Exception as exc:  # noqa: BLE001 — DLQ is best-effort
+        except Exception as exc:  # noqa: BLE001
             logger.error("auto_triage_worker.dlq_producer_failed", error=str(exc))
             self._producer = None
             return None
@@ -615,13 +625,23 @@ class FusedAlertTriageWorker:
         producer = await self._ensure_producer()
         if producer is None:
             logger.error("auto_triage_worker.dlq_unavailable", alert_id=alert_id, stage=stage)
-            return
+            raise _DlqUnavailable(alert_id)
         try:
-            await producer.send(self._dlq_topic, value=record)
+            pending = await producer.send(self._dlq_topic, value=record)
+            # aiokafka's send returns a future that finishes when the record is published.
+            if asyncio.isfuture(pending):
+                await pending
             _METRICS["dead_lettered"] += 1
             logger.error("auto_triage_worker.dead_lettered", alert_id=alert_id, stage=stage, attempts=attempts)
-        except Exception as exc:  # noqa: BLE001 — never wedge the loop on a DLQ failure
+        except asyncio.CancelledError:
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise
+            logger.error("auto_triage_worker.dlq_send_failed", alert_id=alert_id, error="cancelled")
+            raise _DlqUnavailable(alert_id) from None
+        except Exception as exc:  # noqa: BLE001
             logger.error("auto_triage_worker.dlq_send_failed", alert_id=alert_id, error=str(exc))
+            raise _DlqUnavailable(alert_id) from exc
 
     @property
     def topic(self) -> str:
@@ -632,6 +652,40 @@ class FusedAlertTriageWorker:
     def attached(self) -> bool:
         """Whether the consume loop is currently iterating the subscription."""
         return self._attached
+
+    async def broker_reachable(self) -> bool:
+        """Ask the broker, instead of asking the loop whether it is still looping.
+
+        :attr:`attached` answers "am I consuming"; this answers "can I reach
+        the broker". They are different facts and only the second can describe
+        an outage. Under aiokafka the reconnect lives inside ``__anext__``, so
+        a stopped broker never ends the ``async for`` and the flag never
+        clears: a live pass measured this service answering **200** with
+        ``{"status": "ready"}`` at 35 s and again at 105 s into a Kafka outage
+        while its own log carried ``KafkaConnectionError: Connection at
+        kafka:29092 closed``, and fusion, ingest and realtime all answered 503
+        with a reason in the same window.
+
+        This service hosts ``FusedAlertTriageWorker``, so a replica reporting
+        ready while nothing can reach it is the worst case available: a load
+        balancer has no reason to route away from it and no fused alert gets
+        triaged.
+
+        Copied from ``FusionWorker.broker_reachable`` deliberately, down to
+        the metadata call — two services answering the same question two ways
+        makes a fleet-wide readiness answer unreadable.
+        ``fetch_all_metadata`` (which ``topics()`` drives) builds its own
+        ``ClusterMetadata``, so a probe cancelled by the caller's deadline
+        cannot corrupt the client's shared view of the cluster. The caller
+        (``app/_health.py``) bounds this at 1.5 s and treats a raise as "not
+        reachable", which is the honest reading: if asking whether the broker
+        is there is itself unanswerable, the answer is not yes.
+        """
+        consumer = self._consumer
+        if consumer is None:
+            return False
+        await consumer.topics()
+        return True
 
     async def stop(self) -> None:
         self._running = False
@@ -758,6 +812,7 @@ class FusedAlertTriageWorker:
         decision = governor.check(str(state.tenant_id), fingerprint)
 
         tier: str
+        verdict: str | None
         # None, not 0.0: a cached or deterministic verdict placed no LLM call,
         # and "no call was made" is a different fact from "the call was free".
         cost: CostSummary = CostSummary()
@@ -768,8 +823,18 @@ class FusedAlertTriageWorker:
         # happened.
         if decision.decision is Decision.DEDUPLICATED and decision.cached_verdict and writer.uses_dedup_cache:
             _METRICS["deduplicated"] += 1
-            verdict = decision.cached_verdict.get("verdict")
-            confidence = float(decision.cached_verdict.get("confidence", 0.0))
+            verdict = normalize_disposition(decision.cached_verdict.get("verdict"), default=NEEDS_REVIEW)
+            confidence = max(0.0, min(1.0, float(decision.cached_verdict.get("confidence") or 0.0)))
+            # Persistence and source writeback read the state, not these locals.
+            # A cached verdict never carries authorization to close this alert.
+            state.verdict = verdict
+            state.confidence = confidence
+            state.status = AgentStatus.RUNNING
+            state.confidence_basis = [
+                f"Cached prior assessment: {verdict}; confidence={confidence:.2f}. "
+                "The evidence fingerprint matched a previous assessment; no new model call was made. "
+                "This is not evidence of remediation or authorization to close the alert."
+            ]
             tier = "cached"
         else:
             cfg = await self._resolve_tenant_llm(state.tenant_id)
