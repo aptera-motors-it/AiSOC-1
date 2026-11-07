@@ -3,7 +3,7 @@ info:
   title: AiSOC Platform API
   description: AiSOC — open-source AI Security Operations Center. Autonomous threat
     detection, investigation, and response.
-  version: 0.1.0
+  version: 22.2.0
 paths:
   /api/v1/auth/login:
     post:
@@ -6342,7 +6342,9 @@ paths:
 
         *names* in the run result, never values — the run record is readable by
 
-        anyone with access to the case.'
+        anyone with access to the case. A session is never served here, whatever
+
+        permissions it holds.'
       operationId: resolve_playbook_references_api_v1_playbook_steps_references_post
       security:
       - HTTPBearer: []
@@ -12791,7 +12793,7 @@ paths:
       - responder
       - approvals
       summary: Create Approval
-      description: 'Create a new approval request.
+      description: 'Create a new approval request. Requires `approvals:write`.
 
 
         The agents service calls this when it hits a high-risk step that
@@ -12866,7 +12868,14 @@ paths:
 
         approved request returns the row unchanged; trying to flip an
 
-        approved row to denied (or vice versa) is a 409.'
+        approved row to denied (or vice versa) is a 409.
+
+
+        Separation of duties, the named approver and the approval window are each
+
+        enforced; a requester cannot approve their own request, and an elapsed
+
+        approval can be denied but not approved.'
       operationId: decide_approval_api_v1_approvals__approval_id__decide_post
       security:
       - HTTPBearer: []
@@ -16351,6 +16360,175 @@ paths:
         schema:
           type: string
           title: Capability
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/response-schedule:
+    get:
+      tags:
+      - response-schedule
+      summary: Get Response Schedule
+      description: 'The tenant''s schedule, or an all-off one when they have declared
+        none.
+
+
+        An all-off schedule and no row are different states and the difference is
+
+        load-bearing — the loader returns ``None`` for no row, which is the
+
+        byte-identical-to-before path — so ``declared`` says which this is.'
+      operationId: get_response_schedule_api_v1_response_schedule_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleOut'
+      security:
+      - HTTPBearer: []
+    put:
+      tags:
+      - response-schedule
+      summary: Set Response Schedule
+      description: 'Declare the schedule and replace its windows in one transaction.
+
+
+        Windows are replaced wholesale rather than patched, because a schedule
+
+        half-applied is a schedule nobody declared: a window list that is updated
+
+        in pieces has an instant where Tuesday is covered and Wednesday is not,
+
+        and an automatic containment that lands in that instant is governed by a
+
+        configuration no operator ever wrote down.'
+      operationId: set_response_schedule_api_v1_response_schedule_put
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScheduleIn'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - HTTPBearer: []
+    delete:
+      tags:
+      - response-schedule
+      summary: Clear Response Schedule
+      description: 'Remove the schedule entirely, returning to no-schedule behaviour.
+
+
+        Deleting the row is the real off switch. Setting every flag false leaves a
+
+        row the loader still reads and still has to grade; removing it is what
+
+        makes ``apply_schedule`` a no-op again.'
+      operationId: clear_response_schedule_api_v1_response_schedule_delete
+      responses:
+        '204':
+          description: Successful Response
+      security:
+      - HTTPBearer: []
+  /api/v1/triage-questions:
+    get:
+      tags:
+      - triage-questions
+      summary: List Triage Questions
+      description: Every question this tenant has declared, enabled or not.
+      operationId: list_triage_questions_api_v1_triage_questions_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/QuestionOut'
+                type: array
+                title: Response List Triage Questions Api V1 Triage Questions Get
+      security:
+      - HTTPBearer: []
+    post:
+      tags:
+      - triage-questions
+      summary: Upsert Triage Question
+      description: 'Declare a question, or update the one with the same lookup.
+
+
+        Upsert rather than insert, because the table''s own uniqueness is
+
+        ``(tenant_id, alert_type, field, op)``: two identical lookups under
+
+        different labels would both be answered and both rendered, which reads to
+
+        an analyst as corroboration from one fact. Re-posting a lookup therefore
+
+        edits its label rather than raising.'
+      operationId: upsert_triage_question_api_v1_triage_questions_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuestionIn'
+        required: true
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuestionOut'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - HTTPBearer: []
+  /api/v1/triage-questions/{question_id}:
+    delete:
+      tags:
+      - triage-questions
+      summary: Delete Triage Question
+      description: 'Remove a question.
+
+
+        404 and not 403 on another tenant''s id: a 403 would make this route an
+
+        existence oracle over every tenant''s question ids, byte-identical to a
+
+        genuine miss.'
+      operationId: delete_triage_question_api_v1_triage_questions__question_id__delete
+      security:
+      - HTTPBearer: []
+      parameters:
+      - name: question_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Question Id
       responses:
         '204':
           description: Successful Response
@@ -20870,6 +21048,22 @@ paths:
                 $ref: '#/components/schemas/BundleJob'
       security:
       - HTTPBearer: []
+  /api/v1/system/version:
+    get:
+      tags:
+      - System
+      summary: Get System Version
+      description: Report the running build and whether its schema matches it.
+      operationId: get_system_version_api_v1_system_version_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemVersion'
+      security:
+      - HTTPBearer: []
   /api/v1/fusion/health:
     get:
       tags:
@@ -24836,6 +25030,16 @@ components:
           - type: 'null'
           title: Suppression Reason
           description: Free-text reason recorded with the suppression placeholder.
+        suppress_when:
+          anyOf:
+          - additionalProperties:
+              items:
+                type: string
+              type: array
+            type: object
+          - type: 'null'
+          title: Suppress When
+          description: Field values that suppress matching events for this rule.
       type: object
       required:
       - action
@@ -26213,6 +26417,67 @@ components:
       - items
       - total
       title: BundleListResponse
+    BusinessWindowIn:
+      properties:
+        weekday:
+          type: integer
+          maximum: 6.0
+          minimum: 0.0
+          title: Weekday
+          description: 'datetime.weekday(): Monday is 0'
+        start_minute:
+          type: integer
+          maximum: 1439.0
+          minimum: 0.0
+          title: Start Minute
+          description: minutes from local midnight
+        end_minute:
+          type: integer
+          maximum: 1440.0
+          minimum: 0.0
+          title: End Minute
+          description: 1440 means midnight at the end of the day
+      type: object
+      required:
+      - weekday
+      - start_minute
+      - end_minute
+      title: BusinessWindowIn
+      description: One recurring window in which automatic response is acceptable.
+    BusinessWindowOut:
+      properties:
+        weekday:
+          type: integer
+          maximum: 6.0
+          minimum: 0.0
+          title: Weekday
+          description: 'datetime.weekday(): Monday is 0'
+        start_minute:
+          type: integer
+          maximum: 1439.0
+          minimum: 0.0
+          title: Start Minute
+          description: minutes from local midnight
+        end_minute:
+          type: integer
+          maximum: 1440.0
+          minimum: 0.0
+          title: End Minute
+          description: 1440 means midnight at the end of the day
+        id:
+          type: string
+          title: Id
+        weekday_name:
+          type: string
+          title: Weekday Name
+      type: object
+      required:
+      - weekday
+      - start_minute
+      - end_minute
+      - id
+      - weekday_name
+      title: BusinessWindowOut
     ByokSavings:
       properties:
         is_byok_active:
@@ -29183,14 +29448,15 @@ components:
           $ref: '#/components/schemas/DeploymentMode'
         llm_provider:
           $ref: '#/components/schemas/LLMProvider'
-        update_channel:
-          $ref: '#/components/schemas/UpdateChannel'
         telemetry_enabled:
           type: boolean
+          const: false
           title: Telemetry Enabled
-        auto_update:
-          type: boolean
-          title: Auto Update
+          description: Always false. AiSOC has no phone-home and no model-improvement
+            callback; see docs/trust/data-flows.md. Reported rather than removed so
+            a consumer asking the question gets an answer, and typed as a constant
+            so the published spec cannot drift back to claiming otherwise.
+          default: false
         last_updated:
           type: string
           title: Last Updated
@@ -29198,9 +29464,6 @@ components:
       required:
       - mode
       - llm_provider
-      - update_channel
-      - telemetry_enabled
-      - auto_update
       - last_updated
       title: DeploymentConfig
     DeploymentConfigUpdate:
@@ -29213,20 +29476,7 @@ components:
           anyOf:
           - $ref: '#/components/schemas/LLMProvider'
           - type: 'null'
-        update_channel:
-          anyOf:
-          - $ref: '#/components/schemas/UpdateChannel'
-          - type: 'null'
-        telemetry_enabled:
-          anyOf:
-          - type: boolean
-          - type: 'null'
-          title: Telemetry Enabled
-        auto_update:
-          anyOf:
-          - type: boolean
-          - type: 'null'
-          title: Auto Update
+      additionalProperties: false
       type: object
       title: DeploymentConfigUpdate
     DeploymentMode:
@@ -31470,6 +31720,14 @@ components:
         mttd_seconds:
           type: number
           title: Mttd Seconds
+        signal_to_noise_sample_count:
+          type: integer
+          title: Signal To Noise Sample Count
+          default: 0
+        mttd_sample_count:
+          type: integer
+          title: Mttd Sample Count
+          default: 0
         analyst_queue_depth:
           type: integer
           title: Analyst Queue Depth
@@ -31540,15 +31798,23 @@ components:
 
         All counts are absolute for ``period``. ``signal_to_noise`` is the
 
-        fraction of *resolved* alerts that ended in disposition ``true_positive``
+        fraction of *decided* verdicts that ended in disposition
 
-        (i.e. signal / (signal + noise)). ``mttd_seconds`` mirrors /metrics/soc''s
+        ``true_positive`` (i.e. signal / (signal + noise)); alerts the agent
 
-        MTTD definition (Alert.created_at → Alert.first_seen_at) but expressed in
+        abstained on with ``needs_review`` are in neither half, because scoring
 
-        seconds for funnel-level precision. ``deltas`` compares this period to the
+        an agent on questions it refused to answer is not an accuracy figure.
 
-        immediately preceding period of the same length.'
+        ``mttd_seconds`` mirrors /metrics/soc''s MTTD definition
+
+        (Alert.created_at → Alert.first_seen_at) but expressed in seconds for
+
+        funnel-level precision. Each of those two travels with the count of rows
+
+        it was computed over -- read them as a pair. ``deltas`` compares this
+
+        period to the immediately preceding period of the same length.'
     GateLogOut:
       properties:
         id:
@@ -36556,6 +36822,11 @@ components:
         status:
           type: string
           title: Status
+        detail:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Detail
         unmeasured:
           items:
             type: string
@@ -37698,6 +37969,86 @@ components:
       - rows
       - total_rows
       title: QueryResult
+    QuestionIn:
+      properties:
+        alert_type:
+          type: string
+          maxLength: 200
+          title: Alert Type
+          description: '''*'' matches every alert type'
+          default: '*'
+        label:
+          type: string
+          maxLength: 200
+          minLength: 1
+          title: Label
+          description: Free text for the analyst. Never interpreted.
+        field:
+          type: string
+          maxLength: 200
+          title: Field
+        op:
+          type: string
+          title: Op
+        value:
+          title: Value
+        enabled:
+          type: boolean
+          title: Enabled
+          default: true
+      type: object
+      required:
+      - label
+      - field
+      - op
+      title: QuestionIn
+    QuestionOut:
+      properties:
+        alert_type:
+          type: string
+          maxLength: 200
+          title: Alert Type
+          description: '''*'' matches every alert type'
+          default: '*'
+        label:
+          type: string
+          maxLength: 200
+          minLength: 1
+          title: Label
+          description: Free text for the analyst. Never interpreted.
+        field:
+          type: string
+          maxLength: 200
+          title: Field
+        op:
+          type: string
+          title: Op
+        value:
+          title: Value
+        enabled:
+          type: boolean
+          title: Enabled
+          default: true
+        id:
+          type: string
+          title: Id
+        created_at:
+          type: string
+          format: date-time
+          title: Created At
+        updated_at:
+          type: string
+          format: date-time
+          title: Updated At
+      type: object
+      required:
+      - label
+      - field
+      - op
+      - id
+      - created_at
+      - updated_at
+      title: QuestionOut
     QueueAction:
       properties:
         priority:
@@ -39562,6 +39913,10 @@ components:
         analyst_overrides_7d:
           type: integer
           title: Analyst Overrides 7D
+        ai_dispositions_7d:
+          type: integer
+          title: Ai Dispositions 7D
+          default: 0
         mttd_sample_count:
           type: integer
           title: Mttd Sample Count
@@ -40214,6 +40569,148 @@ components:
       - findings_closed
       - error_message
       title: ScanRunOut
+    ScheduleIn:
+      properties:
+        timezone_name:
+          type: string
+          maxLength: 64
+          title: Timezone Name
+          default: UTC
+        require_human_outside_business_hours:
+          type: boolean
+          title: Require Human Outside Business Hours
+          default: false
+        require_human_without_on_call:
+          type: boolean
+          title: Require Human Without On Call
+          default: false
+        freeze_active:
+          type: boolean
+          title: Freeze Active
+          default: false
+        freeze_reason:
+          type: string
+          maxLength: 500
+          title: Freeze Reason
+          default: ''
+        applies_from_impact:
+          type: string
+          title: Applies From Impact
+          default: moderate
+        windows:
+          items:
+            $ref: '#/components/schemas/BusinessWindowIn'
+          type: array
+          title: Windows
+      type: object
+      title: ScheduleIn
+    ScheduleOut:
+      properties:
+        timezone_name:
+          type: string
+          maxLength: 64
+          title: Timezone Name
+          default: UTC
+        require_human_outside_business_hours:
+          type: boolean
+          title: Require Human Outside Business Hours
+          default: false
+        require_human_without_on_call:
+          type: boolean
+          title: Require Human Without On Call
+          default: false
+        freeze_active:
+          type: boolean
+          title: Freeze Active
+          default: false
+        freeze_reason:
+          type: string
+          maxLength: 500
+          title: Freeze Reason
+          default: ''
+        applies_from_impact:
+          type: string
+          title: Applies From Impact
+          default: moderate
+        windows:
+          items:
+            $ref: '#/components/schemas/BusinessWindowOut'
+          type: array
+          title: Windows
+        updated_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Updated At
+        updated_by:
+          type: string
+          title: Updated By
+          default: ''
+        effect:
+          items:
+            type: string
+          type: array
+          title: Effect
+      type: object
+      title: ScheduleOut
+    SchemaMigrationState:
+      properties:
+        state:
+          type: string
+          enum:
+          - current
+          - skewed
+          - unknown
+          title: State
+          description: '''current'' — every migration on disk is applied. ''skewed''
+            — the two disagree; see pending and applied_not_on_disk. ''unknown'' —
+            the comparison could not be performed (no database, no tracking table,
+            or a failed query). ''unknown'' is never a pass.'
+        detail:
+          type: string
+          title: Detail
+          description: Why this verdict, in one sentence an operator can act on.
+        migrations_on_disk:
+          type: integer
+          title: Migrations On Disk
+          description: Migration files this build ships.
+        migrations_applied:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Migrations Applied
+          description: Rows in aisoc_schema_migrations, or null when they could not
+            be read.
+        latest_applied:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Latest Applied
+          description: 'Applied-migration high-water mark: the last applied migration
+            in apply order.'
+        pending:
+          items:
+            type: string
+          type: array
+          title: Pending
+          description: On disk and not applied — new code against an old schema.
+        applied_not_on_disk:
+          items:
+            type: string
+          type: array
+          title: Applied Not On Disk
+          description: Applied but absent from this build — old code against a newer
+            schema.
+      type: object
+      required:
+      - state
+      - detail
+      - migrations_on_disk
+      - migrations_applied
+      - latest_applied
+      title: SchemaMigrationState
+      description: How the live schema compares with the migrations this build ships.
     ScimTokenOut:
       properties:
         id:
@@ -41295,6 +41792,35 @@ components:
       - posted
       - error
       title: SyncResult
+    SystemVersion:
+      properties:
+        version:
+          type: string
+          title: Version
+          description: The running release. Stamped into the image at build time;
+            read from the repo-root VERSION file on a source checkout; the literal
+            string 'unknown' when neither declared one. Never a placeholder version
+            number.
+        revision:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Revision
+          description: The commit this build came from, or null when the build was
+            not stamped.
+        environment:
+          type: string
+          title: Environment
+          description: The deployment's configured environment name.
+        schema_migrations:
+          $ref: '#/components/schemas/SchemaMigrationState'
+      type: object
+      required:
+      - version
+      - revision
+      - environment
+      - schema_migrations
+      title: SystemVersion
     TAXIICollection:
       properties:
         id:
@@ -42854,14 +43380,6 @@ components:
           title: Sla Due At
       type: object
       title: UpdateCaseRequest
-    UpdateChannel:
-      type: string
-      enum:
-      - stable
-      - beta
-      - nightly
-      - manual
-      title: UpdateChannel
     UpdateConnectorRequest:
       properties:
         name:

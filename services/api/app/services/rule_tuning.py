@@ -33,13 +33,14 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from fastapi import HTTPException, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.deps import AuthUser
 from app.models.detection_rule import DetectionRule
 from app.services.audit import emit_audit
+from app.services.builtin_rules import builtin_by_uuid
 
 # ─── Tuning heuristics ───────────────────────────────────────────────────────
 #
@@ -194,6 +195,27 @@ class ApplyTuningRequest(BaseModel):
         max_length=255,
         description="Free-text reason recorded with the suppression placeholder.",
     )
+    suppress_when: dict[str, list[str]] | None = Field(
+        default=None,
+        description="Field values that suppress matching events for this rule.",
+    )
+
+    @field_validator("note", "suppression_reason", "suppress_when")
+    @classmethod
+    def _reject_nul(cls, value: object) -> object:
+        if _contains_nul(value):
+            raise ValueError("cannot contain a NUL character")
+        return value
+
+
+def _contains_nul(value: object) -> bool:
+    if isinstance(value, str):
+        return "\x00" in value
+    if isinstance(value, dict):
+        return any(_contains_nul(key) or _contains_nul(item) for key, item in value.items())
+    if isinstance(value, list):
+        return any(_contains_nul(item) for item in value)
+    return False
 
 
 class DismissTuningRequest(BaseModel):
@@ -532,10 +554,12 @@ async def _load_rule_for_tenant(
     # exists, it just isn't tuneable from here) and another tenant's rule is
     # a 404 (it must not be distinguishable from absent).
     result = await db.execute(
-        select(DetectionRule).where(
+        select(DetectionRule)
+        .where(
             DetectionRule.id == rule_id,
             or_(DetectionRule.tenant_id == tenant_id, DetectionRule.tenant_id.is_(None)),
         )
+        .with_for_update()
     )
     rule = result.scalar_one_or_none()
     if rule is None:
@@ -550,8 +574,50 @@ async def _load_rule_for_tenant(
     return rule
 
 
-def _bumped_threshold(current: dict[str, Any], override: int | None) -> tuple[dict[str, Any], int, int]:
-    """Return (new_config, old_threshold, new_threshold)."""
+_SEVERITY_LADDER = ("info", "low", "medium", "high", "critical")
+
+
+def _raised_min_severity(*values: object) -> str | None:
+    ranks: list[int] = []
+    for value in values:
+        if isinstance(value, str):
+            key = value.strip().lower()
+            if key in _SEVERITY_LADDER:
+                ranks.append(_SEVERITY_LADDER.index(key))
+    if not ranks:
+        return None
+    return _SEVERITY_LADDER[min(max(ranks) + 1, len(_SEVERITY_LADDER) - 1)]
+
+
+def _string_list(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    if value is None:
+        return []
+    return [str(value)]
+
+
+def _merged_suppress_when(current: dict[str, Any], incoming: dict[str, list[str]]) -> dict[str, list[str]]:
+    merged: dict[str, list[str]] = {}
+    raw = current.get("suppress_when")
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            merged[str(key)] = _string_list(value)
+    for key, values in incoming.items():
+        bucket = merged.setdefault(str(key), [])
+        for item in _string_list(values):
+            if item not in bucket:
+                bucket.append(item)
+    return merged
+
+
+def _bumped_threshold(
+    current: dict[str, Any],
+    override: int | None,
+    *,
+    rule_severity: str | None,
+    corpus_severity: str | None = None,
+) -> tuple[dict[str, Any], int, int]:
     next_config = dict(current)
     raw_existing = current.get("event_threshold") or current.get("threshold")
     try:
@@ -561,6 +627,9 @@ def _bumped_threshold(current: dict[str, Any], override: int | None) -> tuple[di
     new_value = override if override is not None else max(existing + 1, 2)
     next_config["event_threshold"] = new_value
     next_config["last_raised_at"] = datetime.now(UTC).isoformat()
+    floor = _raised_min_severity(rule_severity, corpus_severity, current.get("min_severity"))
+    if floor is not None:
+        next_config["min_severity"] = floor
     return next_config, existing, new_value
 
 
@@ -569,10 +638,8 @@ def _appended_suppression(
     *,
     reason: str | None,
     actor_email: str | None,
+    suppress_when: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
-    """Append a placeholder suppression record. The real suppression engine
-    interprets ``suppression_config.rules`` — this just gives it a starting
-    point that analysts can refine."""
     next_config = dict(current)
     rules_list = list(next_config.get("rules") or [])
     rules_list.append(
@@ -585,6 +652,8 @@ def _appended_suppression(
     )
     next_config["rules"] = rules_list
     next_config["last_tuned_at"] = datetime.now(UTC).isoformat()
+    if suppress_when is not None:
+        next_config["suppress_when"] = _merged_suppress_when(current, suppress_when)
     return next_config
 
 
@@ -635,9 +704,19 @@ async def apply_tuning(
     changes_payload: dict[str, Any] = {"action": body.action}
 
     if body.action == "raise_threshold":
+        catalogue_rule = builtin_by_uuid(rule.id, actor.tenant_id)
+        corpus_severity = None if catalogue_rule is None else catalogue_rule.severity
+        current_threshold = _threshold_config(rule)
+        if _raised_min_severity(rule.severity, corpus_severity) is None:
+            raise HTTPException(
+                status_code=422,
+                detail="rule severity is outside info, low, medium, high, critical",
+            )
         next_threshold, old_value, new_value = _bumped_threshold(
-            _threshold_config(rule),
+            current_threshold,
             body.threshold,
+            rule_severity=rule.severity,
+            corpus_severity=corpus_severity,
         )
         rule.threshold_config = next_threshold
         changes_payload["threshold"] = {"before": old_value, "after": new_value}
@@ -647,6 +726,7 @@ async def apply_tuning(
             _suppression_config(rule),
             reason=body.suppression_reason or body.note,
             actor_email=actor.email,
+            suppress_when=body.suppress_when,
         )
         changes_payload["suppression_reason"] = body.suppression_reason or body.note
 
