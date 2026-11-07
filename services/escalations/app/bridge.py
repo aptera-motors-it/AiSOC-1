@@ -156,6 +156,15 @@ def save_state(state: dict) -> None:
     os.replace(tmp, STATE_FILE)
 
 
+def _persist(state: dict) -> None:
+    state.pop("_dirty", None)
+    try:
+        save_state(state)
+    except Exception as exc:
+        state["_dirty"] = True
+        log(f"ERROR saving escalation state: {type(exc).__name__}: {exc}")
+
+
 # --- IO ----------------------------------------------------------------------
 def post(url: str, payload: dict) -> int:
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}, method="POST")
@@ -222,28 +231,40 @@ def pipeline_health(cur) -> str:
 # --- main loop ---------------------------------------------------------------
 def tick(state: dict) -> None:
     now = datetime.now(UTC)
-    with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
-        cur = conn.cursor()
-        for case in fetch_unacked(cur, "critical"):
-            nag_d = state["escalations"].get(case.id)
-            nag = NagState(**nag_d) if nag_d else None
-            if not should_escalate_critical(case, nag, now):
-                continue
-            nag = nag or NagState()
-            age = (now - case.opened_at).total_seconds() / 60
-            code = post(TEAMS_URL, crit_payload(case, age, nag.count + 1))
-            log(f"critical escalation {case.ref} HTTP {code}")
-            nag.count += 1
-            nag.last = now.isoformat()
-            state["escalations"][case.id] = nag.__dict__
+    try:
+        with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
+            cur = conn.cursor()
+            for case in fetch_unacked(cur, "critical"):
+                nag_d = state["escalations"].get(case.id)
+                nag = NagState(**nag_d) if nag_d else None
+                if not should_escalate_critical(case, nag, now):
+                    continue
+                nag = nag or NagState()
+                age = (now - case.opened_at).total_seconds() / 60
+                try:
+                    code = post(TEAMS_URL, crit_payload(case, age, nag.count + 1))
+                except Exception as exc:
+                    log(f"ERROR critical escalation {case.ref}: {type(exc).__name__}: {exc}")
+                    continue
+                log(f"critical escalation {case.ref} HTTP {code}")
+                nag.count += 1
+                nag.last = now.isoformat()
+                state["escalations"][case.id] = nag.__dict__
+                _persist(state)
 
-        if should_send_digest(state.get("digest_last", ""), now):
-            highs = fetch_unacked(cur, "high")
-            if highs:
-                code = post(TEAMS_URL, digest_payload(highs, pipeline_health(cur), now))
-                log(f"daily digest HTTP {code} highs={len(highs)}")
-            state["digest_last"] = now.strftime("%Y-%m-%d")
-    save_state(state)
+            if should_send_digest(state.get("digest_last", ""), now):
+                try:
+                    highs = fetch_unacked(cur, "high")
+                    if highs:
+                        code = post(TEAMS_URL, digest_payload(highs, pipeline_health(cur), now))
+                        log(f"daily digest HTTP {code} highs={len(highs)}")
+                    state["digest_last"] = now.strftime("%Y-%m-%d")
+                    _persist(state)
+                except Exception as exc:
+                    log(f"ERROR digest: {type(exc).__name__}: {exc}")
+    finally:
+        if state.get("_dirty"):
+            _persist(state)
 
 
 def main() -> None:
