@@ -106,7 +106,9 @@
       "tinypool": ">=2.1.1",
       "proxy-addr": ">=2.0.8",
       "glob@>=9.0.0": ">=14.0.2",
-      "minimatch@>=9.0.0": ">=11.0.1"
+      "minimatch": "link:packages/minimatch-cjs-compat",
+      "minimatch@>=9.0.0": ">=11.0.1",
+      "nyc>test-exclude": "7.0.2"
     }
   }
 }
