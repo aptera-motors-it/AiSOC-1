@@ -24,9 +24,12 @@ quietly.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import time
 import uuid
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
@@ -107,6 +110,105 @@ async def test_two_concurrent_workers_take_one_claim_between_them(redis):  # noq
     hits_b = await worker_b.evaluate(_auth_fail(tenant, "2026-10-27T12:00:05Z"), event_id="evt-5")
 
     assert len(hits_a) + len(hits_b) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_crossing_re_delivered_inside_a_dead_workers_lease_still_fires(redis):  # noqa: ANN001
+    """A committed threshold crossing has an alert.
+
+    The worker that crossed the threshold died between the claim and the
+    database, so nothing released the claim. Its offset never committed, so
+    Kafka hands the same record to the restarted worker inside the lease. If
+    that delivery finds the slot taken and returns nothing, the consumer
+    commits the offset and no later delivery exists to recover the alert.
+    """
+    dead = WindowedDetectionEngine(redis, rules=(_RULE,))
+    tenant = str(uuid.uuid4())
+    await _drive_to_threshold(dead, tenant)
+    crossing = _auth_fail(tenant, "2026-10-27T12:00:04Z")
+    assert len(await dead.evaluate(crossing, event_id="evt-4")) == 1
+
+    restarted = WindowedDetectionEngine(redis, rules=(_RULE,))
+    hits = await restarted.evaluate(crossing, event_id="evt-4")
+
+    assert len(hits) == 1, "a re-delivery of the crossing event must recover its hit, not commit past it"
+    await restarted.confirm(hits[0])
+    assert await redis.get(hits[0].claim_key) == FIRED_CONFIRMED, "the recovered hit must be able to resolve the claim"
+
+
+@pytest.mark.asyncio
+async def test_a_re_delivery_late_in_the_lease_still_has_time_to_confirm(redis):  # noqa: ANN001
+    """The recovered hit gets a whole lease, not what the dead worker left.
+
+    The re-delivery waits out the consumer group's session timeout, which can
+    leave it near the end of the lease. Inheriting the remainder lets the
+    claim expire while the alert is persisted, the confirm finds nothing to
+    promote, and the window is open to a second alert.
+    """
+    dead = WindowedDetectionEngine(redis, rules=(_RULE,))
+    tenant = str(uuid.uuid4())
+    await _drive_to_threshold(dead, tenant)
+    crossing = _auth_fail(tenant, "2026-10-27T12:00:04Z")
+    key = (await dead.evaluate(crossing, event_id="evt-4"))[0].claim_key
+    await redis.pexpire(key, 100)
+
+    restarted = WindowedDetectionEngine(redis, rules=(_RULE,))
+    hits = await restarted.evaluate(crossing, event_id="evt-4")
+    assert len(hits) == 1
+    await asyncio.sleep(0.2)
+    await restarted.confirm(hits[0])
+
+    assert await redis.get(key) == FIRED_CONFIRMED, "a claim resumed late in its lease must survive until its confirm"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_re_delivery_cannot_free_a_claim_another_delivery_will_confirm(redis):  # noqa: ANN001
+    """One crossing, one alert, even with two deliveries of it in flight.
+
+    A consumer rebalance can hand the crossing record to a second worker
+    while the first is still persisting. Both resume the claim. If the second
+    fails and its release frees the slot, a different event claims it before
+    the first confirms, and the window gets two alerts.
+    """
+    first = WindowedDetectionEngine(redis, rules=(_RULE,))
+    second = WindowedDetectionEngine(redis, rules=(_RULE,))
+    tenant = str(uuid.uuid4())
+    await _drive_to_threshold(first, tenant)
+    crossing = _auth_fail(tenant, "2026-10-27T12:00:04Z")
+    hit = (await first.evaluate(crossing, event_id="evt-4"))[0]
+    await second.release((await second.evaluate(crossing, event_id="evt-4"))[0])
+
+    assert await second.evaluate(_auth_fail(tenant, "2026-10-27T12:00:05Z"), event_id="evt-5") == []
+    await first.confirm(hit)
+    assert await redis.get(hit.claim_key) == FIRED_CONFIRMED
+
+
+@pytest.mark.asyncio
+async def test_a_re_delivery_without_an_event_time_lands_where_the_first_did(redis, monkeypatch):  # noqa: ANN001
+    """Arrival time is when ingest stamped the record, not when a worker read it.
+
+    By the worker's clock the re-delivery arrives a minute later, its window
+    slides past the oldest of the five failures, and the crossing it already
+    claimed no longer counts to the threshold.
+    """
+    clock = [0.0]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    engine = WindowedDetectionEngine(redis, rules=(_RULE,))
+    tenant = str(uuid.uuid4())
+    start = datetime(2026, 10, 27, 12, tzinfo=UTC)
+
+    def arrived(n: int) -> dict:
+        stamp = start + timedelta(seconds=150 * n)
+        clock[0] = stamp.timestamp() + 1
+        raw = {"event_type": "authentication", "outcome": "failure", "user": "alice"}
+        return {"tenant_id": tenant, "ocsf_event": {"tenant_uid": tenant, "ingest_time": stamp.isoformat(), "raw_data": json.dumps(raw)}}
+
+    hits = [len(await engine.evaluate(arrived(n), event_id=f"evt-{n}")) for n in range(5)]
+    assert hits == [0, 0, 0, 0, 1]
+    crossing = arrived(4)
+    clock[0] += 60
+
+    assert len(await engine.evaluate(crossing, event_id="evt-4")) == 1
 
 
 @pytest.mark.asyncio

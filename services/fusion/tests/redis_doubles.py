@@ -26,7 +26,7 @@ from typing import Any
 
 
 class FakeRedis:
-    """Sorted sets, string keys with NX/EX, and the engine's two Lua scripts."""
+    """Sorted sets, string keys with NX/EX, and the engine's three Lua scripts."""
 
     def __init__(self) -> None:
         self.zsets: dict[str, dict[str, float]] = {}
@@ -84,13 +84,22 @@ class FakeRedis:
         from app.services import windowed_detection as wd  # noqa: PLC0415 — avoids an import cycle at module load
 
         key, token = args[0], args[1]
+        if script == wd._CLAIM_FOR_EVENT:  # noqa: SLF001
+            held = self.strings.get(key)
+            if held is None:
+                self.strings[key] = token
+                return 1
+            if held in (token, f"r:{token}"):
+                self.strings[key] = f"r:{token}"
+                return 1
+            return 0
         if script == wd._RELEASE_IF_OWNER:  # noqa: SLF001
             if self.strings.get(key) == token:
                 del self.strings[key]
                 return 1
             return 0
         if script == wd._CONFIRM_IF_OWNER:  # noqa: SLF001
-            if self.strings.get(key) == token:
+            if self.strings.get(key) in (token, f"r:{token}"):
                 self.strings[key] = args[2]
                 return 1
             return 0

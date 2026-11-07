@@ -51,8 +51,9 @@ never landed. Simply moving the write after the database would have swapped
 one race for another — two workers both crossing the threshold before either
 had written anything — so the claim is taken atomically up front and only its
 *resolution* waits for the database. A worker that dies mid-handoff releases
-nothing, and the lease ages out: the alert is delayed by the lease rather
-than suppressed for the window.
+nothing. The claim belongs to the event rather than the worker, so the
+re-delivery of that record takes it back; the lease ages out for any other
+event.
 
 Event time, late arrival and backfill
 -------------------------------------
@@ -200,12 +201,30 @@ FIRE_CLAIM_SECONDS = 60
 #: the claim's lease.
 FIRED_CONFIRMED = "1"
 
-#: Promote this worker's claim to the window-long marker, and only this
-#: worker's. A plain SET would overwrite a claim another worker took after
-#: ours expired, confirming an alert that worker has not persisted yet.
+#: Promote this event's claim to the window-long marker, bare or resumed. A
+#: plain SET would overwrite a claim another event took after ours expired,
+#: confirming an alert that event has not persisted yet.
 _CONFIRM_IF_OWNER = """
-if redis.call('get', KEYS[1]) == ARGV[1] then
+local held = redis.call('get', KEYS[1])
+if held == ARGV[1] or held == 'r:' .. ARGV[1] then
   return redis.call('set', KEYS[1], ARGV[2], 'EX', ARGV[3])
+end
+return 0
+"""
+
+#: Take the fire slot when free or already held by this event, with a fresh
+#: lease either way. The owner is the event, not the delivery. A resumed
+#: claim is ``r:<identity>``: release matches only the bare identity, so no
+#: delivery can free a claim another delivery resumed.
+_CLAIM_FOR_EVENT = """
+local held = redis.call('get', KEYS[1])
+if not held then
+  redis.call('set', KEYS[1], ARGV[1], 'EX', ARGV[2])
+  return 1
+end
+if held == ARGV[1] or held == 'r:' .. ARGV[1] then
+  redis.call('set', KEYS[1], 'r:' .. ARGV[1], 'EX', ARGV[2])
+  return 1
 end
 return 0
 """
@@ -414,8 +433,8 @@ class WindowedHit(DetectionHit):
 
     #: Redis key holding the claim. Empty for a hit that took none.
     claim_key: str = ""
-    #: This worker's token for that key, checked before confirm or release so
-    #: one worker cannot resolve another's claim.
+    #: The claiming event's identity, checked before confirm or release so
+    #: one event cannot resolve another's claim.
     claim_token: str = ""
 
 
@@ -604,9 +623,10 @@ class WindowedDetectionEngine:
             privileged = overlay.derived_identity_fields(fields)
             if privileged:
                 fields = {**fields, **privileged}
-        now = time.time()
+        stamped = parse_event_time({"ingest_time": ocsf.get("ingest_time")})
+        arrived = stamped.timestamp() if stamped is not None else time.time()
         identity = self._event_identity(message, event_id=event_id, topic=topic, partition=partition, offset=offset)
-        when = self._event_seconds(fields, now)
+        when = self._event_seconds(fields, arrived)
         hits: list[DetectionHit] = []
         for rule in self._rules:
             try:
@@ -655,7 +675,7 @@ class WindowedDetectionEngine:
             token = uuid.uuid4().hex
             for sequence in self._sequences:
                 try:
-                    hit = await self._advance_sequence(sequence, tenant, fields, now, token)
+                    hit = await self._advance_sequence(sequence, tenant, fields, arrived, token)
                     if hit is not None:
                         hits.append(hit)
                 except Exception as exc:  # noqa: BLE001 — same fail-soft contract
@@ -774,7 +794,7 @@ class WindowedDetectionEngine:
     ) -> tuple[str, str] | None:
         """Record this observation and, on a threshold crossing, claim the fire.
 
-        Returns ``(claim_key, claim_token)`` for the worker that owns the
+        Returns ``(claim_key, claim_token)`` for the event that owns the
         fire, or ``None``. Owning the claim is a promise to call
         :meth:`confirm` or :meth:`release`.
         """
@@ -825,7 +845,6 @@ class WindowedDetectionEngine:
         # in the same bucket and meet the same marker.
         bucket = int(when // rule.window_seconds)
         fired_key = f"{key}:fired:{bucket}"
-        token = uuid.uuid4().hex
         # A claim, not a flag. The old code wrote the full-window marker
         # here -- before the hit existed and long before anything was
         # persisted -- so a persistence failure, which is exactly what the
@@ -833,10 +852,9 @@ class WindowedDetectionEngine:
         # nothing. Taking the claim atomically up front is also what stops
         # two workers both firing; moving the write after the database would
         # have traded this race for that one.
-        claimed = await self._redis.set(fired_key, token, nx=True, ex=FIRE_CLAIM_SECONDS)
-        if not claimed:
+        if not await self._redis.eval(_CLAIM_FOR_EVENT, 1, fired_key, identity, FIRE_CLAIM_SECONDS):
             return None
-        return fired_key, token
+        return fired_key, identity
 
     async def confirm(self, hit: DetectionHit) -> None:
         """Promote a claim to the window-long cooldown: the alert is durable.

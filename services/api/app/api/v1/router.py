@@ -87,6 +87,7 @@ from app.api.v1.endpoints import (
     replay,
     report_builder,
     reports,
+    response_schedule,
     retro_hunts,
     rule_tuning,
     sandbox,
@@ -98,12 +99,14 @@ from app.api.v1.endpoints import (
     software_inventory,
     sso_connections,
     stix_taxii,
+    system,
     taxii,
     tenant_provision,
     tenant_skills,
     tenants,
     threat_intel,
     translation,
+    triage_questions,
     usage,
     verification_policies,
     waitlist,
@@ -297,6 +300,8 @@ api_router.include_router(feedback.router)
 
 # Configurable autonomy guardrails — three-tier per-action confidence (Tier 1.3)
 api_router.include_router(autonomy_policy.router)
+api_router.include_router(response_schedule.router)
+api_router.include_router(triage_questions.router)
 
 # Business Context Rules — Track 3, T3.5 (v8.0 parallel team plan).
 # YAML rule engine that mutates fused alerts (severity bump, route, suppress,
@@ -386,6 +391,11 @@ api_router.include_router(stix_taxii.router)
 
 # Deployment configuration and air-gap bundle management
 api_router.include_router(deployment.router)
+
+# What is actually running here: the build, the commit, and whether the live
+# schema matches the migrations this build ships. The route the upgrade
+# runbook has always told operators to check.
+api_router.include_router(system.router)
 
 # Fusion gateway: proxies to services/fusion when FUSION_URL is set, otherwise
 # returns graceful empty payloads so the analyst console renders cleanly.
