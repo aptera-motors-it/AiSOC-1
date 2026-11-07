@@ -43,6 +43,8 @@
 #     the only things bound, and they bind to loopback unless you set
 #     AISOC_BIND_ADDR deliberately (put a TLS-terminating proxy in front —
 #     see docs/runbooks/HARDENING.md section 2).
+#   * Every service carries memory and pid ceilings under
+#     `deploy.resources.limits`. See `scripts/production_compose_resource_limits.py`.
 #
 # WHAT IT DOES NOT DO
 #
@@ -73,6 +75,11 @@ services:
   # exists that the preflight never sees.
   # ---------------------------------------------------------------------------
   preflight-secrets:
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          pids: 256
     image: ghcr.io/beenuar/aisoc-core-api:${AISOC_VERSION:-latest}
     pull_policy: missing
     container_name: aisoc-preflight-secrets
@@ -111,6 +118,11 @@ services:
   # appending to it.
   # ---------------------------------------------------------------------------
   postgres:
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          pids: 1024
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -124,6 +136,11 @@ services:
       AISOC_APP_DB_PASSWORD: ${AISOC_APP_DB_PASSWORD:?set AISOC_APP_DB_PASSWORD — the development default is a published literal}
 
   redis:
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          pids: 512
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -131,6 +148,11 @@ services:
     restart: unless-stopped
 
   zookeeper:
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          pids: 2048
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -138,6 +160,11 @@ services:
     restart: unless-stopped
 
   kafka:
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+          pids: 4096
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -145,6 +172,11 @@ services:
     restart: unless-stopped
 
   qdrant:
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          pids: 512
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -158,6 +190,11 @@ services:
   # lives, which is the defect this file exists to make impossible.
   # ---------------------------------------------------------------------------
   api:
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          pids: 512
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -211,6 +248,11 @@ services:
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET — signs SAML/OIDC sessions; the same value ingest-worker takes below}
 
   ingest-worker:
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          pids: 512
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -230,6 +272,11 @@ services:
       AISOC_NEO4J_PASSWORD: ${NEO4J_PASSWORD:?set NEO4J_PASSWORD}
 
   fusion:
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          pids: 512
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -242,6 +289,11 @@ services:
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD}
 
   agents:
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          pids: 512
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -258,6 +310,11 @@ services:
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:?set NEO4J_PASSWORD}
 
   actions:
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          pids: 512
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -272,6 +329,11 @@ services:
       AISOC_ACTIONS_SERVICE_TOKEN: ${AISOC_ACTIONS_SERVICE_TOKEN:?set AISOC_ACTIONS_SERVICE_TOKEN}
 
   connectors:
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+          pids: 512
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -285,6 +347,11 @@ services:
       SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY}
 
   threatintel:
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          pids: 512
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -296,6 +363,11 @@ services:
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:?set NEO4J_PASSWORD}
 
   realtime:
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          pids: 512
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -309,6 +381,11 @@ services:
       REALTIME_INTERNAL_TOKEN: ${REALTIME_INTERNAL_TOKEN:?set REALTIME_INTERNAL_TOKEN — run `make env` to generate it}
 
   litellm:
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          pids: 512
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -316,6 +393,11 @@ services:
     restart: unless-stopped
 
   ollama:
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          pids: 4096
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -327,6 +409,11 @@ services:
   # and a single service that starts ahead of the credential check is the hole
   # the check exists to close.
   ollama-pull:
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          pids: 256
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -339,6 +426,11 @@ services:
   # credential in the request (no static key — `check_mcp_over_http.py`
   # enforces that), so the credential check still gates its start.
   mcp:
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          pids: 512
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -348,6 +440,11 @@ services:
   # The console. Demo mode is inlined at build time by Next, so this asserts
   # the runtime side only; pull the `latest` tag rather than a `-demo` one.
   web:
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          pids: 512
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -364,6 +461,11 @@ services:
   # on the services that dial them so the two cannot disagree.
   # ---------------------------------------------------------------------------
   neo4j:
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          pids: 2048
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -373,6 +475,11 @@ services:
       NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?set NEO4J_PASSWORD — required for the full profile}
 
   clickhouse:
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          pids: 2048
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -382,6 +489,11 @@ services:
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD — required for the full profile}
 
   opensearch:
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          pids: 2048
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -393,6 +505,11 @@ services:
   # so it is moved onto a profile nothing here activates: `--profile full` no
   # longer starts it. An operator who wants it can still ask for it by name.
   kafka-ui:
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          pids: 512
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -413,6 +530,11 @@ services:
   # for debugging, or publish one deliberately in a local override.
   # ---------------------------------------------------------------------------
   alertmanager:
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          pids: 512
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -420,12 +542,22 @@ services:
     restart: unless-stopped
 
   enrichment:
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          pids: 512
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
     ports: !reset []
 
   honeytokens:
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          pids: 512
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -435,17 +567,32 @@ services:
   # file, so nothing to reset; it only needs to wait for the credential
   # preflight like every other service.
   escalations:
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          pids: 512
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
 
   osquery-tls:
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          pids: 512
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
     ports: !reset []
 
   otel-collector:
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          pids: 512
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -453,6 +600,11 @@ services:
     restart: unless-stopped
 
   prometheus:
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          pids: 512
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -460,18 +612,33 @@ services:
     restart: unless-stopped
 
   purple-team:
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          pids: 512
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
     ports: !reset []
 
   slack-bot:
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          pids: 512
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
     ports: !reset []
 
   teams-bot:
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          pids: 512
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -482,6 +649,11 @@ services:
     ports: !reset []
 
   tempo:
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          pids: 512
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -489,6 +661,11 @@ services:
     restart: unless-stopped
 
   ueba:
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          pids: 512
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
@@ -500,6 +677,11 @@ services:
   # `--profile monitoring` cannot start a dashboard over production telemetry
   # on a password printed in its own documentation.
   grafana:
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          pids: 512
     depends_on:
       preflight-secrets:
         condition: service_completed_successfully
