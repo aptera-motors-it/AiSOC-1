@@ -33,6 +33,7 @@ import asyncio
 import contextlib
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any, Literal
 
 import structlog
@@ -47,6 +48,14 @@ from app.services.timer_store import InMemoryTimerStore, TimerRecord, TimerStore
 log = structlog.get_logger(__name__)
 
 SafeDefault = Literal["rejected", "approved"]
+
+
+@dataclass(frozen=True)
+class SuspendedDeadline:
+    """Suspend token; ``epoch`` must still be the open generation for resume."""
+
+    record: TimerRecord
+    epoch: int
 
 
 class ApprovalTimeoutScheduler:
@@ -82,6 +91,11 @@ class ApprovalTimeoutScheduler:
         # behaviour); production injects a PostgresTimerStore.
         self._store: TimerStore = store or InMemoryTimerStore()
         self._timers: dict[str, asyncio.Task[None]] = {}
+        self._records: dict[str, TimerRecord] = {}
+        self._epoch: dict[str, int] = {}
+        self._open_epoch: dict[str, int] = {}
+        # Set once a woken timer claims the decision, before the actions HTTP call.
+        self._claimed_by_timeout: set[str] = set()
 
     @property
     def pending(self) -> int:
@@ -109,6 +123,9 @@ class ApprovalTimeoutScheduler:
         existing = self._timers.get(action_id)
         if existing is not None and not existing.done():
             existing.cancel()
+        self._epoch[action_id] = self._epoch.get(action_id, 0) + 1
+        self._open_epoch.pop(action_id, None)
+        self._claimed_by_timeout.discard(action_id)
 
         # Phase B3 — persist the pending timer so a restart can recover it.
         # Best-effort: a store failure never blocks arming the in-memory timer.
@@ -120,6 +137,7 @@ class ApprovalTimeoutScheduler:
             channel=channel,
             approver_id=approver_id,
         )
+        self._records[action_id] = record
         asyncio.create_task(self._store.put(record))  # noqa: RUF006 — fire-and-forget persist
 
         async def _fire() -> None:
@@ -127,6 +145,11 @@ class ApprovalTimeoutScheduler:
                 await asyncio.sleep(timeout_seconds)
             except asyncio.CancelledError:
                 return
+            # Stale wake after schedule/cancel/suspend replaced this generation.
+            if self._records.get(action_id) is not record:
+                return
+            del self._records[action_id]
+            self._claimed_by_timeout.add(action_id)
             # The timer fired — drop the durable row so recovery won't re-arm it.
             with contextlib.suppress(Exception):
                 await self._store.delete(action_id)
@@ -185,6 +208,10 @@ class ApprovalTimeoutScheduler:
         """
         # Human decided in time (or explicit cancel) — drop the durable row so a
         # restart won't resurrect a timer for an already-decided action.
+        self._epoch[action_id] = self._epoch.get(action_id, 0) + 1
+        self._open_epoch.pop(action_id, None)
+        self._records.pop(action_id, None)
+        self._claimed_by_timeout.discard(action_id)
         asyncio.create_task(self._store.delete(action_id))  # noqa: RUF006 — fire-and-forget
 
         existing = self._timers.pop(action_id, None)
@@ -192,6 +219,44 @@ class ApprovalTimeoutScheduler:
             return False
         existing.cancel()
         return True
+
+    def claimed_by_timeout(self, action_id: str) -> bool:
+        """True once the woken timer has claimed the decision (before actions HTTP)."""
+        return action_id in self._claimed_by_timeout
+
+    def suspend(self, action_id: str) -> SuspendedDeadline | None:
+        """Leave the durable row; cancel only the in-memory sleep."""
+        if action_id in self._claimed_by_timeout:
+            return None
+        record = self._records.get(action_id)
+        task = self._timers.get(action_id)
+        if record is None or task is None or task.done():
+            return None
+        epoch = self._epoch.get(action_id, 0)
+        self._open_epoch[action_id] = epoch
+        self._timers.pop(action_id, None)
+        task.cancel()
+        return SuspendedDeadline(record, epoch)
+
+    def resume(self, suspended: SuspendedDeadline) -> asyncio.Task[None] | None:
+        """Re-arm remaining time only while this suspend is still the open generation."""
+        action_id = suspended.record.action_id
+        if self._open_epoch.get(action_id) != suspended.epoch:
+            return None
+        if suspended.epoch != self._epoch.get(action_id):
+            return None
+        self._open_epoch.pop(action_id, None)
+        record = suspended.record
+        remaining = max(0.0, record.fire_at_epoch - time.time())
+        safe_default: SafeDefault = "approved" if record.safe_default == "approved" else "rejected"
+        return self.schedule(
+            record.action_id,
+            timeout_seconds=remaining,
+            safe_default=safe_default,
+            case_id=record.case_id,
+            channel=record.channel,
+            approver_id=record.approver_id,
+        )
 
     async def recover(self) -> int:
         """Re-arm timers from the durable store after a restart.
@@ -240,3 +305,7 @@ class ApprovalTimeoutScheduler:
                 # reference.
                 _ = await task
         self._timers.clear()
+        self._records.clear()
+        self._epoch.clear()
+        self._open_epoch.clear()
+        self._claimed_by_timeout.clear()

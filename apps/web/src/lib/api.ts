@@ -3063,11 +3063,21 @@ export interface FunnelMetrics {
   events_of_interest: number;
   correlation_instances: number;
   alerts_generated: number;
-  /** 0..1 ratio: 1 − (FP / total dispositioned alerts). */
+  /** 0..1 ratio: true positives / alerts with a *decided* verdict. */
   signal_to_noise: number;
   /** Mean time-to-detect in seconds (Alert.created_at → first_seen_at). */
   mttd_seconds: number;
-  /** Active alerts owned by analysts (`status in new/triaging/in_progress`). */
+  /**
+   * The denominator behind each figure above. Zero means unmeasured, not
+   * zero: the server sends `0.0` for both rather than `null` (a breaking
+   * change for every existing client), so the pair *is* the measurement.
+   * Read them together or the tile claims a perfect signal/noise ratio and
+   * instant detection for a tenant where nobody has looked at anything.
+   * Optional so the console still works against an API that predates them.
+   */
+  signal_to_noise_sample_count?: number;
+  mttd_sample_count?: number;
+  /** Alerts that are neither terminal nor dispositioned. */
   analyst_queue_depth: number;
   /** Alerts produced per correlation instance, clamped to [0, 1]. */
   correlation_efficiency: number;
@@ -3114,6 +3124,12 @@ export interface PipelineStage {
    * full instrumentation.
    */
   unmeasured?: string[];
+  /**
+   * What the stage observed when the observation is not a backlog. The
+   * correlate stage reported its single-event alert count under `backlog`,
+   * so the strip read "Backlog 7" on a tenant with nothing queued.
+   */
+  detail?: string | null;
 }
 
 export interface PipelineHealth {
@@ -3140,7 +3156,10 @@ export interface SOCKpis {
   alert_volume_7d: number;
   cases_opened_7d: number;
   cases_closed_7d: number;
+  /** Alerts a **human** dispositioned, from the lifecycle events carrying an actor. */
   analyst_overrides_7d: number;
+  /** The agent's own dispositions over the same window. */
+  ai_dispositions_7d?: number;
   /**
    * How many rows each mean above was averaged over. Zero means the figure is
    * unmeasured rather than zero — render "not measured", not "0.0 hrs".
@@ -3153,7 +3172,9 @@ export interface SOCKpis {
    * The denominator each rate above was computed over. Zero means the rate is
    * undefined rather than 0% — a tenant that has resolved nothing has not
    * achieved a 0% false-positive rate. Optional for the same reason as the
-   * sample counts.
+   * sample counts. The false-positive denominator counts *decided* verdicts
+   * only: `needs_review` is the agent declining to decide, and a rate that
+   * counts abstentions scores it on questions it refused to answer.
    */
   false_positive_rate_sample_count?: number;
   escalation_rate_sample_count?: number;
@@ -4017,7 +4038,28 @@ export const oauthApi = {
 
 // ─── Threat Intel ─────────────────────────────────────────────────────────────
 
-export type IndicatorType = "ip" | "domain" | "hash" | "url" | "email";
+/**
+ * The indicator kinds the console renders a badge for.
+ *
+ * `vulnerability` is in this list because it is what the one real feed a
+ * default install ships — the CISA KEV catalogue — emits, and leaving it
+ * out badged all 1,766 of its CVEs as IPs.
+ *
+ * The union is deliberately open. `type` arrives from a feed payload and
+ * the threat-intel service does not constrain it, so a closed union would
+ * be a claim about other people's data: a loader added tomorrow emits
+ * whatever it emits, and the console's job is to render that honestly
+ * rather than to coerce it into the nearest known value.
+ */
+export type KnownIndicatorType =
+  | "ip"
+  | "domain"
+  | "hash"
+  | "url"
+  | "email"
+  | "vulnerability";
+
+export type IndicatorType = KnownIndicatorType | (string & {});
 
 /**
  * A canonical threat indicator surfaced by the threatintel service.
@@ -4392,9 +4434,22 @@ export interface HuntHitWire {
 export interface HuntSearchWire {
   query: string;
   total: number;
-  took_ms: number;
+  /** `null` when no query ran. Never 0 for an unmeasured read. */
+  took_ms: number | null;
   hits: HuntHitWire[];
-  source?: "sample" | "live";
+  /**
+   * `live` — the tenant's event lake answered. `unavailable` — no query ran.
+   *
+   * The backend no longer emits `sample`: it used to return five fabricated
+   * CrowdStrike events unconditionally, and that generator is deleted.
+   * `sample` survives on {@link HuntResponse} because the console's own
+   * demo-gated fallback still constructs it client-side.
+   *
+   * Not optional. The handler sets it on every path — it used to carry a
+   * default, which is why this was `source?:` — and declaring it optional
+   * makes a caller guard a case the service cannot produce.
+   */
+  source: "live" | "unavailable";
   notice?: string | null;
 }
 
@@ -4424,8 +4479,13 @@ export interface HuntResponse {
    */
   tookMs: number | null;
   hits: HuntResult[];
-  /** `sample` means the backend generated illustrative events. */
-  source: "sample" | "live";
+  /**
+   * `live` — these hits came from the tenant's lake; zero of them is a
+   * result. `unavailable` — no query ran, and `notice` says why; zero hits
+   * is not a result and must not read as one. `sample` — the console's own
+   * demo-gated fallback, never the backend.
+   */
+  source: "sample" | "live" | "unavailable";
   notice: string | null;
 }
 
@@ -4463,8 +4523,10 @@ export function normalizeHuntResponse(raw: unknown): HuntResponse {
     hits,
     // A backend that did not say is not a backend that said "live". The
     // honesty marker defaults to the claim that costs nothing to be wrong
-    // about.
-    source: r.source === "live" ? "live" : "sample",
+    // about — and `unavailable` is carried through rather than collapsed
+    // into `sample`, because "we could not look" and "here are invented
+    // events" are different things to put in front of an analyst.
+    source: r.source === "live" ? "live" : r.source === "unavailable" ? "unavailable" : "sample",
     notice: typeof r.notice === "string" ? r.notice : null,
   };
 }
@@ -5947,6 +6009,12 @@ export interface ContextualStreamFrame {
   confidence?: number;
   /** Error frame. */
   error?: string;
+  /**
+   * Whether asking again could succeed. `false` means the deployment has no
+   * model configured, which no retry reaches — the frame used to say
+   * "Streaming failed. Please try again." for that case too.
+   */
+  retryable?: boolean;
 }
 
 export const contextualApi = {
@@ -6832,7 +6900,7 @@ export interface LlmCredentialView {
  * VRAM or a usable driver, so this is the outcome rather than the intent.
  */
 export interface LlmRuntime {
-  placement: "gpu" | "partial" | "cpu" | "unknown" | "unreachable" | "not_local";
+  placement: "gpu" | "partial" | "cpu" | "no_model" | "unknown" | "unreachable" | "not_local";
   detail: string;
   base_url: string;
   /** What an operator can do about the answer. Never empty for a CPU verdict. */

@@ -64,7 +64,7 @@ from app.interactions import (
 from app.notify import router as notify_router
 from app.services.aisoc_clients import AisocActionsClient, AisocApiClient
 from app.services.approval_audit import StructlogAuditSink
-from app.services.approval_timeout import ApprovalTimeoutScheduler
+from app.services.approval_timeout import ApprovalTimeoutScheduler, SuspendedDeadline
 from app.war_room import router as war_room_router
 
 # Configure structlog before anything else so module-level loggers
@@ -73,7 +73,11 @@ configure_logging()
 logger = structlog.get_logger("aisoc.slack_bot")
 
 
-def _build_bolt_app(api_client: AisocApiClient, actions_client: AisocActionsClient) -> AsyncApp:
+def _build_bolt_app(
+    api_client: AisocApiClient,
+    actions_client: AisocActionsClient,
+    timeout_scheduler: ApprovalTimeoutScheduler | None = None,
+) -> AsyncApp:
     """
     Construct the Bolt :class:`AsyncApp` and register every Slack handler.
 
@@ -98,11 +102,18 @@ def _build_bolt_app(api_client: AisocApiClient, actions_client: AisocActionsClie
         ignoring_self_events_enabled=True,
     )
 
+    # Refuse to build the app at all when signatures would not be verified on
+    # anything but an explicitly non-production environment. The warning below
+    # used to be the whole control, and a warning is a note about a
+    # deployment, not a thing that stops one (GHSA-vf98-8367-45mp, F02).
+    settings.require_signature_verification()
+
     if not settings.signature_verification_enabled:
         logger.warning(
             "slack_signing_secret_missing",
             note=(
-                "Bolt request-signature verification disabled — acceptable for local dev only. Set SLACK_SIGNING_SECRET before shipping."
+                "Bolt request-signature verification disabled — permitted only because ENVIRONMENT "
+                "names a development or test environment. Set SLACK_SIGNING_SECRET before shipping."
             ),
         )
     if not settings.SLACK_BOT_TOKEN:
@@ -150,6 +161,7 @@ def _build_bolt_app(api_client: AisocApiClient, actions_client: AisocActionsClie
             body=body,
             respond=respond,
             actions_client=actions_client,
+            timeout_scheduler=timeout_scheduler,
         )
 
     # ── Interactive: deny -----------------------------------------------------
@@ -161,6 +173,7 @@ def _build_bolt_app(api_client: AisocApiClient, actions_client: AisocActionsClie
             body=body,
             respond=respond,
             actions_client=actions_client,
+            timeout_scheduler=timeout_scheduler,
         )
 
     # ── Interactive: need-info -----------------------------------------------
@@ -172,6 +185,7 @@ def _build_bolt_app(api_client: AisocApiClient, actions_client: AisocActionsClie
             body=body,
             respond=respond,
             actions_client=actions_client,
+            timeout_scheduler=timeout_scheduler,
         )
 
     # ── Interactive: open-case link ------------------------------------------
@@ -195,6 +209,7 @@ async def _route_action_decision(
     body: dict,
     respond,
     actions_client: AisocActionsClient,
+    timeout_scheduler: ApprovalTimeoutScheduler | None = None,
 ) -> None:
     """
     Pull the routing value out of the Slack ``block_actions`` payload and
@@ -216,6 +231,19 @@ async def _route_action_decision(
         first = actions[0] or {}
         button_value = first.get("value") or ""
 
+    action_id = button_value.split("|", 1)[0].strip()
+    suspended: SuspendedDeadline | None = None
+    if timeout_scheduler is not None and event_action_id in {APPROVE_ACTION_ID, DENY_ACTION_ID} and action_id:
+        if timeout_scheduler.claimed_by_timeout(action_id):
+            await respond(
+                {
+                    "response_type": "ephemeral",
+                    "text": "⏱️ This approval already timed out.",
+                }
+            )
+            return
+        suspended = timeout_scheduler.suspend(action_id)
+
     try:
         payload = await handle_action_decision(
             action_id_event=event_action_id,
@@ -232,6 +260,10 @@ async def _route_action_decision(
             "response_type": "ephemeral",
             "text": f"⚠️ Internal error: {exc}",
         }
+    if timeout_scheduler is not None and action_id and payload.get("replace_original"):
+        timeout_scheduler.cancel(action_id)
+    elif suspended is not None and timeout_scheduler is not None:
+        timeout_scheduler.resume(suspended)
     await respond(payload)
 
 
@@ -251,7 +283,6 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     api_client = AisocApiClient.from_settings()
     actions_client = AisocActionsClient.from_settings()
-    bolt_app = _build_bolt_app(api_client, actions_client)
 
     # The timeout scheduler is shared across the process — one task per
     # pending approval so a forgotten Approve/Deny can't leave the action
@@ -283,6 +314,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         audit_sink=StructlogAuditSink(),
         store=timer_store,
     )
+    bolt_app = _build_bolt_app(api_client, actions_client, timeout_scheduler)
     # Re-arm any timers that survived a restart (no-op for the in-memory store).
     try:
         await timeout_scheduler.recover()

@@ -57,7 +57,7 @@ class ApprovalCardRequest(BaseModel):
         ),
     )
     related_alerts: list[dict[str, Any]] | None = None
-    timeout_seconds: int | None = None
+    timeout_seconds: int | None = Field(default=None, ge=0, le=7 * 24 * 60 * 60)
 
 
 def _authorized(supplied: str | None) -> bool:
@@ -93,6 +93,14 @@ async def post_approval_card(
     """
     if not _authorized(x_internal_token):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="internal token required")
+
+    action_id = str(body.action.get("id") or body.action.get("action_id") or "")
+    timeout_seconds = body.timeout_seconds or 0
+    if timeout_seconds > 0 and not action_id:
+        raise HTTPException(
+            status_code=422,
+            detail="action id required when timeout_seconds is set",
+        )
 
     settings = get_settings()
     channel = (body.channel or settings.SLACK_APPROVALS_CHANNEL).strip()
@@ -141,4 +149,11 @@ async def post_approval_card(
         action_id=body.action.get("id"),
         channel=channel,
     )
+    if action_id and timeout_seconds > 0:
+        request.app.state.timeout_scheduler.schedule(
+            action_id,
+            timeout_seconds=timeout_seconds,
+            case_id=str(body.case.get("id") or ""),
+            channel=channel,
+        )
     return {"posted": True, "channel": channel, "ts": response.get("ts") if hasattr(response, "get") else None}
