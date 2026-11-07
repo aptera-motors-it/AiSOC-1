@@ -15,3 +15,5 @@ require (
 	go.opentelemetry.io/otel/trace v1.16.0 // indirect
 	golang.org/x/sys v0.44.0 // indirect
 )
+
+toolchain go1.26.10
