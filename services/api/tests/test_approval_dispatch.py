@@ -239,3 +239,35 @@ class TestThePrincipalReachesTheActionsService:
         await endpoint._dispatch_decision(_row(), _user(), approve=True)
 
         assert calls["decide"][0]["approver"]["roles"] == ["soc_lead"]
+
+
+class TestAPlaybookDecisionReachesTheAgentsService:
+    @pytest.mark.asyncio
+    async def test_a_bad_agents_url_does_not_raise_into_decide(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A mis-set AGENTS_SERVICE_URL must not turn a committed decision into a 500."""
+        monkeypatch.setenv("AGENTS_SERVICE_URL", "http://agents:not-a-port")
+        row = _row(requested_by="playbook:pb-1")
+
+        await endpoint._resume_playbook_run(row)
+
+    @pytest.mark.asyncio
+    async def test_a_non_playbook_approval_is_not_delivered(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        called: list[str] = []
+
+        class _Client:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def post(self, url, headers=None):
+                called.append(url)
+                return SimpleNamespace(status_code=202)
+
+        monkeypatch.setattr(endpoint.httpx, "AsyncClient", _Client)
+        await endpoint._resume_playbook_run(_row(requested_by="agent"))
+        assert called == []

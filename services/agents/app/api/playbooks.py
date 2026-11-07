@@ -13,12 +13,16 @@ Endpoints:
 
 from __future__ import annotations
 
+import copy
 import html
+import itertools
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Annotated, Any
+from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -27,6 +31,7 @@ from app.playbook import (
     PlaybookEngine,
     PlaybookRun,
     PlaybookStore,
+    RunStatus,
     draft_from_nl,
     verification,
 )
@@ -72,6 +77,47 @@ verifications_router = APIRouter(prefix="/api/v1/playbook-verifications", tags=[
 #: was.
 ScopedPrincipal = Annotated[TenantPrincipal, Depends(require_console_or_service_auth)]
 
+#: Which console roles may author a playbook, and which may run one.
+#:
+#: GHSA-8cpf-mchw-jpf2, F15. These routes authenticated every caller and
+#: resolved their tenant, and then asked nothing else -- so a `viewer` could
+#: create a playbook whose steps dispatch containment and run it. Measured
+#: against the real router: 201 on create, 202 on run, for a playbook whose
+#: only step was `isolate_host`. The API gates the same step dispatch on
+#: `actions:execute` (`endpoints/playbook_steps.py`), so the two halves of one
+#: capability disagreed about who may use it.
+#:
+#: **These mirror `ROLE_PERMISSIONS` in `services/api/app/core/security.py`
+#: and must not drift from it.** They are a mirror rather than an import for
+#: the reason every vendored module here is: this service is built with its
+#: own directory as its Docker context and cannot import the API's package.
+#: `tests/test_playbook_authorization.py::test_the_role_table_matches_the_api`
+#: reads that file and fails if a role gains or loses either permission
+#: without this table moving -- because a second permission model that can
+#: silently disagree with the first is what this repository refuses, and an
+#: unpinned copy is exactly that.
+_MAY_AUTHOR: frozenset[str] = frozenset({"admin", "platform_admin", "tenant_admin"})
+_MAY_RUN: frozenset[str] = frozenset({"admin", "platform_admin", "tenant_admin", "soc_lead", "soc_analyst"})
+
+
+def _require_role(principal: TenantPrincipal, allowed: frozenset[str], *, verb: str, permission: str) -> None:
+    """Refuse a console caller whose role does not carry ``permission``.
+
+    A **service** principal passes. It authenticated with a shared secret and
+    carries no human role, so there is no role to check -- and the governed
+    half of what a playbook does still answers to the actions service, which
+    grades every step on the way past. Refusing it here would break the
+    engine's own dispatch while protecting nothing.
+    """
+    if principal.delegated:
+        return
+    if principal.role in allowed:
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=(f"{verb} requires '{permission}'. Your role ({principal.role or 'unknown'}) does not carry it."),
+    )
+
 
 @dataclass(frozen=True)
 class _OwnedRun:
@@ -87,14 +133,20 @@ class _OwnedRun:
 
     tenant_id: str
     run: PlaybookRun
+    leg: int
 
 
 # In-memory run store for Pillar-2 (swap for Redis/DB in production)
 _runs: dict[str, _OwnedRun] = {}
 
+_legs = itertools.count()
 
-def _remember(tenant_id: str, run: PlaybookRun) -> None:
-    _runs[run.run_id] = _OwnedRun(tenant_id=tenant_id, run=run)
+
+def _remember(tenant_id: str, run: PlaybookRun, leg: int) -> None:
+    current = _runs.get(run.run_id)
+    if current is not None and current.leg > leg:
+        return
+    _runs[run.run_id] = _OwnedRun(tenant_id=tenant_id, run=run, leg=leg)
 
 
 def _run_or_404(run_id: str, tenant_id: str) -> PlaybookRun:
@@ -110,7 +162,7 @@ def _run_or_404(run_id: str, tenant_id: str) -> PlaybookRun:
     return owned.run
 
 
-def _remember_resumed(run: PlaybookRun) -> None:
+def _remember_resumed(run: PlaybookRun, leg: int) -> None:
     """Record a run that resumed from a durable pause.
 
     The two callback routes have no session — a vendor webhook and the subject
@@ -124,7 +176,7 @@ def _remember_resumed(run: PlaybookRun) -> None:
     if not tenant_id:
         logger.warning("playbook run %s resumed with no tenant; not recording it", run.run_id)
         return
-    _remember(tenant_id, run)
+    _remember(tenant_id, run, leg)
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +238,7 @@ async def list_playbooks(principal: ScopedPrincipal, enabled_only: bool = False)
 
 @router.post("", summary="Create a playbook", status_code=201)
 async def create_playbook(playbook: Playbook, principal: ScopedPrincipal) -> dict:
+    _require_role(principal, _MAY_AUTHOR, verb="Creating a playbook", permission="playbooks:write")
     store = PlaybookStore.default()
     tenant_id = str(scoped_tenant_or_403(principal))
     created = store.create(playbook, tenant_id=tenant_id)
@@ -232,6 +285,7 @@ async def get_playbook(playbook_id: str, principal: ScopedPrincipal) -> dict:
 
 @router.put("/{playbook_id}", summary="Update a playbook")
 async def update_playbook(playbook_id: str, data: dict[str, Any], principal: ScopedPrincipal) -> dict:
+    _require_role(principal, _MAY_AUTHOR, verb="Updating a playbook", permission="playbooks:write")
     store = PlaybookStore.default()
     tenant_id = str(scoped_tenant_or_403(principal))
     updated = store.update(playbook_id, data, tenant_id=tenant_id)
@@ -244,6 +298,7 @@ async def update_playbook(playbook_id: str, data: dict[str, Any], principal: Sco
 
 @router.delete("/{playbook_id}", summary="Delete a playbook", status_code=204, response_model=None)
 async def delete_playbook(playbook_id: str, principal: ScopedPrincipal) -> None:
+    _require_role(principal, _MAY_AUTHOR, verb="Deleting a playbook", permission="playbooks:write")
     store = PlaybookStore.default()
     tenant_id = str(scoped_tenant_or_403(principal))
     if not store.delete(playbook_id, tenant_id=tenant_id):
@@ -277,8 +332,9 @@ def _execution_context(body_context: dict[str, Any], tenant_id: str) -> dict[str
 async def _execute(playbook: Playbook, context: dict[str, Any], dry_run: bool, run_holder: list, tenant_id: str) -> None:
     """Background task: run the playbook and store the result."""
     engine = PlaybookEngine()
+    leg = next(_legs)
     pr = await engine.run(playbook, context, dry_run=dry_run)
-    _remember(tenant_id, pr)
+    _remember(tenant_id, pr, leg)
     run_holder.append(pr.run_id)
 
 
@@ -289,6 +345,7 @@ async def run_playbook(
     background_tasks: BackgroundTasks,
     principal: ScopedPrincipal,
 ) -> dict:
+    _require_role(principal, _MAY_RUN, verb="Running a playbook", permission="playbooks:execute")
     store = PlaybookStore.default()
     tenant_id = str(scoped_tenant_or_403(principal))
     pb = store.get(playbook_id, tenant_id=tenant_id)
@@ -303,9 +360,10 @@ async def run_playbook(
 
     placeholder = _PR(pb, context)
     placeholder.status = _RS.PENDING
-    _remember(tenant_id, placeholder)
+    leg = next(_legs)
+    _remember(tenant_id, placeholder, leg)
 
-    background_tasks.add_task(_execute_and_update, pb, context, body.dry_run, placeholder.run_id, tenant_id)
+    background_tasks.add_task(_execute_and_update, pb, context, body.dry_run, placeholder.run_id, tenant_id, leg)
 
     return {
         "run_id": placeholder.run_id,
@@ -321,13 +379,57 @@ async def _execute_and_update(
     dry_run: bool,
     run_id: str,
     tenant_id: str,
+    leg: int,
 ) -> None:
     """Background task: overwrite placeholder with real run."""
     engine = PlaybookEngine()
-    pr = await engine.run(playbook, context, dry_run=dry_run)
-    # Preserve the pre-allocated run_id
-    pr.run_id = run_id
-    _remember(tenant_id, pr)
+    pr = await engine.run(playbook, context, dry_run=dry_run, resume_run_id=run_id)
+    _remember(tenant_id, pr, leg)
+
+
+@router.post("/approvals/{approval_id}/resume", summary="Deliver a recorded approval decision", status_code=202)
+async def resume_approval(approval_id: UUID, background_tasks: BackgroundTasks, principal: ScopedPrincipal) -> dict[str, Any]:
+    if not principal.delegated:
+        raise HTTPException(status_code=403, detail="approval decisions are delivered by the API service")
+    tenant_id = str(scoped_tenant_or_403(principal))
+    decision = await playbook_pause.approval_decision(approval_id=str(approval_id), tenant_id=tenant_id)
+    if decision is None:
+        raise HTTPException(status_code=404, detail="no decided approval with this id")
+
+    background_tasks.add_task(_resume_approval_in_background, str(approval_id), tenant_id, decision)
+    return {"status": "resuming"}
+
+
+async def _resume_approval_in_background(approval_id: str, tenant_id: str, decision: dict[str, Any]) -> None:
+    leg = next(_legs)
+    decided_by = str(decision["decided_by_id"] or "")
+    comment = decision["decision_comment"] or ""
+    run_id = str(decision["run_id"] or "")
+    if decision["status"] == "approved":
+        try:
+            run = await engine_module.resume_after_approval(
+                approval_id=approval_id, tenant_id=tenant_id, decided_by=decided_by, comment=comment
+            )
+        except engine_module.PlaybookDeleted:
+            _end_stored(tenant_id, run_id, RunStatus.FAILED, "the playbook was deleted while the run waited on its approval", leg)
+            return
+        if run is not None:
+            _remember(tenant_id, run, leg)
+        return
+    if not await engine_module.deny_approval(approval_id=approval_id, tenant_id=tenant_id, decided_by=decided_by, comment=comment):
+        return
+    _end_stored(tenant_id, run_id, RunStatus.CANCELLED, "approval denied", leg)
+
+
+def _end_stored(tenant_id: str, run_id: str, status: RunStatus, error: str, leg: int) -> None:
+    owned = _runs.get(run_id)
+    if owned is None or owned.tenant_id != tenant_id:
+        return
+    ended = copy.copy(owned.run)
+    ended.status = status
+    ended.error = error
+    ended.finished_at = datetime.now(UTC).isoformat()
+    _remember(tenant_id, ended, leg)
 
 
 # ---------------------------------------------------------------------------
@@ -364,13 +466,14 @@ async def resume_wait(resume_token: str, background_tasks: BackgroundTasks) -> d
 
 
 async def _resume_wait_in_background(resume_token: str) -> None:
+    leg = next(_legs)
     run = await engine_module.resume_wait(resume_token=resume_token)
     if run is None:
         # Not an error: another delivery of the same callback, or the
         # sweeper's timer, got there first.
         logger.info("playbook wait callback matched no waiting run (already resumed)")
         return
-    _remember_resumed(run)
+    _remember_resumed(run, leg)
 
 
 # ---------------------------------------------------------------------------
@@ -404,11 +507,12 @@ async def answer_verification(resume_token: str, answer: str, sig: str = Query("
     if answer not in verification.ANSWERS:
         return HTMLResponse(_verification_html(_VERIFY_REFUSED_TITLE, _VERIFY_REFUSED_BODY, ok=False), status_code=400)
 
+    leg = next(_legs)
     run = await engine_module.resume_verification(resume_token=resume_token, answer=answer, signature=sig)
     if run is None:
         return HTMLResponse(_verification_html(_VERIFY_REFUSED_TITLE, _VERIFY_REFUSED_BODY, ok=False), status_code=400)
 
-    _remember_resumed(run)
+    _remember_resumed(run, leg)
     return HTMLResponse(
         _verification_html(
             "Thanks — that's recorded",

@@ -20,6 +20,7 @@ import re
 import secrets
 import time
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Any
@@ -27,6 +28,7 @@ from typing import Any
 import httpx
 
 from app.playbook import pause as playbook_pause
+from app.security import peer_tokens
 
 from . import action_bridge, ask_model, idempotency, references, timeout_outcome, verification
 from .bounds import (
@@ -808,14 +810,12 @@ async def _emit(run_id: str, event_type: str, payload: dict, http: httpx.AsyncCl
 # ---------------------------------------------------------------------------
 
 
-async def _suspend_for_approval(pr: PlaybookRun, step: PlaybookStep, step_idx: int, http: Any) -> Any:
+async def _suspend_for_approval(pr: PlaybookRun, step: PlaybookStep, step_idx: int, http: Any | None = None) -> Any:
     """Create the approval and persist where to resume.
 
-    Order matters. The approval row is created **first**, so the pause can
-    name it: a pause with no approval has nothing for a human to decide
-    against, and a human deciding against an approval with no pause wakes
-    nothing. If the approval cannot be created the pause is not written
-    either, and the caller fails the step closed.
+    The approval and its pause are one statement. The API is told afterwards
+    only to fan that row out; a second insert would page for an approval this
+    pause is not waiting on. A fan-out that fails leaves the pause.
     """
     tenant_id = str(pr.context.get("tenant_id") or pr.trigger_context.get("tenant_id") or "")
     if not tenant_id:
@@ -834,9 +834,7 @@ async def _suspend_for_approval(pr: PlaybookRun, step: PlaybookStep, step_idx: i
         logger.error("Approval step %s declares an unusable timeout outcome: %s", step.name, exc)
         return None
 
-    approval_id = await _create_approval(pr, step, tenant_id, http)
-
-    return await playbook_pause.suspend(
+    pause = await playbook_pause.suspend(
         tenant_id=tenant_id,
         run_id=pr.run_id,
         playbook_id=pr.playbook_id,
@@ -845,10 +843,26 @@ async def _suspend_for_approval(pr: PlaybookRun, step: PlaybookStep, step_idx: i
         step_id=step.id,
         run_context=pr.context,
         step_results=pr.step_results,
-        approval_id=approval_id,
+        approval={
+            "title": step.name or f"Approval for {pr.playbook_name}",
+            "summary": str(step.params.get("prompt") or step.params.get("reason") or step.name or "Approval"),
+            "requested_by": f"playbook:{pr.playbook_id}",
+            "action": {"run_id": pr.run_id, "step_id": step.id},
+        },
         ttl_hours=_approval_ttl(step),
         **declared_timeout.to_row(),
     )
+    if pause is None:
+        logger.error(
+            "Approval step %s could not open an approval; not suspending run %s",
+            step.name,
+            pr.run_id,
+        )
+        return None
+    approval_id = getattr(pause, "approval_id", None)
+    if approval_id:
+        await _create_approval(pr, step, tenant_id, http, str(approval_id))
+    return pause
 
 
 async def _suspend_for_wait(
@@ -924,84 +938,95 @@ def _approval_ttl(step: PlaybookStep) -> float | None:
         return None
 
 
-async def _create_approval(pr: PlaybookRun, step: PlaybookStep, tenant_id: str, http: Any) -> str | None:
-    """Ask the API to open an approval. None when it could not be created.
+async def _create_approval(
+    pr: PlaybookRun,
+    step: PlaybookStep,
+    tenant_id: str,
+    http: Any | None,
+    approval_id: str,
+) -> None:
+    """Ask the API to fan out an approval this service has already stored.
 
-    Posted to the API rather than written here for the same reason
-    `action_bridge` posts there: that service owns the vault and the
-    tenant session, and a second writer to `agent_approvals` would be a
-    second place the responder app's decision has to be kept in step with.
+    The pause is already durable; a channel that is down must not take it
+    with the approval. The body names the existing row so the API stamps
+    and notifies that row instead of inserting another.
     """
-    token = os.getenv("AISOC_AGENTS_SERVICE_TOKEN", "").strip() or os.getenv("AISOC_SERVICE_TOKEN", "").strip()
-    if not token:
-        logger.warning(
-            "Approval step %s cannot open an approval: AISOC_AGENTS_SERVICE_TOKEN is unset",
-            step.name,
-        )
-        return None
-    api_url = os.getenv("AISOC_API_URL", "http://api:8000")
     try:
-        response = await http.post(
+        headers = peer_tokens.api_bearer_headers(tenant_id)
+    except peer_tokens.MissingPeerCredential as exc:
+        logger.warning("Approval step %s cannot fan out its approval: %s", step.name, exc)
+        return
+    api_url = os.getenv("AISOC_API_URL", "http://api:8000")
+    owns_client = http is None
+    client = http if http is not None else httpx.AsyncClient()
+    try:
+        response = await client.post(
             f"{api_url}/api/v1/approvals",
-            headers={"Authorization": f"Bearer {token}", "X-Tenant-ID": tenant_id},
+            headers=headers,
             json={
                 "title": step.name or f"Approval for {pr.playbook_name}",
-                "description": str(step.params.get("prompt") or step.params.get("reason") or ""),
+                "summary": str(step.params.get("prompt") or step.params.get("reason") or step.name or "Approval"),
                 "requested_by": f"playbook:{pr.playbook_id}",
-                "context": {"run_id": pr.run_id, "step_id": step.id},
+                "action": {"run_id": pr.run_id, "step_id": step.id, "approval_id": approval_id},
             },
             timeout=10.0,
         )
         if response.status_code >= 400:
             logger.warning(
-                "Approval creation refused: HTTP %s %s",
+                "Approval fan-out refused: HTTP %s %s",
                 response.status_code,
                 response.text[:200],
             )
-            return None
-        return str(response.json().get("id") or "") or None
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Approval creation failed: %s", exc)
-        return None
+        logger.warning("Approval fan-out failed: %s", exc)
+    finally:
+        if owns_client:
+            await client.aclose()
+
+
+async def deny_approval(*, approval_id: str, tenant_id: str, decided_by: str = "", comment: str = "") -> bool:
+    """Record a denial against the run suspended on this approval.
+
+    True only when this call stopped a waiting run. A denial whose pause
+    already resumed, or a second delivery of the same denial, stops nothing.
+    """
+    pause = await playbook_pause.find_waiting(approval_id=approval_id, tenant_id=tenant_id)
+    if pause is None:
+        return False
+    denied = await playbook_pause.resolve(
+        pause_id=pause.id,
+        tenant_id=pause.tenant_id,
+        status="denied",
+        resolution=f"denied by {decided_by or 'an analyst'}: {comment}"[:500],
+    )
+    if denied:
+        logger.info("Playbook run %s halted: approval denied", pause.run_id)
+    return denied
+
+
+class PlaybookDeleted(LookupError):
+    """An approved run cannot continue: its playbook was deleted while it waited."""
 
 
 async def resume_after_approval(
     *,
     approval_id: str,
     tenant_id: str,
-    approved: bool,
     decided_by: str = "",
     comment: str = "",
 ) -> PlaybookRun | None:
-    """Continue a run suspended on this approval, or record the denial.
+    """Continue a run suspended on this approval.
 
     Returns the completed run, or None when there is nothing waiting. The
     pause is resolved **before** the run continues, so a decision that
     arrives twice (a double-tap, a retried webhook) resumes once: the
     second attempt matches no `waiting` row.
+
+    Raises :class:`PlaybookDeleted` when the run's playbook is gone. Its
+    pause is resolved ``cancelled``, because nothing continued.
     """
     pause = await playbook_pause.find_waiting(approval_id=approval_id, tenant_id=tenant_id)
     if pause is None:
-        return None
-
-    if not approved:
-        await playbook_pause.resolve(
-            pause_id=pause.id,
-            tenant_id=pause.tenant_id,
-            status="denied",
-            resolution=f"denied by {decided_by or 'an analyst'}: {comment}"[:500],
-        )
-        logger.info("Playbook run %s halted: approval denied", pause.run_id)
-        return None
-
-    claimed = await playbook_pause.resolve(
-        pause_id=pause.id,
-        tenant_id=pause.tenant_id,
-        status="resumed",
-        resolution=f"approved by {decided_by or 'an analyst'}: {comment}"[:500],
-    )
-    if not claimed:
-        # Somebody else resumed it first. Not an error.
         return None
 
     from app.playbook.store import PlaybookStore
@@ -1010,15 +1035,37 @@ async def resume_after_approval(
     # tenant the run belongs to, so a resume cannot reach a playbook in
     # another one.
     playbook = PlaybookStore.default().get(pause.playbook_id, tenant_id=str(pause.tenant_id))
+    status, resolution = "resumed", f"approved by {decided_by or 'an analyst'}: {comment}"
+    if playbook is None:
+        status, resolution = "cancelled", f"playbook {pause.playbook_id} was deleted; {resolution}"
+    claimed = await playbook_pause.resolve(
+        pause_id=pause.id,
+        tenant_id=pause.tenant_id,
+        status=status,
+        resolution=resolution[:500],
+    )
+    if not claimed:
+        # Somebody else resolved it first. Not an error.
+        return None
     if playbook is None:
         logger.warning(
             "Cannot resume run %s: playbook %s is no longer in the store",
             pause.run_id,
             pause.playbook_id,
         )
-        return None
+        raise PlaybookDeleted(pause.playbook_id)
 
-    return await PlaybookEngine().resume(playbook, pause)
+    approval = {
+        "step_id": pause.step_id,
+        "name": next((step.name for step in playbook.steps if step.id == pause.step_id), pause.step_id),
+        "status": StepStatus.SUCCESS,
+        "result": {"outcome": "approved", "approval_id": pause.approval_id, "decided_by": decided_by, "comment": comment},
+    }
+    pause = replace(pause, step_results=[*pause.step_results, approval])
+
+    earlier = pause.run_context.get("steps")
+    steps = {**(earlier if isinstance(earlier, dict) else {}), pause.step_id: {"outcome": "approved"}}
+    return await PlaybookEngine().resume(playbook, pause, extra_context={"steps": steps})
 
 
 async def resume_wait(*, resume_token: str) -> PlaybookRun | None:
@@ -1236,8 +1283,8 @@ async def _resume_pause(pause: Any, *, resolution: str, extra_context: dict[str,
 
     ``extra_context`` is merged into the stored run context before the run
     restarts, which is how a verification answer reaches the ``condition``
-    step that branches on it. A wait and an approval pass nothing: they
-    resume a run, they do not tell it anything it did not already know.
+    step that branches on it. A wait passes nothing: it resumes a run, it
+    does not tell it anything it did not already know.
     """
     claimed = await playbook_pause.resolve(
         pause_id=pause.id,
@@ -2078,6 +2125,7 @@ class PlaybookEngine:
             # the realtime stream and the ledger rather than appearing as
             # a second, unrelated one that starts halfway through.
             pr.run_id = resume_run_id
+            pr.context["_run_id"] = resume_run_id
         if resume_results:
             pr.step_results = list(resume_results)
         pr.started_at = datetime.now(UTC).isoformat()

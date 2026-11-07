@@ -123,6 +123,12 @@ jobs:
           ISOLATION_PLAYBOOK_DSN: ${{ env.PLAYBOOK_DSN }}
         run: python -m pytest ../../tests/isolation/test_playbook_pause_live.py -v --tb=short
 
+      - name: An approved run resumes, and the sweeper leaves a decided pause
+        working-directory: services/api
+        env:
+          ISOLATION_PLAYBOOK_DSN: ${{ env.PLAYBOOK_DSN }}
+        run: python -m pytest ../../tests/isolation/test_playbook_approval_resume_live.py -v --tb=short
+
       # The Investigation Ledger, the surface an auditor reads. Its
       # offline test drives a `_FakeConn` and opens no connection, so it
       # cannot prove the rows exist, that RLS applies, or that the

@@ -29,6 +29,7 @@ Endpoints
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
@@ -36,9 +37,9 @@ from typing import Annotated, Any, Literal
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, select, update
 
-from app.api.v1.deps import AuthUser, require_permission
+from app.api.v1.deps import SERVICE_TENANT_HEADER, AuthUser, require_permission
 from app.core.config import settings
 from app.db.rls import TenantDBSession
 from app.models.responder import AgentApproval
@@ -130,6 +131,15 @@ _REQUESTER_KEY = "requester_principal"
 _DISPATCH_IN_FLIGHT = "dispatching"
 #: The actions service was reached and answered.
 _DISPATCH_EXECUTED = "executed"
+#: Where the separation-of-duties verdict is recorded on the row.
+#:
+#: Mirrors ``services/actions/app/security/authz.py``, including its reasoning:
+#: a control that cannot evaluate a request must say so in the record rather
+#: than leave an omission, because afterwards "checked and passed" and "never
+#: checked" are indistinguishable.
+_SOD_KEY = "separation_of_duties"
+_SOD_ENFORCED = "enforced"
+_SOD_UNEVALUATED = "unevaluated"
 _DISPATCH_DECLINED = "declined"
 #: The actions service refused, with a reason.
 _DISPATCH_FAILED = "failed"
@@ -166,6 +176,97 @@ def _requester_principal(user: AuthUser) -> dict[str, Any]:
 def _dispatch_state(row: AgentApproval) -> str | None:
     dispatch = (row.action or {}).get("dispatch")
     return dispatch.get("state") if isinstance(dispatch, dict) else None
+
+
+def _stamped_requester_id(row: AgentApproval) -> str | None:
+    """The identity that raised this approval, or ``None`` for a legacy row.
+
+    Read from ``action.requester_principal``, which :func:`create_approval`
+    writes from authenticated context. Never from ``requested_by``, which is a
+    free-text label the caller picks -- a separation-of-duties comparison
+    against that would be forgeable from the request body, which is the exact
+    defect the actions service was fixed for.
+    """
+    requester = (row.action or {}).get(_REQUESTER_KEY)
+    if not isinstance(requester, dict):
+        return None
+    user_id = requester.get("user_id")
+    return str(user_id) if user_id else None
+
+
+def _authorize_decision(row: AgentApproval, user: AuthUser, *, approving: bool, enforce_window: bool) -> str:
+    """Decide whether this principal may take this decision, now.
+
+    ``require_permission("cases:write")`` on the route answers "may this
+    person decide approvals at all". It cannot answer the three questions
+    below, each of which is about *this* approval, and none of which was
+    asked: GHSA-q388-w896-9jr2.
+
+    One principle governs all three: **approving is the governed act, and
+    denying executes nothing.** A denial dispatches a rejection, leaves the
+    estate untouched, and is the safe default `approval_expiry` already names
+    -- so every rule here narrows who may *approve*, and leaves denial open.
+    The alternative was tried on paper and is worse: a requester who cannot
+    withdraw their own mistaken request, and an approval routed to somebody on
+    leave that nobody can clear, are both pressure to hand out wider
+    permissions than the job needs.
+
+    Returns the separation-of-duties state, for the caller to record.
+    """
+    requester_id = _stamped_requester_id(row)
+
+    # F08. The requester may not approve their own request.
+    if approving and requester_id is not None and requester_id == str(user.user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "The principal that requested this approval cannot approve it "
+                "(separation of duties). Another holder of cases:write must decide it; "
+                "you can still deny it."
+            ),
+        )
+
+    # F09. An approval addressed to one person is answered by that person.
+    #
+    # `required_user_id` is written at create time and `list_approvals(mine=true)`
+    # filters on it, so the console already presents these as routed. Reading the
+    # column only in the list and never in the decision made the routing cosmetic.
+    if approving and row.required_user_id is not None and row.required_user_id != user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "This approval is routed to a specific approver and only they can approve it. "
+                "You can deny it, or have it re-raised to a different approver."
+            ),
+        )
+
+    # F82. The window closes over approval.
+    #
+    # `enforce_window` is False when re-entering an already-decided row whose
+    # dispatch never resolved: that decision *was* taken in time, and the
+    # re-entry exists so an approval whose dispatch died is not stranded.
+    if approving and enforce_window and row.expires_at is not None:
+        deadline = row.expires_at if row.expires_at.tzinfo is not None else row.expires_at.replace(tzinfo=UTC)
+        if deadline <= datetime.now(UTC):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"This approval expired at {deadline.isoformat()} and can no longer be approved. "
+                    "Nothing was dispatched. Deny it, or raise a new approval against current evidence."
+                ),
+            )
+
+    if requester_id is None:
+        # Pre-v9 rows carry no stamp. Refusing them would strand every approval
+        # raised before the identity was recorded, during exactly the incident
+        # somebody needs to clear them in -- so this is a recorded fact, not a
+        # denial, and the row says afterwards which it was.
+        logger.warning(
+            "Approval decision: separation of duties could not be evaluated",
+            extra={"approval_id": str(row.id), "reason": "the row carries no requester principal"},
+        )
+        return _SOD_UNEVALUATED
+    return _SOD_ENFORCED
 
 
 @router.get("", response_model=ApprovalListResponse)
@@ -237,19 +338,87 @@ async def get_approval(
     return ApprovalResponse.model_validate(row)
 
 
+# `approvals:write` rather than `cases:write`, and the difference is the whole
+# reason it exists. The agents service's playbook engine must open an approval
+# when a step needs human sign-off, and it reaches this route on the shared
+# service token — whose permission set is a deliberately short read-only list,
+# because that one credential is valid on every route for every tenant. Adding
+# `cases:write` to it to unblock one POST would also have handed it case
+# authoring, case deletion and every other write on the case surface.
+#
+# Every role that held `cases:write` was granted `approvals:write` in the same
+# commit, so no operator lost access; the only principal that gains anything is
+# the service, and only this one verb. `/{id}/decide` deliberately still
+# requires `cases:write`: a service that can raise an approval must not be able
+# to answer it.
+async def _existing_playbook_approval(db: TenantDBSession, user: AuthUser, body: ApprovalCreateRequest) -> AgentApproval | None:
+    """The row a playbook step already wrote, when this call is its fan-out.
+
+    The id travels in ``action`` because that object is already the
+    caller's structured payload. A caller that is actually creating an
+    approval does not know the row's id yet and does not send one.
+    """
+    raw = (body.action or {}).get("approval_id")
+    if not raw:
+        return None
+    try:
+        approval_id = uuid.UUID(str(raw))
+    except ValueError:
+        return None
+    return (
+        await db.execute(
+            select(AgentApproval).where(
+                AgentApproval.id == approval_id,
+                AgentApproval.tenant_id == user.tenant_id,
+            )
+        )
+    ).scalar_one_or_none()
+
+
+async def _fan_out_existing(db: TenantDBSession, user: AuthUser, row: AgentApproval) -> ApprovalResponse:
+    """Stamp and notify an approval the playbook step has already stored.
+
+    The action column is the only one written. A decision can land
+    between the pause becoming visible and this call, and a whole-row
+    update would put that decision back to pending.
+    """
+    if row.status == "pending":
+        action = dict(row.action or {})
+        if _REQUESTER_KEY not in action:
+            action[_REQUESTER_KEY] = _requester_principal(user)
+        await _notify_realtime(row, event="approval_request")
+        delivery = await deliver_approval(row, await resolve_branding(db, user.tenant_id))
+        action["delivery"] = delivery.as_dict()
+        await db.execute(
+            update(AgentApproval)
+            .where(
+                AgentApproval.id == row.id,
+                AgentApproval.tenant_id == user.tenant_id,
+            )
+            .values(action=action)
+        )
+        await db.commit()
+        await db.refresh(row)
+    return ApprovalResponse.model_validate(row)
+
+
 @router.post("", response_model=ApprovalResponse, status_code=status.HTTP_201_CREATED)
 async def create_approval(
     body: ApprovalCreateRequest,
-    user: Annotated[AuthUser, Depends(require_permission("cases:write"))],
+    user: Annotated[AuthUser, Depends(require_permission("approvals:write"))],
     db: TenantDBSession,
 ) -> ApprovalResponse:
-    """Create a new approval request.
+    """Create a new approval request. Requires `approvals:write`.
 
     The agents service calls this when it hits a high-risk step that
     requires human sign-off. We persist it, then fan-out a Web Push
     notification via the realtime service so the PWA buzzes the right
     on-call analyst.
     """
+    existing = await _existing_playbook_approval(db, user, body)
+    if existing is not None:
+        return await _fan_out_existing(db, user, existing)
+
     row = AgentApproval(
         tenant_id=user.tenant_id,
         run_id=body.run_id,
@@ -304,7 +473,17 @@ async def decide_approval(
     Idempotent only on the same decision: re-approving an already
     approved request returns the row unchanged; trying to flip an
     approved row to denied (or vice versa) is a 409.
+
+    Separation of duties, the named approver and the approval window are each
+    enforced; a requester cannot approve their own request, and an elapsed
+    approval can be denied but not approved.
     """
+    # The paragraph above is a *published* description -- this docstring is
+    # exported into `docs/openapi.yaml`, so it says what a caller must know
+    # and does not name internals. The mechanism is `_authorize_decision`:
+    # `cases:write` on the dependency answers "may this person decide
+    # approvals at all" and nothing more, and the three questions about
+    # *this* approval are asked there.
     row = (
         await db.execute(
             select(AgentApproval).where(
@@ -320,12 +499,26 @@ async def decide_approval(
     unresolved = _dispatch_state(row) in _UNRESOLVED_DISPATCH
 
     if row.status == new_status and not unresolved:
+        await _resume_playbook_run(row)
         return ApprovalResponse.model_validate(row)
     if row.status not in {"pending", "expired"} and row.status != new_status:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Approval already {row.status}; cannot change to {new_status}",
         )
+
+    # Everything from here writes a decision, so this is where it is authorized.
+    # Placed after the idempotent return above and before the first mutation,
+    # so re-entering a stalled dispatch is governed too -- re-driving a
+    # containment is an act, even when the row already records the verdict.
+    sod = _authorize_decision(
+        row,
+        user,
+        approving=body.decision == "approve",
+        # The window governs a *new* decision. A row already carrying a verdict
+        # had that verdict taken in time; re-entry is finishing the dispatch.
+        enforce_window=row.status not in {"approved", "denied"},
+    )
 
     row.status = new_status
     row.decided_by_id = user.user_id
@@ -350,6 +543,7 @@ async def decide_approval(
     # twice.
     row.action = {
         **(row.action or {}),
+        _SOD_KEY: sod,
         "dispatch": {"state": _DISPATCH_IN_FLIGHT, "started_at": datetime.now(UTC).isoformat()},
     }
     await db.commit()
@@ -360,9 +554,8 @@ async def decide_approval(
     await db.commit()
     await db.refresh(row)
 
-    # Notify the agents service (and any other listener) so the run can
-    # resume — fire-and-forget pattern matches the rest of the surface.
     await _notify_realtime(row, event="approval_decided")
+    await _resume_playbook_run(row)
 
     if dispatch.get("state") == _DISPATCH_FAILED:
         # The decision is durable and the operator is told the truth: their
@@ -507,6 +700,24 @@ async def _dispatch_decision(
         "action_status": result.get("status"),
         "blast_radius": result.get("blast_radius"),
     }
+
+
+async def _resume_playbook_run(row: AgentApproval) -> None:
+    if not (row.requested_by or "").startswith("playbook:"):
+        return
+    base = (os.getenv("AGENTS_SERVICE_URL") or os.getenv("AGENTS_API_URL") or "http://agents:8084").rstrip("/")
+    token = (os.getenv("AISOC_AGENTS_SERVICE_TOKEN") or os.getenv("AISOC_SERVICE_TOKEN") or "").strip()
+    headers = {"Authorization": f"Bearer {token}", SERVICE_TENANT_HEADER: str(row.tenant_id)}
+    try:
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+            response = await client.post(f"{base}/api/v1/playbooks/approvals/{row.id}/resume", headers=headers)
+    except Exception as exc:
+        # httpx.InvalidURL (and kin) subclass Exception, not HTTPError; a bad
+        # AGENTS_SERVICE_URL must not turn a committed decision into a 500.
+        logger.warning("Approval %s: decision not delivered to the agents service: %s", row.id, exc)
+        return
+    if response.status_code >= 400:
+        logger.warning("Approval %s: the agents service refused the decision: HTTP %s", row.id, response.status_code)
 
 
 async def _notify_realtime(row: AgentApproval, *, event: str) -> None:
