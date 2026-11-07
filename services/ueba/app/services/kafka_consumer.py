@@ -35,14 +35,6 @@ Anomalies are published to ``ueba.anomalies``:
     "detected_at":    "2026-05-03T12:00:01Z"
   }
 
-What happens when the handler raises
-------------------------------------
-
-It logs at ``error``, dead-letters the event, and carries on. A single
-unprocessable event must not stop the stream, which is already the policy in
-``services/fusion`` and ``services/agents`` — one answer across the three
-consumers is worth more than a cleverer answer here.
-
 What must never happen again is the previous behaviour. There was no
 ``except`` at all: the first event that raised left the ``async for``, the
 ``finally`` stopped the consumer, and the exception went into the task
@@ -180,7 +172,8 @@ class UEBAKafkaConsumer:
 
     async def run(self) -> None:
         try:
-            from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+            from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
+            from aiokafka.errors import CommitFailedError, IllegalStateError
         except ImportError:
             LOG.error("aiokafka not installed; Kafka consumer disabled.")
             return
@@ -190,7 +183,7 @@ class UEBAKafkaConsumer:
             bootstrap_servers=settings.kafka_bootstrap_servers,
             group_id=settings.kafka_consumer_group,
             auto_offset_reset="latest",
-            enable_auto_commit=True,
+            enable_auto_commit=False,
             **kafka_client_kwargs(),
         )
         producer = AIOKafkaProducer(
@@ -203,17 +196,62 @@ class UEBAKafkaConsumer:
         self._running = True
         self._attached = True
         LOG.info("UEBA Kafka consumer started (topic=%s)", settings.kafka_input_topic)
+        lost = (CommitFailedError, IllegalStateError)
+
+        async def commit_position(tp: TopicPartition, offset: int) -> bool:
+            try:
+                await consumer.commit({tp: offset})
+            except lost as exc:
+                LOG.warning(
+                    "UEBA offset commit skipped; the group lost this partition. topic=%s partition=%s offset=%s error=%s",
+                    tp.topic,
+                    tp.partition,
+                    offset,
+                    exc,
+                )
+                return False
+            return True
+
+        # With auto_offset_reset=latest, a fresh group has no commit and would
+        # resume at the log end after a crash. Commit this record's offset
+        # (not +1) before handling so a restart re-reads it.
+        pinned: set[TopicPartition] = set()
+
+        async def handle(msg: Any, tp: TopicPartition) -> str:
+            try:
+                await self._process_message(msg.value, producer)
+            except Exception as exc:  # noqa: BLE001 — dead-letter or stop; do not raise out of the loop
+                if not await self._handler_failed(msg, exc):
+                    return "stop"
+            else:
+                self._stats["processed"] += 1
+            if not await commit_position(tp, msg.offset + 1):
+                return "retry"
+            return "ok"
 
         try:
             async for msg in consumer:
                 if not self._running:
                     break
-                try:
-                    await self._process_message(msg.value, producer)
-                except Exception as exc:  # noqa: BLE001 — one event must not end the subscription
-                    await self._handler_failed(msg, exc)
-                else:
-                    self._stats["processed"] += 1
+                tp = TopicPartition(msg.topic, msg.partition)
+                if tp not in pinned:
+                    try:
+                        current = await consumer.committed(tp)
+                    except lost:
+                        current = None
+                    pinned.add(tp)
+                    if current is None and not await commit_position(tp, msg.offset):
+                        if await commit_position(tp, msg.offset):
+                            break
+                        outcome = await handle(msg, tp)
+                        if outcome == "stop":
+                            await commit_position(tp, msg.offset)
+                        break
+                outcome = await handle(msg, tp)
+                if outcome == "stop":
+                    break
+                if outcome == "retry":
+                    continue
         finally:
             # Before the awaits below, not after: ``consumer.stop()`` can
             # itself raise on a broker that has gone away, and readiness must
@@ -224,8 +262,8 @@ class UEBAKafkaConsumer:
             await producer.stop()
             LOG.info("UEBA Kafka consumer stopped.")
 
-    async def _handler_failed(self, msg: Any, exc: Exception) -> None:
-        """Report one unprocessable event and keep the subscription.
+    async def _handler_failed(self, msg: Any, exc: Exception) -> bool:
+        """Report one unprocessable event.
 
         Loud on purpose. This is the exact point the old code exited from
         without writing anything anywhere, so the log line carries the
@@ -241,20 +279,10 @@ class UEBAKafkaConsumer:
         offset = getattr(msg, "offset", None)
         raw = getattr(msg, "value", msg)
 
-        LOG.error(
-            "UEBA handler failed; event dead-lettered and the subscription kept. topic=%s partition=%s offset=%s error=%s: %s",
-            topic,
-            partition,
-            offset,
-            type(exc).__name__,
-            exc,
-            exc_info=True,
-        )
-
         payload: Any
         try:
             payload = json.loads(raw) if isinstance(raw, bytes | bytearray) else raw
-        except (json.JSONDecodeError, UnicodeDecodeError):
+        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
             payload = {"undecodable": str(raw)[:500]}
 
         tenant_id = payload.get("tenant_id") if isinstance(payload, dict) else None
@@ -269,6 +297,17 @@ class UEBAKafkaConsumer:
         )
         if recorded:
             self._stats["dead_lettered"] += 1
+        LOG.error(
+            "UEBA handler failed; %s. topic=%s partition=%s offset=%s error=%s: %s",
+            "event dead-lettered and the subscription kept" if recorded else "subscription stopped with the event unconsumed",
+            topic,
+            partition,
+            offset,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        return recorded
 
     def stop(self) -> None:
         self._running = False

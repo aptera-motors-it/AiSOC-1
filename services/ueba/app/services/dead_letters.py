@@ -77,11 +77,7 @@ class DeadLetterSink:
         tenant_id: str | None = None,
         source_event_id: str | None = None,
     ) -> bool:
-        """Write one dead letter. Returns whether it landed.
-
-        The return value is for the caller's counters, not for control flow —
-        there is no branch here a consumer should take differently.
-        """
+        """Write one dead letter. Returns whether it landed."""
         params = {
             "tenant_id": tenant_id,
             "topic": topic,
