@@ -259,6 +259,36 @@ async def find_waiting(*, approval_id: str, tenant_id: str) -> Pause | None:
     return _row_to_pause(row)
 
 
+async def run_status(*, run_id: str, tenant_id: str) -> str | None:
+    """The status of this run's latest pause, or None if it never paused.
+
+    Every status counts: a run that paused once has already executed the
+    steps before that pause. ``None`` also when the lookup fails, so a
+    database error starts the run rather than dropping a response.
+    """
+    pool = await _pool()
+    if pool is None:
+        return None
+    try:
+        async with pool.acquire() as conn:
+            status = await conn.fetchval(
+                """
+                SELECT status
+                  FROM aisoc_playbook_pauses
+                 WHERE run_id = $1
+                   AND tenant_id = $2::uuid
+                 ORDER BY created_at DESC
+                 LIMIT 1
+                """,
+                run_id,
+                tenant_id,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("playbook_pause: run lookup failed for run %s: %s", run_id, exc)
+        return None
+    return str(status) if status is not None else None
+
+
 def _row_to_pause(row: Any) -> Pause:
     def _json(value: Any, default: Any) -> Any:
         if value is None:
@@ -382,6 +412,35 @@ async def due_waits(*, now: datetime | None = None, limit: int = 50) -> list[Pau
         logger.warning("playbook_pause: due-wait sweep failed: %s", exc)
         return []
     return [_row_to_pause(row) for row in rows]
+
+
+async def find_due_wait(*, run_id: str, tenant_id: str) -> Pause | None:
+    """This run's timer wait, if it is waiting and has come due."""
+    pool = await _pool()
+    if pool is None:
+        return None
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"""
+                SELECT {_PAUSE_COLUMNS}
+                  FROM aisoc_playbook_pauses
+                 WHERE run_id = $1
+                   AND tenant_id = $2::uuid
+                   AND status = 'waiting'
+                   AND kind = 'wait'
+                   AND resume_at IS NOT NULL
+                   AND resume_at <= $3
+                 LIMIT 1
+                """,
+                run_id,
+                tenant_id,
+                datetime.now(UTC),
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("playbook_pause: due-wait lookup failed for run %s: %s", run_id, exc)
+        return None
+    return _row_to_pause(row) if row is not None else None
 
 
 async def find_verification_by_token(*, resume_token: str) -> Pause | None:

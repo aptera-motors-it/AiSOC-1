@@ -27,6 +27,7 @@ from typing import Any
 import httpx
 
 from app.playbook import pause as playbook_pause
+from app.security import peer_tokens
 
 from . import action_bridge, ask_model, idempotency, references, timeout_outcome, verification
 from .bounds import (
@@ -99,8 +100,8 @@ class StepResult(dict):  # thin dict subclass for JSON serialisation
 class PlaybookRun:
     """Mutable run state threaded through the engine."""
 
-    def __init__(self, playbook: Playbook, trigger_context: dict[str, Any]) -> None:
-        self.run_id: str = str(uuid.uuid4())
+    def __init__(self, playbook: Playbook, trigger_context: dict[str, Any], *, run_id: str | None = None) -> None:
+        self.run_id: str = run_id or str(uuid.uuid4())
         self.playbook_id: str = playbook.id
         self.playbook_name: str = playbook.name
         #: The top-level step list, so a `wait` can find the index it must
@@ -835,6 +836,17 @@ async def _suspend_for_approval(pr: PlaybookRun, step: PlaybookStep, step_idx: i
         return None
 
     approval_id = await _create_approval(pr, step, tenant_id, http)
+    if not approval_id:
+        # The docstring above has always claimed this and the code did not do
+        # it: a pause written with `approval_id=None` is a run halted forever
+        # with nothing for any human to decide against, and no amount of
+        # waiting produces one. Failing the step closed at least surfaces.
+        logger.error(
+            "Approval step %s could not open an approval; not suspending run %s",
+            step.name,
+            pr.run_id,
+        )
+        return None
 
     return await playbook_pause.suspend(
         tenant_id=tenant_id,
@@ -932,18 +944,22 @@ async def _create_approval(pr: PlaybookRun, step: PlaybookStep, tenant_id: str, 
     tenant session, and a second writer to `agent_approvals` would be a
     second place the responder app's decision has to be kept in step with.
     """
-    token = os.getenv("AISOC_AGENTS_SERVICE_TOKEN", "").strip() or os.getenv("AISOC_SERVICE_TOKEN", "").strip()
-    if not token:
-        logger.warning(
-            "Approval step %s cannot open an approval: AISOC_AGENTS_SERVICE_TOKEN is unset",
-            step.name,
-        )
+    try:
+        # Token and tenant header together: both were wrong here, one at a
+        # time. This presented `AISOC_AGENTS_SERVICE_TOKEN` — the token the
+        # *agents* service accepts — to an API that validates
+        # `AISOC_API_SERVICE_TOKEN` (401), on `X-Tenant-ID`, which the API's
+        # service auth never reads, so a service caller named no tenant and
+        # resolved to an empty scope (403).
+        headers = peer_tokens.api_bearer_headers(tenant_id)
+    except RuntimeError as exc:
+        logger.warning("Approval step %s cannot open an approval: %s", step.name, exc)
         return None
     api_url = os.getenv("AISOC_API_URL", "http://api:8000")
     try:
         response = await http.post(
             f"{api_url}/api/v1/approvals",
-            headers={"Authorization": f"Bearer {token}", "X-Tenant-ID": tenant_id},
+            headers=headers,
             json={
                 "title": step.name or f"Approval for {pr.playbook_name}",
                 "description": str(step.params.get("prompt") or step.params.get("reason") or ""),
@@ -1229,6 +1245,19 @@ async def resume_due_waits(*, now: Any = None, limit: int = 50) -> list[str]:
         if run is not None:
             resumed.append(pause.run_id)
     return resumed
+
+
+async def resume_due_wait(*, run_id: str, tenant_id: str) -> PlaybookRun | None:
+    """Continue this run if it is waiting on a timer that has come due.
+
+    Only a due wait. A run resumes one past the step it paused on, so
+    resuming an approval or a verification here would run the gated step
+    with no decision; those keep waiting for the resumer that has one.
+    """
+    pause = await playbook_pause.find_due_wait(run_id=run_id, tenant_id=tenant_id)
+    if pause is None:
+        return None
+    return await _resume_pause(pause, resolution="resumed on a redelivery of its alert")
 
 
 async def _resume_pause(pause: Any, *, resolution: str, extra_context: dict[str, Any] | None = None) -> PlaybookRun | None:
@@ -2072,12 +2101,7 @@ class PlaybookEngine:
         resume_run_id: str | None = None,
         resume_results: list[dict[str, Any]] | None = None,
     ) -> PlaybookRun:
-        pr = PlaybookRun(playbook, trigger_context)
-        if resume_run_id:
-            # Keep the original run id, so a resumed run stays one run in
-            # the realtime stream and the ledger rather than appearing as
-            # a second, unrelated one that starts halfway through.
-            pr.run_id = resume_run_id
+        pr = PlaybookRun(playbook, trigger_context, run_id=resume_run_id)
         if resume_results:
             pr.step_results = list(resume_results)
         pr.started_at = datetime.now(UTC).isoformat()
